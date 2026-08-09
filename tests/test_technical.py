@@ -9,6 +9,21 @@ def make_series(n_days: int, start: float = 100.0, daily_drift: float = 0.0) -> 
     return pd.Series(values, index=index)
 
 
+def make_history(
+    n_days: int, start: float = 100.0, daily_drift: float = 0.0, volumes: list[float] | None = None
+) -> pd.DataFrame:
+    prices = make_series(n_days, start, daily_drift)
+    return pd.DataFrame(
+        {
+            "High": prices + 0.5,
+            "Low": prices - 0.5,
+            "Close": prices,
+            "Volume": volumes if volumes is not None else [1000.0] * n_days,
+        },
+        index=prices.index,
+    )
+
+
 def test_returns_all_none_for_empty_series():
     stats = compute_technical_stats(pd.Series(dtype=float))
     assert stats.last_price is None
@@ -92,3 +107,68 @@ def test_sideways_regime_for_choppy_oscillation():
     prices = pd.Series(values, index=pd.date_range("2026-01-01", periods=60, freq="D"))
     stats = compute_technical_stats(prices)
     assert stats.market_regime == "sideways"
+
+
+def test_rsi_none_when_shorter_than_window():
+    prices = make_series(10, start=100.0, daily_drift=1.0)
+    stats = compute_technical_stats(prices)
+    assert stats.rsi is None
+
+
+def test_rsi_high_for_steady_uptrend_with_no_down_days():
+    # Every day is a gain, no losing days at all: RSI should sit at its
+    # ceiling (100), not just "high".
+    prices = make_series(20, start=100.0, daily_drift=1.0)
+    stats = compute_technical_stats(prices)
+    assert stats.rsi == 100.0
+
+
+def test_rsi_low_for_steady_downtrend_with_no_up_days():
+    prices = make_series(20, start=100.0, daily_drift=-1.0)
+    stats = compute_technical_stats(prices)
+    assert stats.rsi == 0.0
+
+
+def test_rsi_mid_range_for_choppy_oscillation():
+    values = [100.0 + (5 if i % 2 == 0 else -5) for i in range(20)]
+    prices = pd.Series(values, index=pd.date_range("2026-01-01", periods=20, freq="D"))
+    stats = compute_technical_stats(prices)
+    assert 30 < stats.rsi < 70
+
+
+def test_atr_and_volume_trend_none_without_history():
+    prices = make_series(30, start=100.0, daily_drift=1.0)
+    stats = compute_technical_stats(prices)
+    assert stats.atr is None
+    assert stats.atr_pct is None
+    assert stats.volume_trend_pct is None
+
+
+def test_atr_computed_from_history():
+    history = make_history(30, start=100.0, daily_drift=1.0)
+    stats = compute_technical_stats(history["Close"], history=history)
+    # True Range accounts for the gap from the prior close, not just the
+    # day's own High-Low spread (1.0 here) — with a steady +1.0/day drift,
+    # High[t] - prev_close = 1.5, which dominates the day's own 1.0 range.
+    assert stats.atr == 1.5
+    assert stats.atr_pct == stats.atr / stats.last_price * 100
+
+
+def test_atr_none_when_history_shorter_than_window():
+    history = make_history(10, start=100.0, daily_drift=1.0)
+    stats = compute_technical_stats(history["Close"], history=history)
+    assert stats.atr is None
+
+
+def test_volume_trend_positive_when_recent_volume_spikes():
+    volumes = [1000.0] * 15 + [2000.0] * 5  # last 5 days double the baseline
+    history = make_history(20, start=100.0, daily_drift=0.0, volumes=volumes)
+    stats = compute_technical_stats(history["Close"], history=history)
+    assert stats.volume_trend_pct is not None
+    assert stats.volume_trend_pct > 0
+
+
+def test_volume_trend_none_when_no_volume_column():
+    history = make_history(30, start=100.0, daily_drift=1.0).drop(columns=["Volume"])
+    stats = compute_technical_stats(history["Close"], history=history)
+    assert stats.volume_trend_pct is None

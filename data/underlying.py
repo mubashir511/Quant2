@@ -31,6 +31,9 @@ _KEYWORD_MAP: list[tuple[str, str, str]] = [
     ("CORN", "Corn", "ZC=F"),
     ("RICE", "Rice", "ZR=F"),
     ("SUGAR", "Sugar", "SB=F"),
+    ("COTTON", "Cotton", "CT=F"),
+    ("ALUMINUM", "Aluminum", "ALI=F"),
+    ("ALUMINIUM", "Aluminum", "ALI=F"),
 ]
 
 

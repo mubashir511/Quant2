@@ -9,23 +9,23 @@ def get_open_positions() -> list[Position]:
     return [
         # Breaches MAX_LOSS_PCT, has a stop set.
         Position("GO10OZ", 1.0, "buy", 2000.0, 1750.0, sl=1900.0, profit=-250.0,
-                 opened_at=now - timedelta(days=3)),
+                 opened_at=now - timedelta(days=3), ticket=100001),
         # No stop loss set at all.
         Position("SV5OZ", 2.0, "sell", 30.0, 30.5, sl=None, profit=-100.0,
-                  opened_at=now - timedelta(days=1)),
+                  opened_at=now - timedelta(days=1), ticket=100002),
         # Healthy position, no rule triggered.
         Position("CL100BBL", 1.0, "buy", 80.0, 82.0, sl=78.0, profit=200.0,
-                  opened_at=now - timedelta(hours=6)),
+                  opened_at=now - timedelta(hours=6), ticket=100003),
         # Concentrated symbol exposure (large notional vs. the rest).
         Position("GO10OZ", 5.0, "buy", 2000.0, 2010.0, sl=1950.0, profit=50.0,
-                  opened_at=now - timedelta(hours=2)),
+                  opened_at=now - timedelta(hours=2), ticket=100004),
         # Pushes total position count over MAX_POSITION_COUNT.
         Position("NG10K", 1.0, "sell", 3.0, 3.05, sl=3.2, profit=-15.0,
-                  opened_at=now - timedelta(hours=1)),
+                  opened_at=now - timedelta(hours=1), ticket=100005),
         Position("PL50OZ", 1.0, "buy", 1000.0, 1010.0, sl=980.0, profit=10.0,
-                  opened_at=now - timedelta(minutes=30)),
+                  opened_at=now - timedelta(minutes=30), ticket=100006),
         Position("HG25K", 1.0, "buy", 4.0, 4.02, sl=3.9, profit=8.0,
-                  opened_at=now - timedelta(minutes=10)),
+                  opened_at=now - timedelta(minutes=10), ticket=100007),
     ]
 
 

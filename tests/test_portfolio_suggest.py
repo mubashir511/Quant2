@@ -1,26 +1,62 @@
+import time
+from datetime import datetime
 from unittest.mock import patch
 
 import pandas as pd
 
 from ai.portfolio_suggest import (
-    SYSTEM_INSTRUCTION,
+    AUDIT_INSTRUCTION,
+    AUDIT_MODELS,
+    AllocationEntry,
     AssetAnalysis,
+    AuditResult,
+    ModelAuditStatus,
     _detect_present_commodities,
+    _format_audit_progress,
+    _run_audit_with_retry,
     analyze_assets,
+    build_audit_block,
+    build_past_audit_lessons,
     build_crop_supply_demand_context,
     build_enriched_asset_context,
     build_fx_context,
     build_macro_snapshot,
+    build_multi_expiry_context,
     build_portfolio_summary,
+    build_positions_context,
     build_research_directives,
+    build_stage1_instruction,
+    build_stage2_instruction,
     format_enriched_asset_context,
+    get_openrouter_audit,
     parse_final_allocation,
     strip_allocation_block,
     suggest_portfolio,
 )
+from ai.claude_cli import CLI_FAILED_PREFIX, CLI_MISSING_MESSAGE
+from ai.openrouter_client import FAILED_MESSAGE as OPENROUTER_FAILED_MESSAGE
+from ai.openrouter_client import MISSING_KEY_MESSAGE as OPENROUTER_MISSING_KEY_MESSAGE
 from data.macro_source import CountryIndicators, MarketIndicators
 from data.mt5_source import ContractSpec
-from data.mt5_source import AccountSummary, MarketAsset
+from data.mt5_source import AccountSummary, MarketAsset, Position
+
+
+def _ohlc(closes: list[float], start: str = "2026-01-01") -> pd.DataFrame:
+    """Builds a High/Low/Close/Volume frame for mocking
+    fetch_price_history_ohlcv — High/Low bracket Close by a small fixed
+    amount and Volume is constant, enough for ATR/RSI/volume-trend to
+    compute without it mattering to tests that don't assert on them."""
+    index = pd.date_range(start, periods=len(closes))
+    return pd.DataFrame(
+        {
+            "High": [c + 0.5 for c in closes],
+            "Low": [c - 0.5 for c in closes],
+            "Close": closes,
+            "Volume": [1000] * len(closes),
+        },
+        index=index,
+    )
+
 
 EMPTY_MARKET_INDICATORS = MarketIndicators(
     yield_3m_pct=None,
@@ -41,6 +77,58 @@ def test_build_portfolio_summary_includes_account(mock_market, mock_country):
     summary = build_portfolio_summary(account, assets)
     assert "10000.00 USD" in summary
     assert "XYZ999" in summary
+
+
+def test_build_positions_context_empty_when_no_positions():
+    assert build_positions_context([]) == ""
+
+
+def test_build_positions_context_describes_each_open_position():
+    positions = [
+        Position(
+            symbol="GO10OZ", volume=2.0, side="buy", price_open=2000.0,
+            price_current=2050.0, sl=1950.0, profit=100.0,
+            opened_at=datetime.now(), ticket=555,
+        ),
+        Position(
+            symbol="SV5OZ", volume=1.0, side="sell", price_open=30.0,
+            price_current=30.0, sl=None, profit=0.0,
+            opened_at=datetime.now(), ticket=556,
+        ),
+    ]
+    text = build_positions_context(positions)
+    assert "GO10OZ" in text
+    assert "buy" in text
+    assert "2.0" in text or "2 lots" in text.lower()
+    assert "stop at 1950" in text
+    assert "SV5OZ" in text
+    assert "no stop set" in text
+
+
+@patch("ai.portfolio_suggest.fetch_country_indicators", return_value=[])
+@patch("ai.portfolio_suggest.fetch_market_indicators", return_value=EMPTY_MARKET_INDICATORS)
+def test_build_portfolio_summary_includes_open_positions_when_given(mock_market, mock_country):
+    account = AccountSummary(balance=10000.0, equity=9900.0, free_margin=8500.0, currency="USD")
+    assets = [MarketAsset("XYZ999", "Unmapped instrument", bid=1.0, ask=1.1)]
+    positions = [
+        Position(
+            symbol="XYZ999", volume=1.0, side="buy", price_open=1.0,
+            price_current=1.05, sl=None, profit=5.0,
+            opened_at=datetime.now(), ticket=1,
+        )
+    ]
+    summary = build_portfolio_summary(account, assets, positions=positions)
+    assert "Current Open Positions" in summary
+    assert "XYZ999" in summary
+
+
+@patch("ai.portfolio_suggest.fetch_country_indicators", return_value=[])
+@patch("ai.portfolio_suggest.fetch_market_indicators", return_value=EMPTY_MARKET_INDICATORS)
+def test_build_portfolio_summary_omits_positions_section_when_none_held(mock_market, mock_country):
+    account = AccountSummary(balance=10000.0, equity=9900.0, free_margin=8500.0, currency="USD")
+    assets = [MarketAsset("XYZ999", "Unmapped instrument", bid=1.0, ask=1.1)]
+    summary = build_portfolio_summary(account, assets)
+    assert "Current Open Positions" not in summary
 
 
 @patch("ai.portfolio_suggest.fetch_country_indicators", return_value=[])
@@ -85,19 +173,21 @@ def test_build_enriched_asset_context_lists_unmapped_symbol_plainly():
     assets = [MarketAsset("XYZ999", "Unmapped instrument", bid=1.0, ask=1.1)]
     context = build_enriched_asset_context(assets)
     assert "XYZ999" in context
-    assert "technical:" not in context
+    # No fabricated stats for an instrument with zero price-history source
+    # — but the absence must be stated explicitly, not silently omitted,
+    # so the model can't mistake "no line" for "nothing notable."
+    assert "not available" in context.lower()
+    assert "verify" in context.lower()
 
 
 @patch("ai.portfolio_suggest.fetch_recent_headlines")
-@patch("ai.portfolio_suggest.fetch_price_history")
+@patch("ai.portfolio_suggest.fetch_price_history_ohlcv")
 @patch("ai.portfolio_suggest.resolve_yahoo_ticker")
 def test_build_enriched_asset_context_adds_technical_and_news_for_mapped_symbol(
     mock_resolve, mock_history, mock_headlines
 ):
     mock_resolve.return_value = ("Gold", "GC=F")
-    mock_history.return_value = pd.Series(
-        [100.0 + i for i in range(30)], index=pd.date_range("2026-01-01", periods=30)
-    )
+    mock_history.return_value = _ohlc([100.0 + i for i in range(30)])
     mock_headlines.return_value = ["Gold rallies on rate cut bets"]
 
     assets = [MarketAsset("GO10OZ", "Gold 10oz", bid=2000.0, ask=2000.5)]
@@ -106,19 +196,20 @@ def test_build_enriched_asset_context_adds_technical_and_news_for_mapped_symbol(
     assert "GO10OZ" in context
     assert "technical:" in context
     assert "uptrend" in context
+    assert "RSI" in context
+    assert "ATR" in context
+    assert "volume" in context.lower()
     assert "Gold rallies on rate cut bets" in context
 
 
 @patch("ai.portfolio_suggest.fetch_recent_headlines", return_value=[])
-@patch("ai.portfolio_suggest.fetch_price_history")
+@patch("ai.portfolio_suggest.fetch_price_history_ohlcv")
 @patch("ai.portfolio_suggest.resolve_yahoo_ticker")
 def test_build_enriched_asset_context_adds_pattern_with_enough_history(
     mock_resolve, mock_history, mock_headlines
 ):
     mock_resolve.return_value = ("Gold", "GC=F")
-    mock_history.return_value = pd.Series(
-        [100.0 + i for i in range(60)], index=pd.date_range("2026-01-01", periods=60)
-    )
+    mock_history.return_value = _ohlc([100.0 + i for i in range(60)])
 
     assets = [MarketAsset("GO10OZ", "Gold 10oz", bid=2000.0, ask=2000.5)]
     context = build_enriched_asset_context(assets)
@@ -137,7 +228,7 @@ def test_build_enriched_asset_context_respects_max_enriched_cap(mock_resolve):
     config.MAX_ENRICHED_ASSETS = 1
     try:
         mock_resolve.return_value = ("Gold", "GC=F")
-        with patch("ai.portfolio_suggest.fetch_price_history", return_value=pd.Series(dtype=float)), \
+        with patch("ai.portfolio_suggest.fetch_price_history_ohlcv", return_value=_ohlc([])), \
              patch("ai.portfolio_suggest.fetch_recent_headlines", return_value=[]):
             assets = [
                 MarketAsset("GO10OZ", "Gold 10oz", bid=2000.0, ask=2000.5),
@@ -152,29 +243,180 @@ def test_build_enriched_asset_context_respects_max_enriched_cap(mock_resolve):
         config.MAX_ENRICHED_ASSETS = original_cap
 
 
+_NO_AUDIT = AuditResult(block="", audit_available=False)
+
+
+@patch("ai.portfolio_suggest.build_audit_block", return_value=_NO_AUDIT)
 @patch("ai.portfolio_suggest.run_claude")
-def test_suggest_portfolio_delegates_to_claude_cli_with_summary_embedded(mock_run_claude):
-    mock_run_claude.return_value = "Consider a mix of gold and cash."
+def test_suggest_portfolio_calls_run_claude_twice_with_draft_then_final(mock_run_claude, mock_audit):
+    mock_run_claude.side_effect = ["draft suggestion text", "final answer"]
     result = suggest_portfolio("some summary")
-    assert result == "Consider a mix of gold and cash."
-    prompt = mock_run_claude.call_args.args[0]
-    assert "some summary" in prompt
+    assert result == "final answer"
+    assert mock_run_claude.call_count == 2
+    draft_prompt = mock_run_claude.call_args_list[0].args[0]
+    final_prompt = mock_run_claude.call_args_list[1].args[0]
+    assert "some summary" in draft_prompt
+    assert "some summary" in final_prompt
 
 
+@patch("ai.portfolio_suggest.build_audit_block", return_value=_NO_AUDIT)
 @patch("ai.portfolio_suggest.run_claude")
-def test_suggest_portfolio_grants_web_search_tools(mock_run_claude):
-    mock_run_claude.return_value = "..."
+def test_suggest_portfolio_grants_web_search_tools_on_both_calls(mock_run_claude, mock_audit):
+    mock_run_claude.side_effect = ["draft", "final"]
     suggest_portfolio("some summary")
-    assert mock_run_claude.call_args.kwargs["allowed_tools"] == ["WebSearch", "WebFetch"]
+    for call in mock_run_claude.call_args_list:
+        assert call.kwargs["allowed_tools"] == ["WebSearch", "WebFetch"]
 
 
+@patch("ai.portfolio_suggest.build_audit_block", return_value=_NO_AUDIT)
 @patch("ai.portfolio_suggest.run_claude")
-def test_suggest_portfolio_uses_configured_model(mock_run_claude):
+def test_suggest_portfolio_uses_configured_model_on_both_calls(mock_run_claude, mock_audit):
     import config
 
-    mock_run_claude.return_value = "..."
+    mock_run_claude.side_effect = ["draft", "final"]
     suggest_portfolio("some summary")
-    assert mock_run_claude.call_args.kwargs["model"] == config.PORTFOLIO_SUGGESTION_MODEL
+    for call in mock_run_claude.call_args_list:
+        assert call.kwargs["model"] == config.PORTFOLIO_SUGGESTION_MODEL
+
+
+@patch("ai.portfolio_suggest.build_audit_block", return_value=_NO_AUDIT)
+@patch("ai.portfolio_suggest.run_claude")
+def test_suggest_portfolio_uses_explicit_model_override_on_both_calls(mock_run_claude, mock_audit):
+    mock_run_claude.side_effect = ["draft", "final"]
+    suggest_portfolio("some summary", model="sonnet")
+    for call in mock_run_claude.call_args_list:
+        assert call.kwargs["model"] == "sonnet"
+
+
+@patch("ai.portfolio_suggest.build_audit_block", return_value=_NO_AUDIT)
+@patch("ai.portfolio_suggest.run_claude")
+def test_suggest_portfolio_uses_separate_timeout_and_revision_timeout(mock_run_claude, mock_audit):
+    mock_run_claude.side_effect = ["draft", "final"]
+    suggest_portfolio("some summary", timeout=111, revision_timeout=222)
+    draft_call, final_call = mock_run_claude.call_args_list
+    assert draft_call.kwargs["timeout"] == 111
+    assert final_call.kwargs["timeout"] == 222
+
+
+@patch("ai.portfolio_suggest.build_audit_block")
+@patch("ai.portfolio_suggest.run_claude")
+def test_suggest_portfolio_passes_draft_and_audit_block_into_revision_prompt(mock_run_claude, mock_audit):
+    mock_run_claude.side_effect = ["my draft text", "final answer"]
+    mock_audit.return_value = AuditResult(block="Audit block: XYZ", audit_available=True)
+    suggest_portfolio("some summary")
+    final_prompt = mock_run_claude.call_args_list[1].args[0]
+    assert "my draft text" in final_prompt
+    assert "Audit block: XYZ" in final_prompt
+    mock_audit.assert_called_once_with("some summary", "my draft text", on_progress=None)
+
+
+_SAMPLE_CLI_FAILURE = f"{CLI_FAILED_PREFIX} (the `claude` CLI exited with code 1: boom)."
+
+
+@patch("ai.portfolio_suggest.build_audit_block")
+@patch("ai.portfolio_suggest.run_claude", return_value=_SAMPLE_CLI_FAILURE)
+def test_suggest_portfolio_returns_cli_failed_message_immediately_without_second_call(
+    mock_run_claude, mock_audit
+):
+    result = suggest_portfolio("some summary")
+    assert result == _SAMPLE_CLI_FAILURE
+    assert mock_run_claude.call_count == 1
+    assert mock_audit.call_count == 0
+
+
+@patch("ai.portfolio_suggest.build_audit_block")
+@patch("ai.portfolio_suggest.run_claude", return_value=CLI_MISSING_MESSAGE)
+def test_suggest_portfolio_returns_cli_missing_message_immediately_without_second_call(
+    mock_run_claude, mock_audit
+):
+    result = suggest_portfolio("some summary")
+    assert result == CLI_MISSING_MESSAGE
+    assert mock_run_claude.call_count == 1
+    assert mock_audit.call_count == 0
+
+
+@patch("ai.portfolio_suggest.save_portfolio_session")
+@patch("ai.portfolio_suggest.build_audit_block")
+@patch("ai.portfolio_suggest.run_claude")
+def test_suggest_portfolio_does_not_save_record_by_default(mock_run_claude, mock_audit, mock_save):
+    mock_run_claude.side_effect = ["draft", "final"]
+    mock_audit.return_value = AuditResult(block="", audit_available=True)
+    suggest_portfolio("some summary")
+    assert mock_save.call_count == 0
+
+
+@patch("ai.portfolio_suggest.save_portfolio_session")
+@patch("ai.portfolio_suggest.build_audit_block")
+@patch("ai.portfolio_suggest.run_claude")
+def test_suggest_portfolio_saves_record_when_requested(mock_run_claude, mock_audit, mock_save):
+    mock_run_claude.side_effect = ["my draft text", "final answer"]
+    mock_audit.return_value = AuditResult(block="Audit block: XYZ", audit_available=True)
+    suggest_portfolio("some summary", model="sonnet", save_record=True)
+    assert mock_save.call_count == 1
+    record = mock_save.call_args.args[0]
+    assert record.summary == "some summary"
+    assert record.model == "sonnet"
+    assert record.draft == "my draft text"
+    assert record.audit_block == "Audit block: XYZ"
+    assert record.audit_available is True
+    assert record.final_answer == "final answer"
+
+
+@patch("ai.portfolio_suggest.save_portfolio_session")
+@patch("ai.portfolio_suggest.build_audit_block")
+@patch("ai.portfolio_suggest.run_claude", return_value=_SAMPLE_CLI_FAILURE)
+def test_suggest_portfolio_does_not_save_record_when_draft_fails(mock_run_claude, mock_audit, mock_save):
+    suggest_portfolio("some summary", save_record=True)
+    assert mock_save.call_count == 0
+
+
+@patch("ai.portfolio_suggest.build_audit_block")
+@patch("ai.portfolio_suggest.run_claude")
+def test_suggest_portfolio_invokes_on_stage_callback_with_expected_message_sequence(
+    mock_run_claude, mock_audit
+):
+    mock_run_claude.side_effect = ["draft", "final"]
+    mock_audit.return_value = AuditResult(block="", audit_available=True)
+    messages = []
+    suggest_portfolio("some summary", on_stage=messages.append)
+    assert len(messages) == 3
+    assert "drafting" in messages[0].lower()
+    assert "audit" in messages[1].lower()
+    assert "revising" in messages[2].lower()
+
+
+@patch("ai.portfolio_suggest.build_audit_block")
+@patch("ai.portfolio_suggest.run_claude")
+def test_suggest_portfolio_on_stage_discloses_when_audit_unavailable(mock_run_claude, mock_audit):
+    mock_run_claude.side_effect = ["draft", "final"]
+    mock_audit.return_value = AuditResult(block="", audit_available=False)
+    messages = []
+    suggest_portfolio("some summary", on_stage=messages.append)
+    assert "wasn't available" in messages[2] or "re-checking" in messages[2].lower()
+
+
+@patch("ai.portfolio_suggest.build_stage2_instruction", return_value="instruction text")
+@patch("ai.portfolio_suggest.build_audit_block")
+@patch("ai.portfolio_suggest.run_claude")
+def test_suggest_portfolio_selects_stage2_instruction_with_audit_available_true(
+    mock_run_claude, mock_audit, mock_stage2
+):
+    mock_run_claude.side_effect = ["draft", "final"]
+    mock_audit.return_value = AuditResult(block="", audit_available=True)
+    suggest_portfolio("some summary")
+    mock_stage2.assert_called_once_with(True)
+
+
+@patch("ai.portfolio_suggest.build_stage2_instruction", return_value="instruction text")
+@patch("ai.portfolio_suggest.build_audit_block")
+@patch("ai.portfolio_suggest.run_claude")
+def test_suggest_portfolio_selects_stage2_instruction_with_audit_available_false(
+    mock_run_claude, mock_audit, mock_stage2
+):
+    mock_run_claude.side_effect = ["draft", "final"]
+    mock_audit.return_value = AuditResult(block="", audit_available=False)
+    suggest_portfolio("some summary")
+    mock_stage2.assert_called_once_with(False)
 
 
 @patch("ai.portfolio_suggest.resolve_yahoo_ticker")
@@ -245,6 +487,45 @@ def test_build_research_directives_names_linked_country_for_index(mock_resolve):
     assert "United States" in directives
 
 
+def test_build_multi_expiry_context_empty_when_no_shared_base():
+    assets = [
+        MarketAsset("MAIZELD-AU26", "Corn", bid=400.0, ask=400.5),
+        MarketAsset("CRUDE1", "Crude Oil", bid=80.0, ask=80.1),
+    ]
+    assert build_multi_expiry_context(assets) == ""
+
+
+def test_build_multi_expiry_context_detects_same_base_different_expiry():
+    assets = [
+        MarketAsset("MAIZELD-AU26", "Corn", bid=400.0, ask=400.5),
+        MarketAsset("MAIZELD-JY26", "Corn", bid=410.0, ask=410.5),
+    ]
+    context = build_multi_expiry_context(assets)
+    assert "MAIZELD" in context
+    assert "MAIZELD-AU26" in context and "MAIZELD-JY26" in context
+    assert "400.0" in context and "410.0" in context
+    assert "roll yield" in context.lower()
+
+
+def test_build_multi_expiry_context_does_not_confuse_lot_size_variants():
+    # Different base names entirely (PLATINUM1 vs PLATINUM5) sharing the
+    # same expiry suffix must NOT be grouped as a multi-expiry pair — they
+    # differ in lot size, not contract month.
+    assets = [
+        MarketAsset("PLATINUM1-OC26", "Platinum", bid=1700.0, ask=1701.0),
+        MarketAsset("PLATINUM5-OC26", "Platinum", bid=1700.0, ask=1701.0),
+    ]
+    assert build_multi_expiry_context(assets) == ""
+
+
+def test_build_multi_expiry_context_ignores_symbols_without_expiry_suffix():
+    assets = [
+        MarketAsset("CRUDE1", "Crude Oil", bid=80.0, ask=80.1),
+        MarketAsset("CRUDE10", "Crude Oil", bid=80.0, ask=80.1),
+    ]
+    assert build_multi_expiry_context(assets) == ""
+
+
 @patch("ai.portfolio_suggest.resolve_yahoo_ticker", return_value=("Gold", "GC=F"))
 def test_build_research_directives_names_multiple_countries_for_gold(mock_resolve):
     assets = [MarketAsset("GO10OZ", "Gold 10oz", bid=2000.0, ask=2000.5)]
@@ -262,7 +543,7 @@ def test_build_enriched_asset_context_shows_spread_for_unmapped_symbol():
 
 
 @patch("ai.portfolio_suggest.fetch_recent_headlines", return_value=[])
-@patch("ai.portfolio_suggest.fetch_price_history", return_value=pd.Series(dtype=float))
+@patch("ai.portfolio_suggest.fetch_price_history_ohlcv", return_value=_ohlc([]))
 @patch("ai.portfolio_suggest.resolve_yahoo_ticker", return_value=("Gold", "GC=F"))
 def test_build_enriched_asset_context_shows_spread_for_mapped_symbol(
     mock_resolve, mock_history, mock_headlines
@@ -296,7 +577,7 @@ def test_build_fx_context_still_flags_mismatch_when_rate_unavailable(mock_fetch)
 
 
 def test_system_instruction_covers_all_five_stress_test_failure_modes():
-    lowered = SYSTEM_INSTRUCTION.lower()
+    lowered = build_stage1_instruction().lower()
     assert "fx" in lowered
     assert "roll yield" in lowered
     assert "contango" in lowered and "backwardation" in lowered
@@ -308,29 +589,29 @@ def test_system_instruction_covers_all_five_stress_test_failure_modes():
 def test_system_instruction_hides_draft_stress_test_labels_from_output():
     # The reasoning steps must still happen, but not as visible headers —
     # and no hard word cap should remain (thoroughness over brevity).
-    assert "DRAFT MIX" not in SYSTEM_INSTRUCTION
-    assert "STRESS-TEST" not in SYSTEM_INSTRUCTION
-    assert "REVISED MIX" not in SYSTEM_INSTRUCTION
-    assert "do not print it as separate labeled" in SYSTEM_INSTRUCTION.lower()
-    assert "no strict length limit" in SYSTEM_INSTRUCTION.lower()
-    assert "under 1000 words" not in SYSTEM_INSTRUCTION.lower()
+    instruction = build_stage1_instruction()
+    assert "DRAFT MIX" not in instruction
+    assert "STRESS-TEST" not in instruction
+    assert "REVISED MIX" not in instruction
+    assert "do not print it as separate labeled" in instruction.lower()
+    assert "no strict length limit" in instruction.lower()
+    assert "under 1000 words" not in instruction.lower()
 
 
 def test_system_instruction_requires_trailing_json_allocation_block():
-    assert "```json" in SYSTEM_INSTRUCTION
-    assert "CASH" in SYSTEM_INSTRUCTION
+    instruction = build_stage1_instruction()
+    assert "```json" in instruction
+    assert "CASH" in instruction
 
 
 @patch("ai.portfolio_suggest.fetch_recent_headlines", return_value=["Gold rallies on rate cut bets"])
-@patch("ai.portfolio_suggest.fetch_price_history")
+@patch("ai.portfolio_suggest.fetch_price_history_ohlcv")
 @patch("ai.portfolio_suggest.resolve_yahoo_ticker")
 def test_analyze_assets_and_format_match_build_enriched_asset_context(
     mock_resolve, mock_history, mock_headlines
 ):
     mock_resolve.return_value = ("Gold", "GC=F")
-    mock_history.return_value = pd.Series(
-        [100.0 + i for i in range(60)], index=pd.date_range("2026-01-01", periods=60)
-    )
+    mock_history.return_value = _ohlc([100.0 + i for i in range(60)])
     assets = [MarketAsset("GO10OZ", "Gold 10oz", bid=2000.0, ask=2000.5)]
 
     analyses = analyze_assets(assets)
@@ -345,12 +626,47 @@ def test_analyze_assets_and_format_match_build_enriched_asset_context(
 
 
 def test_parse_final_allocation_extracts_trailing_json_block():
+    # Bare-number shape (tolerated fallback — see docstring) still parses,
+    # just with price/stop_loss left None.
     text = (
         "Some prose explaining the reasoning.\n\n"
         '```json\n{"GO10OZ": 15.0, "CL100BBL": 10, "CASH": 75}\n```'
     )
     allocation = parse_final_allocation(text)
-    assert allocation == {"GO10OZ": 15.0, "CL100BBL": 10.0, "CASH": 75.0}
+    assert allocation == {
+        "GO10OZ": AllocationEntry(pct=15.0),
+        "CL100BBL": AllocationEntry(pct=10.0),
+        "CASH": AllocationEntry(pct=75.0),
+    }
+
+
+def test_parse_final_allocation_extracts_object_shape_with_price_and_stop():
+    text = (
+        "Some prose explaining the reasoning.\n\n"
+        '```json\n{"GO10OZ": {"pct": 15, "price": 2005.5, "stop_loss": 1950.0}, '
+        '"CASH": 85}\n```'
+    )
+    allocation = parse_final_allocation(text)
+    assert allocation == {
+        "GO10OZ": AllocationEntry(pct=15.0, price=2005.5, stop_loss=1950.0),
+        "CASH": AllocationEntry(pct=85.0),
+    }
+
+
+def test_parse_final_allocation_object_shape_tolerates_missing_price_and_stop():
+    text = '```json\n{"GO10OZ": {"pct": 15}, "CASH": 85}\n```'
+    allocation = parse_final_allocation(text)
+    assert allocation["GO10OZ"] == AllocationEntry(pct=15.0, price=None, stop_loss=None)
+
+
+def test_parse_final_allocation_none_when_object_missing_pct():
+    text = '```json\n{"GO10OZ": {"price": 2000.0}, "CASH": 85}\n```'
+    assert parse_final_allocation(text) is None
+
+
+def test_parse_final_allocation_none_when_price_not_numeric():
+    text = '```json\n{"GO10OZ": {"pct": 15, "price": "high"}, "CASH": 85}\n```'
+    assert parse_final_allocation(text) is None
 
 
 def test_parse_final_allocation_none_when_block_missing():
@@ -369,7 +685,7 @@ def test_parse_final_allocation_none_when_shape_is_wrong():
 
 def test_parse_final_allocation_uses_last_block_if_multiple():
     text = '```json\n{"WRONG": 100}\n```\nmore text\n```json\n{"RIGHT": 100}\n```'
-    assert parse_final_allocation(text) == {"RIGHT": 100.0}
+    assert parse_final_allocation(text) == {"RIGHT": AllocationEntry(pct=100.0)}
 
 
 def test_strip_allocation_block_removes_json_leaves_prose():
@@ -398,11 +714,14 @@ def test_strip_allocation_block_only_removes_the_last_block_not_earlier_ones():
     assert "More explanation follows this." in stripped
     assert '{"GO10OZ": 20, "CASH": 80}' not in stripped
     # And parsing must still pick up the real (last) block correctly.
-    assert parse_final_allocation(text) == {"GO10OZ": 20.0, "CASH": 80.0}
+    assert parse_final_allocation(text) == {
+        "GO10OZ": AllocationEntry(pct=20.0),
+        "CASH": AllocationEntry(pct=80.0),
+    }
 
 
 def test_system_instruction_forbids_extra_code_fences():
-    lowered = SYSTEM_INSTRUCTION.lower()
+    lowered = build_stage1_instruction().lower()
     assert "only fenced code block" in lowered
 
 
@@ -447,10 +766,16 @@ def test_feasibility_line_omitted_without_account_equity():
     assert "feasibility:" not in context
 
 
-def test_feasibility_line_omitted_when_contract_spec_missing():
+def test_feasibility_line_discloses_when_contract_spec_missing():
+    # A missing contract spec is a real data gap, not "nothing to say" —
+    # confirmed live this let SP500-SE26 get a free pass on the
+    # affordability check every other instrument got, silently, for a
+    # full day of real runs. It must be disclosed, not omitted.
     analysis = _asset_analysis_with_spec("XYZ999", 1.0, 1.1, None)
     context = format_enriched_asset_context([analysis], account_equity=1000000.0)
-    assert "feasibility:" not in context
+    assert "feasibility:" in context
+    assert "not available" in context.lower()
+    assert "not been verified" in context.lower()
 
 
 def test_build_enriched_asset_context_wrapper_has_no_feasibility_line():
@@ -461,23 +786,373 @@ def test_build_enriched_asset_context_wrapper_has_no_feasibility_line():
 
 
 def test_system_instruction_requires_feasibility_grounding():
-    lowered = SYSTEM_INSTRUCTION.lower()
+    lowered = build_stage1_instruction().lower()
     assert "feasibility" in lowered
     assert "not affordable" in lowered
     assert "whole-lot" in lowered
 
 
 def test_system_instruction_requires_trigger_time_fallback():
-    assert "time-based fallback" in SYSTEM_INSTRUCTION.lower()
+    assert "time-based fallback" in build_stage1_instruction().lower()
 
 
 def test_system_instruction_requires_cash_opportunity_cost_research():
-    lowered = SYSTEM_INSTRUCTION.lower()
+    lowered = build_stage1_instruction().lower()
     assert "opportunity cost" in lowered
     assert "risk-free" in lowered
 
 
 def test_system_instruction_requires_volatility_aware_sizing_and_market_watch_only_hedges():
-    lowered = SYSTEM_INSTRUCTION.lower()
+    lowered = build_stage1_instruction().lower()
     assert "volatility" in lowered and "hedge" in lowered
     assert "market watch instruments below" in lowered
+
+
+@patch("ai.portfolio_suggest.run_openrouter")
+def test_get_openrouter_audit_embeds_summary_and_draft_and_uses_given_model(mock_run):
+    mock_run.return_value = "an audit report"
+    result = get_openrouter_audit(
+        "some summary", "Claude's draft suggestion text", model="openai/gpt-oss-20b:free"
+    )
+    assert result == "an audit report"
+    prompt = mock_run.call_args.args[0]
+    assert "some summary" in prompt
+    assert "Claude's draft suggestion text" in prompt
+    assert "do not have web search" in prompt.lower()
+    assert mock_run.call_args.kwargs["model"] == "openai/gpt-oss-20b:free"
+
+
+def test_audit_instruction_frames_critique_role_not_independent_opinion():
+    lowered = AUDIT_INSTRUCTION.lower()
+    assert "not to produce your own independent competing mix" in lowered
+    assert "do not have web search" in lowered
+    assert "fx" in lowered
+    assert "roll yield" in lowered
+    assert "correlation" in lowered
+    assert "execution/liquidity" in lowered
+    assert "idle-cash" in lowered
+    assert "position-sizing" in lowered
+
+
+@patch("ai.portfolio_suggest.get_openrouter_audit")
+def test_build_audit_block_all_succeed(mock_audit):
+    def audit_side_effect(summary, draft, model, **kwargs):
+        return f"audit from {model}"
+
+    mock_audit.side_effect = audit_side_effect
+    result = build_audit_block("some summary", "Claude's draft mix.")
+    assert result.audit_available is True
+    for _, model in AUDIT_MODELS:
+        assert f"audit from {model}" in result.block
+
+
+# These three tests exercise models that never succeed, which would
+# otherwise trigger the real retry loop (config.AUDIT_RETRY_TIMEOUT_SECONDS
+# // config.AUDIT_RETRY_INTERVAL_SECONDS attempts, sleeping for real
+# between each). Pinning both to 1 forces max_attempts down to 1 so the
+# aggregation logic under test still runs, without a multi-minute test.
+@patch("config.AUDIT_RETRY_TIMEOUT_SECONDS", 1)
+@patch("config.AUDIT_RETRY_INTERVAL_SECONDS", 1)
+@patch("ai.portfolio_suggest.get_openrouter_audit", return_value=OPENROUTER_FAILED_MESSAGE)
+def test_build_audit_block_all_audits_fail(mock_audit):
+    result = build_audit_block("some summary", "Claude's draft mix.")
+    assert result.audit_available is False
+    assert "not available this time" in result.block.lower()
+
+
+@patch("config.AUDIT_RETRY_TIMEOUT_SECONDS", 1)
+@patch("config.AUDIT_RETRY_INTERVAL_SECONDS", 1)
+@patch("ai.portfolio_suggest.get_openrouter_audit")
+def test_build_audit_block_available_if_even_one_model_succeeds(mock_audit):
+    # The whole point of a larger pool: audit_available stays True as
+    # long as *any single* model in it responds, even if every other one
+    # in the pool is down at the same time.
+    working_model = AUDIT_MODELS[0][1]
+
+    def audit_side_effect(summary, draft, model, **kwargs):
+        return "a real audit" if model == working_model else OPENROUTER_FAILED_MESSAGE
+
+    mock_audit.side_effect = audit_side_effect
+    result = build_audit_block("some summary", "Claude's draft mix.")
+    assert result.audit_available is True
+    assert "a real audit" in result.block
+    assert result.block.lower().count("not available this time") == len(AUDIT_MODELS) - 1
+
+
+@patch("config.AUDIT_RETRY_TIMEOUT_SECONDS", 1)
+@patch("config.AUDIT_RETRY_INTERVAL_SECONDS", 1)
+@patch("ai.portfolio_suggest.get_openrouter_audit")
+def test_build_audit_block_treats_one_audit_exception_as_unavailable_without_losing_the_others(mock_audit):
+    failing_model = AUDIT_MODELS[0][1]
+
+    def audit_side_effect(summary, draft, model, **kwargs):
+        if model == failing_model:
+            raise RuntimeError("boom")
+        return "surviving audit text"
+
+    mock_audit.side_effect = audit_side_effect
+    result = build_audit_block("some summary", "Claude's draft mix.")
+    assert result.audit_available is True
+    assert result.block.count("surviving audit text") == len(AUDIT_MODELS) - 1
+
+
+@patch("ai.portfolio_suggest.get_openrouter_audit", return_value="an audit")
+def test_build_audit_block_queries_every_audit_model(mock_audit):
+    build_audit_block("some summary", "Claude's draft mix.")
+    assert mock_audit.call_count == len(AUDIT_MODELS)
+
+
+@patch("ai.portfolio_suggest.get_openrouter_audit")
+def test_build_audit_block_passes_past_lessons_to_every_model(mock_audit, tmp_path):
+    def audit_side_effect(summary, draft, model, **kwargs):
+        return kwargs.get("past_lessons", "")
+
+    mock_audit.side_effect = audit_side_effect
+
+    session_dir = tmp_path
+    session_dir.mkdir(exist_ok=True)
+    (session_dir / "portfolio_suggestion_2026-08-09_120000.md").write_text(
+        "# Portfolio Suggestion Session\n\n"
+        "## Stage 2 — Independent audits\n\n"
+        "Some model found: margin math was wrong for SL10-SE26.\n\n"
+        "## Stage 3 — Claude's final revised suggestion\n\nfinal text\n",
+        encoding="utf-8",
+    )
+
+    import config
+    original_dir = config.PORTFOLIO_RECORDS_DIR
+    config.PORTFOLIO_RECORDS_DIR = str(session_dir)
+    try:
+        result = build_audit_block("some summary", "Claude's draft mix.")
+    finally:
+        config.PORTFOLIO_RECORDS_DIR = original_dir
+
+    assert "margin math was wrong for SL10-SE26" in result.block
+
+
+def test_build_past_audit_lessons_empty_when_records_dir_missing(tmp_path):
+    missing = tmp_path / "does-not-exist"
+    assert build_past_audit_lessons(records_dir=missing) == ""
+
+
+def test_build_past_audit_lessons_empty_when_no_matching_files(tmp_path):
+    (tmp_path / "not_a_record.txt").write_text("irrelevant", encoding="utf-8")
+    assert build_past_audit_lessons(records_dir=tmp_path) == ""
+
+
+def test_build_past_audit_lessons_extracts_stage_2_section(tmp_path):
+    (tmp_path / "portfolio_suggestion_2026-08-09_120000.md").write_text(
+        "# Portfolio Suggestion Session\n\n"
+        "## Input data (account, market, macro summary)\n\nsome input\n\n"
+        "## Stage 1 — Claude's initial draft\n\nsome draft\n\n"
+        "## Stage 2 — Independent audits\n\n"
+        "Nvidia audit: found a 3x margin error on SL10-SE26.\n\n"
+        "## Stage 3 — Claude's final revised suggestion\n\nfinal text\n",
+        encoding="utf-8",
+    )
+
+    lessons = build_past_audit_lessons(records_dir=tmp_path)
+    assert "3x margin error on SL10-SE26" in lessons
+    assert "some input" not in lessons  # only Stage 2 content, not the rest
+    assert "final text" not in lessons
+
+
+def test_build_past_audit_lessons_limits_to_max_sessions():
+    # Uses a real tmp-style approach without the fixture so we can create
+    # more files than max_sessions and confirm only the most recent ones
+    # (by filename, which is timestamp-ordered) are included.
+    import tempfile
+    from pathlib import Path as _Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = _Path(tmp)
+        for i, ts in enumerate(["100000", "110000", "120000"]):
+            (tmp_dir / f"portfolio_suggestion_2026-08-09_{ts}.md").write_text(
+                "## Stage 2 — Independent audits\n\n"
+                f"finding-{i}\n\n"
+                "## Stage 3 — Claude's final revised suggestion\n\nx\n",
+                encoding="utf-8",
+            )
+        lessons = build_past_audit_lessons(records_dir=tmp_dir, max_sessions=2)
+        # Most recent two (110000, 120000) included, oldest (100000) not.
+        assert "finding-1" in lessons
+        assert "finding-2" in lessons
+        assert "finding-0" not in lessons
+
+
+def test_build_past_audit_lessons_truncates_long_sections(tmp_path):
+    long_text = "x" * 5000
+    (tmp_path / "portfolio_suggestion_2026-08-09_120000.md").write_text(
+        f"## Stage 2 — Independent audits\n\n{long_text}\n\n"
+        "## Stage 3 — Claude's final revised suggestion\n\nfinal\n",
+        encoding="utf-8",
+    )
+    lessons = build_past_audit_lessons(records_dir=tmp_path, max_chars_per_session=100)
+    assert len(lessons) < 5000
+
+
+def test_build_past_audit_lessons_skips_file_missing_stage_2_section(tmp_path):
+    (tmp_path / "portfolio_suggestion_2026-08-09_120000.md").write_text(
+        "# No stage sections at all\n", encoding="utf-8"
+    )
+    assert build_past_audit_lessons(records_dir=tmp_path) == ""
+
+
+@patch("ai.portfolio_suggest.get_openrouter_audit", return_value="a fine audit")
+def test_run_audit_with_retry_returns_immediately_on_success(mock_audit):
+    label, result = _run_audit_with_retry("Label", "some/model:free", "summary", "draft")
+    assert label == "Label"
+    assert result == "a fine audit"
+    assert mock_audit.call_count == 1
+
+
+@patch("config.AUDIT_RETRY_TIMEOUT_SECONDS", 600)
+@patch("config.AUDIT_RETRY_INTERVAL_SECONDS", 60)
+@patch("ai.portfolio_suggest.time.sleep")
+@patch("ai.portfolio_suggest.get_openrouter_audit")
+def test_run_audit_with_retry_retries_until_success(mock_audit, mock_sleep):
+    mock_audit.side_effect = [OPENROUTER_FAILED_MESSAGE, OPENROUTER_FAILED_MESSAGE, "recovered audit"]
+    label, result = _run_audit_with_retry("Label", "some/model:free", "summary", "draft")
+    assert result == "recovered audit"
+    assert mock_audit.call_count == 3
+    # Slept between the two failed attempts and the eventual success, but
+    # not a third time after success — no wasted wait once a model answers.
+    assert mock_sleep.call_count == 2
+    mock_sleep.assert_called_with(60)
+
+
+@patch("config.AUDIT_RETRY_TIMEOUT_SECONDS", 180)
+@patch("config.AUDIT_RETRY_INTERVAL_SECONDS", 60)
+@patch("ai.portfolio_suggest.time.sleep")
+@patch("ai.portfolio_suggest.get_openrouter_audit", return_value=OPENROUTER_FAILED_MESSAGE)
+def test_run_audit_with_retry_gives_up_after_max_attempts(mock_audit, mock_sleep):
+    # 180 // 60 = 3 attempts total, so a model that's down the entire time
+    # is still eventually written off rather than retried forever.
+    label, result = _run_audit_with_retry("Label", "some/model:free", "summary", "draft")
+    assert result == OPENROUTER_FAILED_MESSAGE
+    assert mock_audit.call_count == 3
+    assert mock_sleep.call_count == 2
+
+
+@patch("ai.portfolio_suggest.time.sleep")
+@patch("ai.portfolio_suggest.get_openrouter_audit", return_value=OPENROUTER_MISSING_KEY_MESSAGE)
+def test_run_audit_with_retry_does_not_retry_missing_key(mock_audit, mock_sleep):
+    # A missing API key is a config problem, not a transient outage —
+    # retrying it for 10 minutes would never help.
+    label, result = _run_audit_with_retry("Label", "some/model:free", "summary", "draft")
+    assert result == OPENROUTER_MISSING_KEY_MESSAGE
+    assert mock_audit.call_count == 1
+    mock_sleep.assert_not_called()
+
+
+@patch("config.AUDIT_RETRY_TIMEOUT_SECONDS", 120)
+@patch("config.AUDIT_RETRY_INTERVAL_SECONDS", 60)
+@patch("ai.portfolio_suggest.time.sleep")
+@patch("ai.portfolio_suggest.get_openrouter_audit")
+def test_run_audit_with_retry_treats_exception_as_failure_and_retries(mock_audit, mock_sleep):
+    mock_audit.side_effect = [RuntimeError("boom"), "recovered after exception"]
+    label, result = _run_audit_with_retry("Label", "some/model:free", "summary", "draft")
+    assert result == "recovered after exception"
+    assert mock_audit.call_count == 2
+    assert mock_sleep.call_count == 1
+
+
+@patch("ai.portfolio_suggest.get_openrouter_audit", return_value="a fine audit")
+def test_run_audit_with_retry_updates_status_map_on_success(mock_audit):
+    status_map = {}
+    _run_audit_with_retry("Label", "some/model:free", "summary", "draft", status_map)
+    assert status_map["Label"].state == "succeeded"
+    assert status_map["Label"].attempt == 1
+
+
+@patch("config.AUDIT_RETRY_TIMEOUT_SECONDS", 600)
+@patch("config.AUDIT_RETRY_INTERVAL_SECONDS", 60)
+@patch("ai.portfolio_suggest.get_openrouter_audit")
+def test_run_audit_with_retry_sets_retrying_status_before_sleeping(mock_audit):
+    mock_audit.side_effect = [OPENROUTER_FAILED_MESSAGE, "recovered"]
+    status_map = {}
+    captured = {}
+
+    def fake_sleep(seconds):
+        captured["state"] = status_map["Label"].state
+        captured["retry_at_is_set"] = status_map["Label"].retry_at is not None
+
+    with patch("ai.portfolio_suggest.time.sleep", side_effect=fake_sleep):
+        _run_audit_with_retry("Label", "some/model:free", "summary", "draft", status_map)
+
+    assert captured["state"] == "retrying"
+    assert captured["retry_at_is_set"] is True
+    # Final status reflects the eventual outcome, not the transient retry.
+    assert status_map["Label"].state == "succeeded"
+
+
+@patch("config.AUDIT_RETRY_TIMEOUT_SECONDS", 120)
+@patch("config.AUDIT_RETRY_INTERVAL_SECONDS", 60)
+@patch("ai.portfolio_suggest.time.sleep")
+@patch("ai.portfolio_suggest.get_openrouter_audit", return_value=OPENROUTER_FAILED_MESSAGE)
+def test_run_audit_with_retry_sets_gave_up_status(mock_audit, mock_sleep):
+    status_map = {}
+    _run_audit_with_retry("Label", "some/model:free", "summary", "draft", status_map)
+    assert status_map["Label"].state == "gave_up"
+    assert status_map["Label"].attempt == 2  # 120 // 60 = 2 max attempts
+
+
+def test_format_audit_progress_counts_and_lists_each_state():
+    status_map = {
+        "A": ModelAuditStatus(state="succeeded", attempt=1, max_attempts=10),
+        "B": ModelAuditStatus(state="retrying", attempt=2, max_attempts=10, retry_at=time.monotonic() + 30),
+        "C": ModelAuditStatus(state="gave_up", attempt=10, max_attempts=10),
+        "D": ModelAuditStatus(state="in_progress", attempt=1, max_attempts=10),
+        "E": ModelAuditStatus(state="waiting", attempt=0, max_attempts=0),
+    }
+    text = _format_audit_progress(status_map)
+    assert "1/5 models completed" in text
+    assert "A" in text and "audit received" in text
+    assert "B" in text and "retrying in" in text
+    assert "C" in text and "giving up" in text
+    assert "D" in text and "waiting for response" in text
+    assert "E" in text and "waiting to start" in text
+
+
+@patch("ai.portfolio_suggest.time.sleep")
+@patch("ai.portfolio_suggest.get_openrouter_audit", return_value="an audit")
+def test_build_audit_block_calls_on_progress_and_reports_final_completion(mock_audit, mock_sleep):
+    progress_calls = []
+    build_audit_block("summary", "draft", on_progress=progress_calls.append)
+    assert progress_calls
+    assert f"{len(AUDIT_MODELS)}/{len(AUDIT_MODELS)} models completed" in progress_calls[-1]
+
+
+def test_build_audit_block_without_on_progress_still_works():
+    # on_progress defaults to None — the polling loop must not require it.
+    with patch("ai.portfolio_suggest.get_openrouter_audit", return_value="an audit"), \
+         patch("ai.portfolio_suggest.time.sleep"):
+        result = build_audit_block("summary", "draft")
+    assert result.audit_available is True
+
+
+def test_build_stage2_instruction_audit_available_frames_synthesis_without_disclosure():
+    lowered = build_stage2_instruction(True).lower()
+    assert "the independent audit of my draft was not available for this run" not in lowered
+    assert "revision" in lowered
+
+
+def test_build_stage2_instruction_audit_unavailable_requires_disclosure_and_self_review():
+    lowered = build_stage2_instruction(False).lower()
+    assert "the independent audit of my draft was not available for this run" in lowered
+
+
+def test_build_stage1_and_stage2_share_failure_mode_checklist():
+    for instruction in [build_stage1_instruction(), build_stage2_instruction(True), build_stage2_instruction(False)]:
+        lowered = instruction.lower()
+        assert "roll yield" in lowered
+        assert "idle cash" in lowered
+
+
+def test_system_instruction_directs_social_media_research():
+    lowered = build_stage1_instruction().lower()
+    assert "x/twitter" in lowered
+    assert "reddit" in lowered
+    # Must be framed as lower-confidence than official/news sources, not
+    # treated as equally authoritative.
+    assert "lower-confidence" in lowered
