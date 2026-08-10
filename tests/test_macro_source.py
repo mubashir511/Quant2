@@ -1,8 +1,14 @@
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import requests
 
-from data.macro_source import fetch_country_indicators, fetch_fx_rate_to_usd, fetch_market_indicators
+from data.macro_source import (
+    fetch_country_indicators,
+    fetch_fx_rate_to_usd,
+    fetch_market_indicators,
+    fetch_pakistan_rates,
+)
 
 
 def _fake_history(close_price: float) -> pd.DataFrame:
@@ -137,3 +143,65 @@ def test_fetch_fx_rate_to_usd_tolerates_failure(mock_ticker_cls):
     mock_ticker_cls.return_value = mock_ticker
 
     assert fetch_fx_rate_to_usd("XYZ") is None
+
+
+_SBP_RATES_HTML = """
+<span>KIBOR As on 07- Aug - 26</span>
+<table class="table kibor-table">
+<thead><tr><th>Tenor</th><th>BID</th><th>Offer</th></tr></thead>
+<tbody>
+<tr><td>3-M</td><td>11.44</td><td>11.69</td></tr>
+<tr><td>6-M</td><td>11.51</td><td>11.76</td></tr>
+</tbody>
+</table>
+<div><span>MTBs</span>
+<div class="tbl__wrapper"><table>
+<thead><tr><th>Tenor</th><th>Cut-off Yield</th></tr></thead>
+<tbody>
+<tr><td>1-M</td><td>11.3504%</td></tr>
+<tr><td>3-M</td><td>11.5154%</td></tr>
+</tbody>
+</table></div>
+</div>
+<div><span>Fixed - Rate PIB</span>
+<div class="tbl__wrapper"><table>
+<thead><tr><th>Tenor</th><th>Cut-off Yield</th></tr></thead>
+<tbody>
+<tr><td>2-Y</td><td>Bids Rejected</td></tr>
+<tr><td>5-Y</td><td>11.8000%</td></tr>
+</tbody>
+</table></div>
+</div>
+"""
+
+
+def _mock_sbp_response(text=None, status_ok=True):
+    resp = MagicMock()
+    resp.text = text or ""
+    if status_ok:
+        resp.raise_for_status.return_value = None
+    else:
+        resp.raise_for_status.side_effect = requests.HTTPError("boom")
+    return resp
+
+
+@patch("requests.get")
+def test_fetch_pakistan_rates_parses_kibor_mtb_pib(mock_get):
+    mock_get.return_value = _mock_sbp_response(text=_SBP_RATES_HTML)
+    rates = fetch_pakistan_rates()
+    assert rates.kibor_pct == {"3-M": 11.565, "6-M": 11.635}
+    assert rates.mtb_yield_pct == {"1-M": 11.3504, "3-M": 11.5154}
+    assert rates.pib_yield_pct == {"5-Y": 11.80}  # "Bids Rejected" tenor skipped, not fabricated
+    assert "07" in rates.as_of and "Aug" in rates.as_of
+
+
+@patch("requests.get")
+def test_fetch_pakistan_rates_none_on_request_failure(mock_get):
+    mock_get.return_value = _mock_sbp_response(status_ok=False)
+    assert fetch_pakistan_rates() is None
+
+
+@patch("requests.get")
+def test_fetch_pakistan_rates_none_when_no_tables_found(mock_get):
+    mock_get.return_value = _mock_sbp_response(text="<html><body>nothing here</body></html>")
+    assert fetch_pakistan_rates() is None

@@ -965,10 +965,15 @@ def get_openrouter_audit(
     model: str,
     timeout: int | None = None,
     past_lessons: str = "",
+    audit_instruction: str = AUDIT_INSTRUCTION,
 ) -> str:
+    # audit_instruction defaults to the PMEX-futures-specific checklist
+    # above but is overridable — ai/psx_suggest.py passes its own
+    # equity-appropriate checklist through the same retry/pooling
+    # machinery below rather than duplicating it.
     timeout = config.OPENROUTER_TIMEOUT_SECONDS if timeout is None else timeout
     prompt = (
-        f"{AUDIT_INSTRUCTION}\n\n{summary}\n\n"
+        f"{audit_instruction}\n\n{summary}\n\n"
         f"Draft suggestion to audit:\n{draft_suggestion}"
     )
     if past_lessons:
@@ -1088,6 +1093,7 @@ def _run_audit_with_retry(
     draft: str,
     status_map: dict[str, ModelAuditStatus] | None = None,
     past_lessons: str = "",
+    audit_instruction: str = AUDIT_INSTRUCTION,
 ) -> tuple[str, str]:
     """Retries a failed/rate-limited audit model every
     config.AUDIT_RETRY_INTERVAL_SECONDS, up to config.AUDIT_RETRY_TIMEOUT_SECONDS
@@ -1122,7 +1128,13 @@ def _run_audit_with_retry(
     for attempt in range(max_attempts):
         _set_status("in_progress", attempt + 1)
         try:
-            result = get_openrouter_audit(summary, draft, model=model, past_lessons=past_lessons)
+            result = get_openrouter_audit(
+                summary,
+                draft,
+                model=model,
+                past_lessons=past_lessons,
+                audit_instruction=audit_instruction,
+            )
         except Exception:
             result = OPENROUTER_FAILED_MESSAGE
 
@@ -1182,7 +1194,11 @@ def _format_audit_progress(status_map: dict[str, ModelAuditStatus]) -> str:
 
 
 def build_audit_block(
-    summary: str, draft: str, on_progress: Callable[[str], None] | None = None
+    summary: str,
+    draft: str,
+    on_progress: Callable[[str], None] | None = None,
+    audit_instruction: str = AUDIT_INSTRUCTION,
+    records_dir: Path | None = None,
 ) -> AuditResult:
     """Runs every model in AUDIT_MODELS in parallel against Claude's own
     stage-1 draft, retrying each one individually (see
@@ -1191,6 +1207,13 @@ def build_audit_block(
     review, unlike the old Gemini-gated design. audit_available is true if
     *any* model responds, so the pool tolerates several being down at once
     (see AUDIT_MODELS for why it's spread across multiple providers).
+
+    `audit_instruction` and `records_dir` let a different market's
+    suggestion pipeline (see ai/psx_suggest.py) reuse this exact retry/
+    pooling/progress machinery with its own failure-mode checklist and its
+    own past-session lessons, without duplicating any of the threading
+    logic below — defaults preserve the original PMEX-futures behavior
+    exactly for every existing caller.
 
     `on_progress`, if given, is called from THIS function's own thread
     (not from the worker threads themselves — Streamlit commands aren't
@@ -1203,14 +1226,23 @@ def build_audit_block(
     }
     # Computed once here, not per-model — it's the same file-read result
     # for every model in the pool, so no reason to redo the I/O 6 times.
-    past_lessons = build_past_audit_lessons()
+    past_lessons = build_past_audit_lessons(records_dir=records_dir)
 
     with ThreadPoolExecutor(max_workers=len(AUDIT_MODELS)) as pool:
         # Submitted as individual futures (not list(pool.map(...))) so one
         # audit's exception can't abort iteration before a sibling's
         # already-completed result is collected.
         futures = [
-            pool.submit(_run_audit_with_retry, label, model, summary, draft, status_map, past_lessons)
+            pool.submit(
+                _run_audit_with_retry,
+                label,
+                model,
+                summary,
+                draft,
+                status_map,
+                past_lessons,
+                audit_instruction,
+            )
             for label, model in AUDIT_MODELS
         ]
 

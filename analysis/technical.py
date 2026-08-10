@@ -97,7 +97,14 @@ def _compute_atr(ohlc: pd.DataFrame) -> float | None:
     gap from the prior close) averaged over ATR_WINDOW days. None if
     there isn't enough history for a real window's worth of data —
     matches this file's rule of never fabricating a stat from a window
-    shorter than it claims."""
+    shorter than it claims. Also None (rather than raising) if the given
+    frame doesn't even have High/Low columns at all — some sources feeding
+    this (e.g. data/psx_source.py's EOD history, which only has Open/
+    Close/Volume) genuinely can't provide them, so this degrades exactly
+    like "not enough rows" rather than crashing the whole stats computation
+    for a source that just doesn't carry High/Low."""
+    if not {"High", "Low", "Close"}.issubset(ohlc.columns):
+        return None
     ohlc = ohlc.dropna(subset=["High", "Low", "Close"])
     if len(ohlc) < ATR_WINDOW + 1:
         return None

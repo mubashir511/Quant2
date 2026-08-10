@@ -92,3 +92,24 @@ PRICE_SANITY_BAND_PCT = float(os.getenv("PRICE_SANITY_BAND_PCT", "5"))
 # as it always has). Point it at wherever your terminal's Data Folder
 # writes Files (MetaEditor: File > Open Data Folder > MQL5 > Files).
 MT5_SYMBOL_SPECS_CSV_PATH = os.getenv("MT5_SYMBOL_SPECS_CSV_PATH", "")
+
+# --- PSX (Pakistan Stock Exchange) research/suggestion avenue ---
+# Unlike PMEX (live MT5 account), there's no broker API for this side (the
+# user's K-Trade account has no programmatic access) — PSX suggestions are
+# a hypothetical, research-only portfolio built from the exchange's own
+# public Data Portal (dps.psx.com.pk) plus the same web-research pipeline,
+# with no account/position awareness and no execution.
+PSX_REQUEST_TIMEOUT_SECONDS = int(os.getenv("PSX_REQUEST_TIMEOUT_SECONDS", "15"))
+
+# How many KSE-100 constituents (ranked by volume) get full technical +
+# fundamental enrichment — mirrors MAX_ENRICHED_ASSETS' role for PMEX, just
+# scoped to the flagship blue-chip index rather than a user-curated list,
+# since PSX has ~490 listed symbols in total and there's no equivalent of
+# "what the user put in their own Market Watch" to size the pool by.
+MAX_PSX_ENRICHED_ASSETS = int(os.getenv("MAX_PSX_ENRICHED_ASSETS", "20"))
+
+# Separate from PORTFOLIO_RECORDS_DIR so a PSX equity session's past-audit
+# lessons never get fed into a PMEX futures audit or vice versa — the two
+# markets' failure modes (roll yield/margin vs. dividend/circuit-breaker/
+# free-float risk) don't meaningfully transfer between each other.
+PSX_RECORDS_DIR = os.getenv("PSX_RECORDS_DIR", "records/psx")

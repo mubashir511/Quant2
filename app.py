@@ -16,15 +16,141 @@ from ai.portfolio_suggest import (
     strip_allocation_block,
     suggest_portfolio,
 )
+from ai.psx_suggest import (
+    analyze_psx_assets,
+    build_psx_summary,
+    compute_sector_allocation,
+    compute_sector_performance,
+    suggest_psx_portfolio,
+)
 from data.mt5_execution import OrderResult, close_position, open_position
 from data.mt5_source import MT5ConnectionError, get_contract_spec
+from data.psx_source import PSX_INDICES, PSXAsset, PSXConnectionError, get_psx_market_watch
 from risk.apply_suggestion import compute_rebalance_plan
 from risk.rebalance import evaluate_positions
 
+# A fixed-order categorical palette (validated colorblind-safe adjacent
+# pairs, per this project's dataviz conventions) — used everywhere a
+# chart distinguishes categories (allocation slices, sectors), instead of
+# Plotly's default rainbow cycling, so the same few hues mean the same
+# thing across every chart on the page.
+_CATEGORICAL_COLORS = [
+    "#2a78d6",  # blue
+    "#eb6834",  # orange
+    "#1baf7a",  # aqua
+    "#eda100",  # yellow
+    "#e87ba4",  # magenta
+    "#008300",  # green
+    "#4a3aa7",  # violet
+    "#e34948",  # red
+]
+# The same blue/red pair, used instead for its OTHER job here: a
+# diverging (positive/negative) polarity encoding, not category identity
+# — gains vs. losses, not "sector A vs. sector B".
+_GAIN_COLOR = "#2a78d6"
+_LOSS_COLOR = "#e34948"
+
+
+def _render_pie(names: list[str], values: list[float], title: str) -> None:
+    fig = px.pie(
+        names=names,
+        values=values,
+        hole=0.35,
+        color_discrete_sequence=_CATEGORICAL_COLORS,
+    )
+    fig.update_traces(
+        textinfo="label+percent",
+        hovertemplate="%{label}: %{value:.1f}%<extra></extra>",
+    )
+    fig.update_layout(
+        title=title,
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend=dict(orientation="h", yanchor="top", y=-0.15),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
 
 def _render_allocation_chart(allocation: dict[str, AllocationEntry]) -> None:
-    fig = px.pie(names=list(allocation.keys()), values=[e.pct for e in allocation.values()])
-    fig.update_layout(title="Suggested Allocation", margin=dict(l=10, r=10, t=40, b=10))
+    _render_pie(
+        list(allocation.keys()), [e.pct for e in allocation.values()], "Allocation by Instrument"
+    )
+
+
+def _render_sector_allocation_chart(
+    allocation: dict[str, AllocationEntry], analyses: list
+) -> None:
+    sector_pct = compute_sector_allocation(allocation, analyses)
+    if not sector_pct:
+        return
+    _render_pie(list(sector_pct.keys()), list(sector_pct.values()), "Allocation by Sector")
+
+
+def _render_sector_performance_chart(all_assets: list[PSXAsset]) -> None:
+    performance = compute_sector_performance(all_assets)
+    if not performance:
+        return
+    # Reversed so the best-performing sector renders at the TOP of the
+    # horizontal bar chart — Plotly draws categorical y-axes bottom-to-top
+    # in the order given, so the worst performer needs to come first.
+    ordered = list(reversed(performance))
+    sectors = [p[0] for p in ordered]
+    changes = [p[1] for p in ordered]
+    counts = [p[2] for p in ordered]
+    colors = [_GAIN_COLOR if c >= 0 else _LOSS_COLOR for c in changes]
+
+    fig = go.Figure(
+        go.Bar(
+            x=changes,
+            y=sectors,
+            orientation="h",
+            marker_color=colors,
+            customdata=counts,
+            hovertemplate="%{y}: %{x:+.2f}%% avg (%{customdata} symbols)<extra></extra>",
+        )
+    )
+    fig.add_vline(x=0, line_color="gray", line_width=1)
+    fig.update_layout(
+        title="Sector Performance Today — Whole PSX Market",
+        xaxis_title="Average % change",
+        margin=dict(l=10, r=10, t=40, b=10),
+        height=max(320, 26 * len(sectors)),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_risk_return_scatter(analyses: list) -> None:
+    rows = [
+        {
+            "symbol": a.symbol,
+            "sector": a.sector_name,
+            "volatility": a.stats.volatility_annualized_pct,
+            "relative_strength": a.relative_strength_1m_pct,
+        }
+        for a in analyses
+        if a.stats.volatility_annualized_pct is not None and a.relative_strength_1m_pct is not None
+    ]
+    if not rows:
+        return
+    df = pd.DataFrame(rows)
+    fig = px.scatter(
+        df,
+        x="volatility",
+        y="relative_strength",
+        color="sector",
+        text="symbol",
+        color_discrete_sequence=_CATEGORICAL_COLORS,
+        labels={
+            "volatility": "Annualized Volatility (%)",
+            "relative_strength": "1-Month Relative Strength vs. Index (%)",
+        },
+    )
+    fig.update_traces(textposition="top center", marker=dict(size=11, line=dict(width=1, color="white")))
+    fig.add_hline(y=0, line_dash="dot", line_color="gray")
+    fig.update_layout(
+        title="Risk vs. Relative Strength — Enriched Candidates",
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend_title_text="Sector",
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -33,13 +159,24 @@ def _render_instrument_chart(analysis: AssetAnalysis) -> None:
         return
     fig = go.Figure()
     fig.add_trace(
-        go.Scatter(x=analysis.prices.index, y=analysis.prices.values, mode="lines", name=analysis.symbol)
+        go.Scatter(
+            x=analysis.prices.index,
+            y=analysis.prices.values,
+            mode="lines",
+            name=analysis.symbol,
+            line=dict(color=_CATEGORICAL_COLORS[0], width=2),
+        )
     )
     if analysis.stats.support is not None:
-        fig.add_hline(y=analysis.stats.support, line_dash="dash", line_color="green", annotation_text="support")
+        fig.add_hline(
+            y=analysis.stats.support, line_dash="dash", line_color=_GAIN_COLOR, annotation_text="support"
+        )
     if analysis.stats.resistance is not None:
         fig.add_hline(
-            y=analysis.stats.resistance, line_dash="dash", line_color="red", annotation_text="resistance"
+            y=analysis.stats.resistance,
+            line_dash="dash",
+            line_color=_LOSS_COLOR,
+            annotation_text="resistance",
         )
     fig.update_layout(
         title=f"{analysis.symbol} ({analysis.display_name})",
@@ -113,15 +250,11 @@ else:
     st.caption("Click the button to get a plain-English narration via the local `claude` CLI.")
 
 st.header("Portfolio Suggestion")
-st.caption(
-    "Early-stage and discretionary — not a rule-backed recommendation, but "
-    "it does factor in your open positions above. Claude drafts a "
-    f"suggestion with live web research, up to {len(AUDIT_MODELS)} free "
-    "models audit it (each retried for up to 10 min if unavailable, so "
-    "more of them get to weigh in), then Claude revises. Can take up to "
-    "~35 minutes and uses significant Claude Pro usage."
-)
-button_col, model_col, apply_col = st.columns([2, 1, 1])
+exchange_col, button_col, model_col, apply_col = st.columns([1, 2, 1, 1])
+with exchange_col:
+    selected_exchange = st.selectbox(
+        "Exchange", ["PMEX", "PSX"], index=0, label_visibility="collapsed"
+    )
 with button_col:
     suggest_clicked = st.button("Suggest Portfolio Mix")
 with model_col:
@@ -129,11 +262,125 @@ with model_col:
         "Model", ["sonnet", "opus", "haiku"], index=0, label_visibility="collapsed"
     )
 with apply_col:
+    # PSX has no execution avenue at all (K-Trade has no order-placement
+    # API) — force-disabled regardless of session_state, on top of
+    # PMEX's own suggested_allocation gate, so switching the exchange
+    # dropdown can never leave this looking clickable for a market it
+    # doesn't apply to.
     apply_clicked = st.button(
-        "Apply Suggestion", disabled=not st.session_state.get("suggested_allocation")
+        "Apply Suggestion",
+        disabled=(selected_exchange != "PMEX") or not st.session_state.get("suggested_allocation"),
     )
 
-if suggest_clicked:
+if selected_exchange == "PSX":
+    st.caption(
+        "Hypothetical and research-only — there's no live K-Trade account "
+        "connection (no broker API exists for it), so this builds an "
+        "illustrative portfolio from PSX's own public market data plus "
+        f"live web research, audited by up to {len(AUDIT_MODELS)} free "
+        "models the same way as the PMEX suggestion, for you to consider "
+        "and execute manually through your own broker. No positions, no "
+        "automatic execution."
+    )
+    capital_col, index_col = st.columns([1, 1])
+    with capital_col:
+        hypothetical_capital = st.number_input(
+            "Hypothetical capital (PKR)", min_value=0.0, value=1_000_000.0, step=50_000.0
+        )
+    with index_col:
+        # Narrows the enrichment pool to one real PSX index instead of
+        # always drawing from the full ~490-symbol market, by explicit
+        # user request — so the model reasons over a focused, coherent
+        # set of companies rather than the entire exchange.
+        index_labels = list(PSX_INDICES.values())
+        index_tags = list(PSX_INDICES.keys())
+        selected_index_label = st.selectbox("PSX Index", index_labels, index=0)
+        selected_index_tag = index_tags[index_labels.index(selected_index_label)]
+else:
+    st.caption(
+        "Early-stage and discretionary — not a rule-backed recommendation, but "
+        "it does factor in your open positions above. Claude drafts a "
+        f"suggestion with live web research, up to {len(AUDIT_MODELS)} free "
+        "models audit it (each retried for up to 10 min if unavailable, so "
+        "more of them get to weigh in), then Claude revises. Can take up to "
+        "~35 minutes and uses significant Claude Pro usage."
+    )
+
+if suggest_clicked and selected_exchange == "PSX":
+    error_message = None
+    warning_message = None
+    suggestion = None
+    analyses = None
+
+    with st.status("Building a PSX portfolio suggestion...", expanded=True) as status:
+        try:
+            st.write("Fetching PSX market data...")
+            psx_assets = get_psx_market_watch()
+        except PSXConnectionError as e:
+            error_message = str(e)
+        else:
+            if not psx_assets:
+                warning_message = "PSX Data Portal returned no symbols — try again shortly."
+            else:
+                analyses = analyze_psx_assets(psx_assets, index_tag=selected_index_tag)
+                psx_summary = build_psx_summary(
+                    hypothetical_capital, psx_assets, analyses, index_tag=selected_index_tag
+                )
+
+                audit_placeholder = {"box": None}
+
+                def _on_stage(msg: str) -> None:
+                    st.write(msg)
+                    if msg.startswith("Sending the draft to"):
+                        audit_placeholder["box"] = st.empty()
+
+                def _on_audit_progress(text: str) -> None:
+                    box = audit_placeholder["box"]
+                    if box is not None:
+                        box.markdown(text)
+
+                suggestion = suggest_psx_portfolio(
+                    psx_summary,
+                    on_stage=_on_stage,
+                    on_audit_progress=_on_audit_progress,
+                    model=selected_model,
+                    save_record=True,
+                )
+                if suggestion == CLI_MISSING_MESSAGE or suggestion.startswith(CLI_FAILED_PREFIX):
+                    error_message = suggestion
+
+        if error_message:
+            status.update(label="Failed", state="error")
+        elif warning_message:
+            status.update(label="No PSX data available", state="error")
+        else:
+            status.update(label="Suggestion ready", state="complete")
+
+    # Own session_state namespace (psx_* rather than the PMEX keys below)
+    # so a PSX result can never make "Apply Suggestion" look enabled for
+    # a real MT5 account, and a stale PMEX allocation never bleeds into a
+    # PSX run — see the "Apply Suggestion" disabled= condition above.
+    st.session_state["psx_suggestion_error"] = error_message
+    st.session_state["psx_suggestion_warning"] = warning_message
+    if suggestion is not None and not error_message:
+        allocation = parse_final_allocation(suggestion)
+        display_text = strip_allocation_block(suggestion)
+        if len(display_text) < 200 and len(suggestion) > 200:
+            display_text = suggestion
+        st.session_state["psx_last_suggestion_text"] = display_text
+        st.session_state["psx_last_suggestion_analyses"] = analyses
+        st.session_state["psx_suggested_allocation"] = allocation
+        # Kept alongside the enriched analyses so the sector-performance
+        # chart (a whole-market view, not just the enriched pool) can
+        # still redraw after the rerun below, the same reason analyses
+        # itself is persisted rather than recomputed.
+        st.session_state["psx_last_market_assets"] = psx_assets
+    else:
+        st.session_state["psx_last_suggestion_text"] = None
+        st.session_state["psx_last_suggestion_analyses"] = None
+    st.rerun()
+
+elif suggest_clicked:
     error_message = None
     warning_message = None
     suggestion = None
@@ -231,26 +478,58 @@ if suggest_clicked:
 # Rendered from session_state (not gated on suggest_clicked) so it
 # survives the rerun above and keeps showing after any later, unrelated
 # button click on this page (e.g. clicking "Apply Suggestion" itself).
-if st.session_state.get("suggestion_error"):
-    # Covers both the MT5 connection error and the claude -p call itself
-    # failing — show that clearly and stop, rather than rendering research
-    # charts next to an easy-to-miss error (which is exactly what an
-    # earlier "just charts, no suggestion" bug looked like).
-    st.error(st.session_state["suggestion_error"])
-elif st.session_state.get("suggestion_warning"):
-    st.warning(st.session_state["suggestion_warning"])
-elif st.session_state.get("last_suggestion_text"):
-    allocation = st.session_state.get("suggested_allocation")
-    if allocation:
-        _render_allocation_chart(allocation)
-    st.markdown(st.session_state["last_suggestion_text"])
+# Each exchange has its own session_state namespace (see above), so
+# switching the dropdown shows that exchange's own last result, if any.
+if selected_exchange == "PSX":
+    if st.session_state.get("psx_suggestion_error"):
+        st.error(st.session_state["psx_suggestion_error"])
+    elif st.session_state.get("psx_suggestion_warning"):
+        st.warning(st.session_state["psx_suggestion_warning"])
+    elif st.session_state.get("psx_last_suggestion_text"):
+        psx_allocation = st.session_state.get("psx_suggested_allocation")
+        psx_analyses = st.session_state.get("psx_last_suggestion_analyses") or []
+        psx_market_assets = st.session_state.get("psx_last_market_assets") or []
 
-    analyses = st.session_state.get("last_suggestion_analyses") or []
-    chartable = [a for a in analyses if a.display_name is not None and not a.prices.empty]
-    if chartable:
-        with st.expander(f"Instrument charts ({len(chartable)})"):
-            for a in chartable:
-                _render_instrument_chart(a)
+        if psx_allocation:
+            alloc_col, sector_col = st.columns(2)
+            with alloc_col:
+                _render_allocation_chart(psx_allocation)
+            with sector_col:
+                _render_sector_allocation_chart(psx_allocation, psx_analyses)
+
+        st.markdown(st.session_state["psx_last_suggestion_text"])
+
+        if psx_market_assets:
+            _render_sector_performance_chart(psx_market_assets)
+        if psx_analyses:
+            _render_risk_return_scatter(psx_analyses)
+
+        psx_chartable = [a for a in psx_analyses if a.display_name is not None and not a.prices.empty]
+        if psx_chartable:
+            with st.expander(f"Instrument charts ({len(psx_chartable)})"):
+                for a in psx_chartable:
+                    _render_instrument_chart(a)
+else:
+    if st.session_state.get("suggestion_error"):
+        # Covers both the MT5 connection error and the claude -p call itself
+        # failing — show that clearly and stop, rather than rendering research
+        # charts next to an easy-to-miss error (which is exactly what an
+        # earlier "just charts, no suggestion" bug looked like).
+        st.error(st.session_state["suggestion_error"])
+    elif st.session_state.get("suggestion_warning"):
+        st.warning(st.session_state["suggestion_warning"])
+    elif st.session_state.get("last_suggestion_text"):
+        allocation = st.session_state.get("suggested_allocation")
+        if allocation:
+            _render_allocation_chart(allocation)
+        st.markdown(st.session_state["last_suggestion_text"])
+
+        analyses = st.session_state.get("last_suggestion_analyses") or []
+        chartable = [a for a in analyses if a.display_name is not None and not a.prices.empty]
+        if chartable:
+            with st.expander(f"Instrument charts ({len(chartable)})"):
+                for a in chartable:
+                    _render_instrument_chart(a)
 
 if apply_clicked:
     allocation = st.session_state.get("suggested_allocation")

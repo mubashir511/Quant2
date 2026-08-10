@@ -1,7 +1,18 @@
+import re
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 WORLD_BANK_BASE_URL = "https://api.worldbank.org/v2/country"
+
+# State Bank of Pakistan's own public rates page — a real, official,
+# free equivalent to this file's US Treasury yield curve (see
+# fetch_market_indicators) for the PSX side. Live-verified: plain
+# server-rendered <table>s (no JS needed), one for KIBOR (the interbank
+# lending benchmark most Pakistani financial commentary actually cites,
+# closer in practice to the policy rate than any other free structured
+# figure found) and several for MTB/PIB government-bond auction cut-off
+# yields — a genuine Pakistani yield curve.
+SBP_RATES_URL = "https://www.sbp.org.pk/ecodata/kibor_index.asp"
 
 # Taiwan is deliberately excluded — the World Bank API doesn't carry it as
 # a reporting entity (political-recognition status), confirmed empty on a
@@ -19,6 +30,7 @@ COUNTRY_NAMES = {
     "KR": "South Korea",
     "SA": "Saudi Arabia",
     "AE": "United Arab Emirates",
+    "PK": "Pakistan",
 }
 
 INDICATOR_CODES = {
@@ -44,6 +56,14 @@ class CountryIndicators:
     gdp_growth_pct: float | None
     inflation_pct: float | None
     unemployment_pct: float | None
+
+
+@dataclass
+class PakistanRates:
+    as_of: str | None
+    kibor_pct: dict[str, float] = field(default_factory=dict)  # tenor -> mid of bid/offer
+    mtb_yield_pct: dict[str, float] = field(default_factory=dict)  # T-Bill cut-off yields
+    pib_yield_pct: dict[str, float] = field(default_factory=dict)  # Fixed-rate PIB cut-off yields
 
 
 def _fetch_latest_price(ticker: str) -> float | None:
@@ -156,3 +176,87 @@ def fetch_country_indicators(
         )
         for code in countries
     ]
+
+
+def _table_label(table) -> str:
+    # Neither table on this page has a <caption> — the identifying text
+    # sits in a preceding sibling (KIBOR) or the parent's preceding
+    # sibling (MTB/PIB, each wrapped in their own container div),
+    # confirmed by inspecting the real page rather than guessed.
+    prev = table.find_previous_sibling()
+    if prev is not None:
+        text = prev.get_text(" ", strip=True)
+        if text:
+            return text
+    parent_prev = table.parent.find_previous_sibling() if table.parent else None
+    return parent_prev.get_text(" ", strip=True) if parent_prev else ""
+
+
+def _parse_yield_table(table) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for row in table.select("tbody tr"):
+        cells = row.find_all("td")
+        if len(cells) != 2:
+            continue
+        tenor = cells[0].get_text(strip=True)
+        raw = cells[1].get_text(strip=True).replace("%", "")
+        try:
+            result[tenor] = float(raw)
+        except ValueError:
+            # e.g. "Bids Rejected" for a tenor with no successful auction,
+            # or a trailing "(as on ...)" date row — real absences, not
+            # parse bugs, so skipped rather than raising.
+            continue
+    return result
+
+
+def fetch_pakistan_rates() -> PakistanRates | None:
+    """Real KIBOR and government-bond (MTB/PIB) cut-off yields, scraped
+    from the State Bank of Pakistan's own public rates page. None on any
+    failure (network, or the page having none of the expected tables at
+    all) — this is best-effort enrichment, not core data, same
+    convention as data/mt5_source.py::get_contract_spec."""
+    import requests
+    from bs4 import BeautifulSoup
+
+    try:
+        resp = requests.get(SBP_RATES_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        resp.raise_for_status()
+    except requests.RequestException:
+        return None
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    tables = soup.find_all("table")
+    if not tables:
+        return None
+
+    as_of = None
+    kibor: dict[str, float] = {}
+    mtb: dict[str, float] = {}
+    pib: dict[str, float] = {}
+
+    for table in tables:
+        label = _table_label(table).upper()
+        if "KIBOR" in label:
+            match = re.search(r"AS ON\s*(.+)", label, re.IGNORECASE)
+            if match:
+                as_of = match.group(1).strip().title()
+            for row in table.select("tbody tr"):
+                cells = row.find_all("td")
+                if len(cells) != 3:
+                    continue
+                tenor = cells[0].get_text(strip=True)
+                try:
+                    bid = float(cells[1].get_text(strip=True))
+                    offer = float(cells[2].get_text(strip=True))
+                except ValueError:
+                    continue
+                kibor[tenor] = round((bid + offer) / 2, 4)
+        elif label == "MTBS":
+            mtb.update(_parse_yield_table(table))
+        elif "FIXED" in label and "PIB" in label:
+            pib.update(_parse_yield_table(table))
+
+    if not kibor and not mtb and not pib:
+        return None
+    return PakistanRates(as_of=as_of, kibor_pct=kibor, mtb_yield_pct=mtb, pib_yield_pct=pib)
