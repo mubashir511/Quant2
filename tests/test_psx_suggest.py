@@ -8,13 +8,22 @@ import config
 from ai.claude_cli import CLI_FAILED_PREFIX, CLI_MISSING_MESSAGE
 from ai.portfolio_suggest import AllocationEntry, AuditResult
 from ai.psx_suggest import (
+    EPSGrowthTrend,
     PSXAssetAnalysis,
     analyze_psx_assets,
     build_psx_macro_context,
     build_psx_summary,
+    compute_eps_growth_trend,
     compute_sector_allocation,
     format_psx_asset_context,
     suggest_psx_portfolio,
+)
+from analysis.backtest import (
+    BetaStabilityBacktest,
+    MomentumPersistenceBacktest,
+    RSIReactionBacktest,
+    SupportResistanceBacktest,
+    VolatilityRegimeBacktest,
 )
 from analysis.technical import compute_technical_stats
 from data.macro_source import CountryIndicators, PakistanRates
@@ -164,6 +173,56 @@ def test_analyze_psx_assets_computes_technical_stats_and_bundles_company_data(
     mock_company_data.assert_called_once_with("ABC")
 
 
+@patch("ai.psx_suggest.compute_eps_growth_trend")
+@patch("ai.psx_suggest.backtest_support_resistance_reaction")
+@patch("ai.psx_suggest.backtest_volatility_regime")
+@patch("ai.psx_suggest.backtest_momentum_persistence")
+@patch("ai.psx_suggest.backtest_beta_stability")
+@patch("ai.psx_suggest.backtest_rsi_reaction")
+@patch("ai.psx_suggest.get_psx_company_data")
+@patch("ai.psx_suggest.get_psx_history")
+def test_analyze_psx_assets_wires_backtests_onto_the_analysis(
+    mock_history,
+    mock_company_data,
+    mock_rsi_bt,
+    mock_beta_bt,
+    mock_momentum_bt,
+    mock_vol_regime_bt,
+    mock_sr_bt,
+    mock_eps_growth,
+):
+    mock_history.return_value = _make_history()
+    mock_company_data.return_value = _make_company_data()
+    overbought = RSIReactionBacktest("overbought", 70.0, 6, -5.0, 100.0, 10)
+    oversold = RSIReactionBacktest("oversold", 30.0, 5, 6.0, 80.0, 10)
+    mock_rsi_bt.return_value = (overbought, oversold)
+    beta_bt = BetaStabilityBacktest(0.5, 0.6, 0.55, 0.52, True)
+    mock_beta_bt.return_value = beta_bt
+    momentum_bt = MomentumPersistenceBacktest(0.4, 20, "persistent")
+    mock_momentum_bt.return_value = momentum_bt
+    vol_regime_bt = VolatilityRegimeBacktest(5.0, 15, 10.0, 20, 10)
+    mock_vol_regime_bt.return_value = vol_regime_bt
+    sr_bt = SupportResistanceBacktest(10, 70.0, 8, 60.0, 10)
+    mock_sr_bt.return_value = sr_bt
+    eps_growth = EPSGrowthTrend(1.2, 1.0, 20.0, 2, 0.4, 0.3, 33.3)
+    mock_eps_growth.return_value = eps_growth
+
+    a = analyze_psx_assets([_make_asset("ABC")])[0]
+    assert a.rsi_overbought_backtest is overbought
+    assert a.rsi_oversold_backtest is oversold
+    assert a.beta_stability_backtest is beta_bt
+    assert a.momentum_persistence_backtest is momentum_bt
+    assert a.volatility_regime_backtest is vol_regime_bt
+    assert a.support_resistance_backtest is sr_bt
+    assert a.eps_growth_trend is eps_growth
+    mock_rsi_bt.assert_called_once()
+    mock_beta_bt.assert_called_once()
+    mock_momentum_bt.assert_called_once()
+    mock_vol_regime_bt.assert_called_once()
+    mock_sr_bt.assert_called_once()
+    mock_eps_growth.assert_called_once()
+
+
 @patch("ai.psx_suggest.get_psx_company_data")
 @patch("ai.psx_suggest.get_psx_history")
 def test_analyze_psx_assets_resolves_sector_name_and_dividend20_flag(
@@ -292,24 +351,64 @@ def test_compute_week52_position_pct_edges():
     assert _compute_week52_position_pct(10.0, 12.0, 12.0) is None  # zero-width range
 
 
-def test_compute_beta_identical_series_is_one():
-    from ai.psx_suggest import _compute_beta
-
-    prices = _make_history(n=70)["Close"]
-    assert _compute_beta(prices, prices) == pytest.approx(1.0)
+# Beta computation itself (compute_beta) now lives in analysis/backtest.py
+# and is tested directly there — ai/psx_suggest.py only calls it.
 
 
-def test_compute_beta_none_without_enough_aligned_history():
-    from ai.psx_suggest import _compute_beta
-
-    short = _make_history(n=10)["Close"]
-    assert _compute_beta(short, short) is None
+def test_compute_eps_growth_trend_none_without_financials():
+    assert compute_eps_growth_trend(None) is None
 
 
-def test_compute_beta_none_on_empty_series():
-    from ai.psx_suggest import _compute_beta
+def test_compute_eps_growth_trend_none_without_enough_annual_periods():
+    financials = _make_financials(annual_periods=["2025"], annual={"EPS": [0.5]})
+    assert compute_eps_growth_trend(financials) is None
 
-    assert _compute_beta(pd.Series(dtype=float), _make_history()["Close"]) is None
+
+def test_compute_eps_growth_trend_computes_growth_and_streak():
+    # Newest-first, per PSXFinancials' own column order: 3 consecutive
+    # periods of growth (1.2 > 1.0 > 0.8), so the streak counts 2 (the
+    # number of period-over-period increases immediately before latest).
+    financials = _make_financials(
+        annual_periods=["2028", "2027", "2026"],
+        annual={"EPS": [1.2, 1.0, 0.8]},
+        quarterly_periods=["Q4", "Q3", "Q2", "Q1", "Q4-ago"],
+        quarterly={"EPS": [0.4, 0.35, 0.3, 0.25, 0.3]},
+    )
+    trend = compute_eps_growth_trend(financials)
+    assert trend.latest_annual_eps == 1.2
+    assert trend.prior_annual_eps == 1.0
+    assert trend.annual_yoy_growth_pct == pytest.approx(20.0)
+    assert trend.consecutive_growth_years == 2
+    assert trend.latest_quarterly_eps == 0.4
+    assert trend.year_ago_quarterly_eps == pytest.approx(0.3)
+    assert trend.quarterly_yoy_growth_pct == pytest.approx(33.333, abs=0.01)
+
+
+def test_compute_eps_growth_trend_breaks_streak_on_decline():
+    financials = _make_financials(
+        annual_periods=["2028", "2027", "2026"], annual={"EPS": [0.9, 1.0, 0.8]}
+    )
+    trend = compute_eps_growth_trend(financials)
+    assert trend.consecutive_growth_years == 0  # latest year DECLINED vs prior
+
+
+def test_compute_eps_growth_trend_growth_pct_none_when_base_not_positive():
+    financials = _make_financials(annual_periods=["2027", "2026"], annual={"EPS": [3000.0, -5000.0]})
+    trend = compute_eps_growth_trend(financials)
+    assert trend.annual_yoy_growth_pct is None  # prior-year EPS was a loss — % change is meaningless
+
+
+def test_compute_eps_growth_trend_none_without_year_ago_quarter():
+    financials = _make_financials(
+        annual_periods=["2027", "2026"],
+        annual={"EPS": [1.0, 0.8]},
+        quarterly_periods=["Q1"],
+        quarterly={"EPS": [0.4]},
+    )
+    trend = compute_eps_growth_trend(financials)
+    assert trend.latest_quarterly_eps == 0.4
+    assert trend.year_ago_quarterly_eps is None
+    assert trend.quarterly_yoy_growth_pct is None
 
 
 def _analysis_with_stats(symbol="ABC", **stat_overrides):
@@ -400,6 +499,51 @@ def test_format_correlation_context_no_pairs_message_when_none_qualify():
     from ai.psx_suggest import format_correlation_context
 
     assert "no pair currently has" in format_correlation_context([_analysis_with_stats("SOLO")])
+
+
+def test_format_psx_asset_context_includes_backtest_evidence():
+    analysis = _analysis_with_stats()
+    analysis.rsi_overbought_backtest = RSIReactionBacktest("overbought", 70.0, 6, -4.5, 83.0, 10)
+    analysis.rsi_oversold_backtest = RSIReactionBacktest("oversold", 30.0, 5, 3.2, 60.0, 10)
+    analysis.beta_stability_backtest = BetaStabilityBacktest(0.8, 0.9, 0.85, 0.82, True)
+    analysis.momentum_persistence_backtest = MomentumPersistenceBacktest(0.42, 25, "persistent")
+    analysis.volatility_regime_backtest = VolatilityRegimeBacktest(8.0, 15, 4.0, 20, 10)
+    analysis.support_resistance_backtest = SupportResistanceBacktest(10, 70.0, 8, 60.0, 10)
+    analysis.eps_growth_trend = EPSGrowthTrend(1.2, 1.0, 20.0, 2, 0.4, 0.3, 33.3)
+
+    text = format_psx_asset_context([analysis])
+    assert "6 distinct past episodes" in text
+    assert "reversed as the textbook convention would predict 83%" in text
+    assert "STABLE" in text
+    assert "0.42" in text and "persistent" in text
+    assert "supports the 'coiled spring' reading" in text
+    assert "support held" in text and "70%" in text and "resistance rejected" in text and "60%" in text
+    assert "2 consecutive reported annual period(s)" in text
+    assert "+20.0%" in text
+
+
+def test_format_psx_asset_context_flags_volatility_regime_contradiction():
+    analysis = _analysis_with_stats()
+    analysis.volatility_regime_backtest = VolatilityRegimeBacktest(4.0, 15, 8.0, 20, 10)
+    text = format_psx_asset_context([analysis])
+    assert "CONTRADICTS the 'coiled spring' reading" in text
+
+
+def test_format_psx_asset_context_discloses_missing_backtest_evidence():
+    analysis = _analysis_with_stats()  # backtest fields default to None
+    text = format_psx_asset_context([analysis])
+    assert "not enough real historical episodes" in text
+    assert "not enough aligned history to compute" in text
+    assert "not enough history to compute" in text
+    assert "not enough real historical tests of these levels to compute" in text
+    assert "EPS growth trend: not available" in text
+
+
+def test_format_psx_asset_context_discloses_unstable_beta():
+    analysis = _analysis_with_stats()
+    analysis.beta_stability_backtest = BetaStabilityBacktest(0.2, 0.9, 1.4, 0.5, False)
+    text = format_psx_asset_context([analysis])
+    assert "UNSTABLE" in text
 
 
 def test_format_psx_asset_context_discloses_atr_unavailable():

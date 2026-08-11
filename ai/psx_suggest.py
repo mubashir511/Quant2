@@ -8,6 +8,19 @@ import config
 from ai.claude_cli import CLI_FAILED_PREFIX, CLI_MISSING_MESSAGE, run_claude
 from ai.portfolio_suggest import AUDIT_MODELS, AllocationEntry, build_audit_block
 from ai.session_record import SessionRecord, save_portfolio_session
+from analysis.backtest import (
+    BetaStabilityBacktest,
+    MomentumPersistenceBacktest,
+    RSIReactionBacktest,
+    SupportResistanceBacktest,
+    VolatilityRegimeBacktest,
+    backtest_beta_stability,
+    backtest_momentum_persistence,
+    backtest_rsi_reaction,
+    backtest_support_resistance_reaction,
+    backtest_volatility_regime,
+    compute_beta,
+)
 from analysis.technical import TechnicalStats, compute_technical_stats
 from data.book_wisdom import format_book_wisdom
 from data.macro_source import fetch_country_indicators, fetch_fx_rate_to_usd, fetch_pakistan_rates
@@ -37,31 +50,6 @@ def _fetch_index_stats(index_tag: str = DEFAULT_INDEX) -> TechnicalStats:
     return compute_technical_stats(prices, history=history if not history.empty else None)
 
 
-_MIN_BETA_OBSERVATIONS = 60  # ~3 months of trading days — a shorter window is too noisy to trust
-
-
-def _compute_beta(stock_prices: pd.Series, index_prices: pd.Series) -> float | None:
-    """Beta vs the benchmark index: how sensitive this stock's own daily
-    moves structurally are to the index's moves (>1 more volatile than
-    the index, <1 less, negative moves opposite it) — a genuinely
-    different concept from relative strength, which only measures how
-    much return actually differed, not how tightly the two co-move.
-    None without a real window's worth of aligned trading days, matching
-    this project's rule of never fabricating a stat from too little
-    history."""
-    if stock_prices.empty or index_prices.empty:
-        return None
-    aligned = pd.DataFrame({"stock": stock_prices, "index": index_prices}).dropna()
-    if len(aligned) < _MIN_BETA_OBSERVATIONS:
-        return None
-    stock_returns = aligned["stock"].pct_change().dropna()
-    index_returns = aligned["index"].pct_change().dropna()
-    index_variance = index_returns.var()
-    if not index_variance:
-        return None
-    return float(stock_returns.cov(index_returns) / index_variance)
-
-
 def _compute_week52_position_pct(
     current: float, week52_low: float | None, week52_high: float | None
 ) -> float | None:
@@ -76,6 +64,77 @@ def _compute_week52_position_pct(
     if span <= 0:
         return None
     return (current - week52_low) / span * 100
+
+
+@dataclass
+class EPSGrowthTrend:
+    """A fundamental-momentum read distinct from the raw annual/quarterly
+    EPS figures already shown in the financials block: how many
+    consecutive REPORTED annual periods (newest first, per
+    PSXFinancials' own column order) show EPS growing over the prior
+    one, plus the latest annual and quarterly year-over-year % moves.
+    Complements (not duplicates) the company's own reported "EPS
+    Growth" ratio, if present, by surfacing a multi-year streak the
+    single latest-period ratio figure can't show on its own."""
+
+    latest_annual_eps: float | None
+    prior_annual_eps: float | None
+    annual_yoy_growth_pct: float | None
+    consecutive_growth_years: int
+    latest_quarterly_eps: float | None
+    year_ago_quarterly_eps: float | None
+    quarterly_yoy_growth_pct: float | None
+
+
+def _pct_growth(latest: float | None, prior: float | None) -> float | None:
+    # A % growth figure is only meaningful with a positive base — EPS
+    # swinging from a loss to a profit (or vice versa) makes a % change
+    # figure nonsensical (e.g. -5000 -> 3000 isn't a "+160% loss"), so
+    # that case is left as None and the raw EPS values speak for
+    # themselves instead.
+    if latest is None or prior is None or prior <= 0:
+        return None
+    return (latest - prior) / prior * 100
+
+
+_QUARTERS_PER_YEAR = 4
+
+
+def compute_eps_growth_trend(financials: PSXFinancials | None) -> EPSGrowthTrend | None:
+    """Real reported EPS only (never estimated) — None when the company
+    page's financial-statement tables don't include an EPS row at all,
+    same "don't fabricate from too little" convention as everywhere
+    else in this file."""
+    if financials is None:
+        return None
+    annual_eps = financials.annual.get("EPS", [])
+    if len(annual_eps) < 2:
+        return None
+
+    latest_annual, prior_annual = annual_eps[0], annual_eps[1]
+
+    consecutive_growth_years = 0
+    for cur, prev in zip(annual_eps, annual_eps[1:]):
+        if cur is None or prev is None or cur <= prev:
+            break
+        consecutive_growth_years += 1
+
+    quarterly_eps = financials.quarterly.get("EPS", [])
+    latest_quarterly = quarterly_eps[0] if quarterly_eps else None
+    year_ago_quarterly = (
+        quarterly_eps[_QUARTERS_PER_YEAR] if len(quarterly_eps) > _QUARTERS_PER_YEAR else None
+    )
+
+    return EPSGrowthTrend(
+        latest_annual_eps=latest_annual,
+        prior_annual_eps=prior_annual,
+        annual_yoy_growth_pct=_pct_growth(latest_annual, prior_annual),
+        consecutive_growth_years=consecutive_growth_years,
+        latest_quarterly_eps=latest_quarterly,
+        year_ago_quarterly_eps=year_ago_quarterly,
+        quarterly_yoy_growth_pct=_pct_growth(latest_quarterly, year_ago_quarterly),
+    )
+
 
 # app.py imports parse_final_allocation/strip_allocation_block/
 # AllocationEntry from ai.portfolio_suggest directly for PSX suggestions
@@ -101,18 +160,45 @@ _INSTRUCTION_HEAD = (
     "this as the goal every sizing/risk decision below serves): beat "
     "Pakistan's average inflation rate (the real current figure is given "
     "in the macro snapshot below) by a meaningful margin, and achieve "
-    "high long-term wealth growth, while taking the MINIMUM risk "
-    "necessary to do so — not risk avoidance for its own sake. The user "
-    "has explicitly said they do NOT want an overly conservative "
-    "portfolio that fails to beat inflation, since a mix that can't even "
-    "outpace inflation defeats the purpose of investing at all (it loses "
-    "real purchasing power even while looking 'safe' in nominal terms). "
-    "This does not mean maximize risk or return — it means don't default "
-    "to an unnecessarily defensive mix out of caution alone; justify the "
-    "actual risk taken as what's needed to plausibly beat inflation and "
-    "grow real wealth over the long term, and say explicitly, near the "
-    "start of your visible answer, what the mix's expected return "
-    "profile implies relative to that real inflation figure."
+    "high long-term wealth growth, by taking genuinely CALCULATED risk — "
+    "not the minimum risk that technically clears the inflation bar, and "
+    "not reckless/unresearched risk either. The user has been explicit, "
+    "across multiple rounds of feedback, that they want a more aggressive "
+    "posture than earlier runs of this tool actually produced (specifically "
+    "flagging a run that ended up roughly half in cash as too "
+    "conservative) — but 'more aggressive' means larger, more deliberate "
+    "positions backed by real conviction from the data/research above, "
+    "not larger positions for their own sake. What makes risk 'calculated' "
+    "rather than 'gambling' is unchanged and still fully required: a real "
+    "stop-loss on every position, sizing that reflects each position's own "
+    "volatility and how strong its supporting evidence actually is (a "
+    "high-conviction, well-evidenced case earns a meaningfully larger "
+    "size than a marginal one — don't spread capital evenly across "
+    "positions regardless of conviction), genuine sector/correlation "
+    "diversification (not concentration into one story), and every claim "
+    "grounded in the real data/backtests/research given, not a hunch. "
+    "Within those real constraints, resolve genuine uncertainty toward "
+    "being MORE invested, not less — a mix that ends up mostly cash or "
+    "mostly ultra-defensive low-beta names 'to be safe' is failing this "
+    "objective just as much as an unresearched gamble would, just less "
+    "visibly, since it quietly fails to beat inflation instead of failing "
+    "loudly. One specific, common failure mode to actively resist: the "
+    "book-wisdom principles below include a generic '~50% of equity in "
+    "reserve' cash-reserve default (Murphy) — that is a reasonable "
+    "starting anchor for a generic account, but it is NOT this user's "
+    "objective, and following it reflexively is exactly the over-"
+    "conservative outcome this paragraph is correcting. Absent a "
+    "specific, genuinely elevated near-term risk you've identified in "
+    "your own research (not a generic 'markets can always fall'), a cash "
+    "reserve in roughly the 10-25% range — sized down from that generic "
+    "anchor because it's now backed by real per-position conviction, not "
+    "abandoned — is a more appropriate default under this objective; if "
+    "you do keep more in cash than that, say explicitly why the specific "
+    "evidence in front of you warrants it, the same way the checklist "
+    "below already asks you to justify any book-wisdom deviation. Say "
+    "explicitly, near the start of your visible answer, what the mix's "
+    "expected return profile implies relative to that real inflation "
+    "figure."
     "\n\n"
     "Source quality matters — prioritize in this order:\n"
     "1. Official/primary sources: the State Bank of Pakistan (SBP), the "
@@ -159,7 +245,40 @@ _INSTRUCTION_HEAD = (
     "measures how much total return actually differed; use beta when "
     "reasoning about how a position would behave in a broad market swing, "
     "and relative strength when reasoning about whether it's currently in "
-    "or out of favor); fundamental context (P/E ratio, market "
+    "or out of favor); REAL HISTORICAL BACKTESTS of this specific "
+    "instrument's own past behavior — not a generic textbook assumption "
+    "— covering exactly the kinds of claims a technical read tempts you "
+    "to make: how often its own past RSI overbought/oversold episodes "
+    "actually reversed as the textbook convention predicts (with the "
+    "real average forward return and reversal rate), whether its beta "
+    "has been a stable structural property across different historical "
+    "windows or swings substantially (in which case treat the single "
+    "current-window beta shown as circumstantial, not reliable), and "
+    "whether its own price history shows real momentum persistence or "
+    "mean-reversion; whether its own historically LOW-volatility episodes "
+    "have actually been followed by BIGGER subsequent moves (supporting "
+    "the textbook 'coiled spring' idea that a volatility contraction "
+    "precedes a bigger move) or by smaller ones (volatility clustering — "
+    "quiet periods tend to stay quiet for this instrument, contradicting "
+    "that idea); and how often price has actually held at the shown "
+    "support level or been rejected at the shown resistance level "
+    "historically, rather than assuming a support/resistance line is "
+    "reliable just because it's a well-known charting concept. Ground any "
+    "claim you make about RSI, beta, momentum, volatility regime, or "
+    "support/resistance reliability for a specific stock in ITS OWN "
+    "backtest evidence rather than the generic convention when the two "
+    "disagree — say so explicitly when a stock's real history contradicts "
+    "the textbook assumption, since that's a genuinely more informed read "
+    "than assuming the convention holds everywhere; a real EPS growth "
+    "trend (from the same reported annual/quarterly financial-statement "
+    "figures shown below, not an estimate) — the latest annual and "
+    "quarterly year-over-year EPS % change plus how many consecutive "
+    "reported annual periods showed EPS growth immediately before the "
+    "latest one; a multi-year growth streak is a materially stronger "
+    "fundamental signal than one good year, and a streak that just broke "
+    "is worth noting explicitly even if the latest single year still "
+    "looks fine in isolation; fundamental context "
+    "(P/E ratio, market "
     "capitalization, shares outstanding, free-float %) where available; "
     "PSX's own published circuit-breaker band and 52-week range PLUS "
     "where the current price sits within that 52-week range as a % (0 = "
@@ -304,12 +423,42 @@ _ROLE_STAGE2_SYNTHESIZE = (
     "Your job now is chiefly revision: read the audit reports, weigh "
     "their specific criticisms against your own original reasoning and "
     "the raw data yourself, and revise your draft into a final "
-    "recommendation — for each point you accept, say what changed and "
-    "why; for each point you reject, say why you're sticking with your "
-    "original call. You remain the final decision-maker, not a rubber "
-    "stamp for the audits: use WebSearch/WebFetch yourself to spot-check "
-    "any specific claim the audits flagged as contested, stale, or "
+    "recommendation. This weighing is INTERNAL working process, not "
+    "content for the visible report: decide privately for each critique "
+    "whether it changes your view, and let that decision simply improve "
+    "the final analysis — do not narrate the back-and-forth (no 'the "
+    "audit flagged...', 'upon review, I now think...', 'other models "
+    "noted...', 'my initial draft said...' anywhere in the visible "
+    "answer). You remain the final decision-maker, not a rubber stamp "
+    "for the audits: use WebSearch/WebFetch yourself to spot-check any "
+    "specific claim the audits flagged as contested, stale, or "
     "consequential enough to double-check."
+    "\n\n"
+    "WEIGH EACH AUDIT BY ITS SOURCE MODEL, not equally by default. Each "
+    "audit below is labeled with its source model's own approximate "
+    "scale and specialization (e.g. '550B params, general-purpose "
+    "reasoning' vs. '30B total/3B active MoE, CODING-AGENT-specialized — "
+    "weigh its open-ended judgment calls with more caution'). Use this "
+    "as a starting prior, not a hard rule: a larger, general-purpose "
+    "reasoning model's open-ended judgment call (e.g. 'this sector "
+    "allocation looks too concentrated given the macro backdrop') "
+    "deserves more default trust than the same kind of judgment call "
+    "from a smaller or coding-specialized model, since the latter's own "
+    "training targeted a different kind of task. But this prior does "
+    "NOT apply to concrete, verifiable points — a real arithmetic error, "
+    "a real contradiction against the data given above, a real gap "
+    "against the failure-mode checklist — those stand on their own "
+    "merits regardless of which model raised them, and a smaller/"
+    "specialized model catching something every larger model missed is "
+    "still a genuine catch, not a fluke to discount. In short: verify "
+    "concrete claims by checking them against the real data (or "
+    "WebSearch) rather than by which model said it; use the scale/"
+    "specialization label mainly to decide how much extra scrutiny an "
+    "open-ended judgment call from a smaller/specialized model deserves "
+    "before you accept it. This weighing is internal analysis, same as "
+    "the rest of this paragraph — don't narrate it in the visible "
+    "answer either (no 'the larger model said X, the smaller one said "
+    "Y', no naming which specific model's critique swayed a decision)."
 )
 
 
@@ -321,10 +470,16 @@ _ROLE_STAGE2_SELF_REVIEW = (
     "now falls back to you. Re-examine your own draft critically: verify "
     "its key claims via WebSearch/WebFetch where practical, and run it "
     "through the failure-mode checklist below the way an independent "
-    "auditor would."
+    "auditor would — internally; this self-check is process, not "
+    "content, and shouldn't be narrated in the visible report either."
     "\n\n"
-    "Because the independent audit was unavailable this run, state so "
-    "plainly and near the start of your visible answer."
+    "Because the independent audit was unavailable this run, disclose "
+    "that fact plainly as one sentence within the Executive Summary "
+    "section of your visible answer (defined below) — this is the one "
+    "piece of process information the user genuinely needs to know, "
+    "since it means this run had one less layer of independent review; "
+    "everything else about how the answer was produced stays out of the "
+    "report."
 )
 
 
@@ -367,11 +522,20 @@ _INSTRUCTION_TAIL = (
     "   f. Aggregate heat — for every position in the mix, multiply its "
     "% allocation by its stop-loss distance (%) to get that position's "
     "contribution to capital at risk, then sum across the whole mix. "
-    "State this total explicitly and check it against a ~6-8% cap.\n"
-    "   g. Idle cash — if the mix leaves a meaningful cash reserve, "
-    "define specific conditional triggers for deploying it (tied to the "
-    "support/resistance levels given above), each with an explicit "
-    "time-based fallback.\n"
+    "State this total explicitly and check it against a ~10-15% cap "
+    "(raised from this tool's earlier, more conservative 6-8% cap, per "
+    "the calculated-risk objective above — still a real, hard ceiling, "
+    "just no longer artificially tighter than the risk this mix's own "
+    "diversification and stop discipline can actually support).\n"
+    "   g. Idle cash — per the investment objective above, treat any cash "
+    "reserve beyond roughly 10-25% of capital as needing its own "
+    "explicit justification (a specific, genuinely elevated near-term "
+    "risk you identified, not generic caution), the same as an "
+    "unusually large single-position bet would need justifying. Whatever "
+    "reserve you do leave, define specific conditional triggers for "
+    "deploying it (tied to the support/resistance levels given above), "
+    "each with an explicit time-based fallback — don't leave it idle "
+    "indefinitely.\n"
     "   h. Sector inclusion/exclusion reasoning — explicitly decide, and "
     "be ready to state, WHY each sector you allocated to was chosen "
     "(tie it to that sector's current performance/valuation backdrop "
@@ -388,32 +552,91 @@ _INSTRUCTION_TAIL = (
     "strongest points from this checklist pass and from the audit/self-"
     "review findings above.\n"
     "\n"
-    "Now write your visible answer as ONE cohesive final recommendation. "
-    "For each symbol and for the cash reserve, explain the reasoning "
-    "behind that decision inline. Include the sector inclusion/exclusion "
-    "reasoning from checklist item (h) above as its own clearly-"
-    "identifiable part of the answer (a short section or clearly-signaled "
-    "paragraph is fine — it does not need a rigid header), not folded "
-    "invisibly into individual symbol justifications where the user would "
-    "have to reconstruct it themselves. State clearly, near the start, "
-    "that this is a hypothetical, discretionary illustration with no real "
-    "account behind it and nothing will be executed automatically — the "
-    "user would place any trades manually through their own broker."
+    "Now write your visible answer as a STRUCTURED INVESTMENT REPORT — "
+    "the way a professional equity-research or wealth-management note "
+    "reads (clear sections, a real narrative arc), not a raw stream of "
+    "reasoning and not a transcript of the draft/audit/revise process "
+    "above. Use exactly these markdown section headers, in this order; "
+    "if a section is genuinely thin for this run, keep the header and "
+    "write one honest sentence under it rather than omitting the "
+    "section entirely — the structure itself is part of what makes this "
+    "readable:\n"
+    "## Executive Summary\n"
+    "3-5 sentences: your overall market stance, what this mix's expected "
+    "return profile implies relative to the real Pakistan inflation "
+    "figure given above (per the investment objective stated earlier), "
+    "the headline allocation idea, and the single biggest risk to watch "
+    "this cycle. State here too, in one sentence, that this is a "
+    "hypothetical, discretionary illustration with no real account "
+    "behind it and nothing will be executed automatically (and, if "
+    "applicable this run, that the independent audit layer wasn't "
+    "available — see above).\n"
+    "## Macro & Market Backdrop\n"
+    "A flowing narrative — interpretation, not a restated bullet list of "
+    "the macro/rate numbers given above — on what the real inflation, "
+    "KIBOR/bond-yield, and PKR/FX data actually imply for equities right "
+    "now, plus whatever political/IMF/policy context you found via "
+    "WebSearch.\n"
+    "## Sector Outlook\n"
+    "The sector inclusion/exclusion reasoning from checklist item (h) "
+    "above belongs HERE, as this section's actual content — which "
+    "sectors you're constructive on and why, which you're avoiding and "
+    "why, tied to the real sector-performance data and to what you found "
+    "via research.\n"
+    "## Investment Thesis by Position\n"
+    "One short subsection per included holding — lead each with the "
+    "symbol in bold (e.g. \"**MCB (Commercial Banks):**\") — covering in "
+    "flowing prose what the company does, why it earns its place now "
+    "(technical + fundamental + business-specific catalyst), and the "
+    "sizing/entry/stop rationale. This is where per-position points from "
+    "the checklist (liquidity, circuit-breaker awareness, dividend/ex-"
+    "date timing, relative strength/beta) belong — applied to that "
+    "specific holding, not listed separately. If you're relying on an "
+    "RSI, beta, or momentum-based argument for a holding, ground it "
+    "explicitly in that instrument's own real historical backtest "
+    "evidence given above rather than the generic textbook convention — "
+    "and if the audit's backtest scorecard flagged that argument as "
+    "CONTRADICTED by this instrument's own history, either drop that "
+    "specific argument for this holding (using a different, supported "
+    "rationale instead) or explain concretely why you're keeping it "
+    "despite the historical evidence against it.\n"
+    "## Portfolio Construction & Risk Management\n"
+    "Aggregate heat, pairwise correlation, and currency/political "
+    "stress-test findings, synthesized as your own risk-management "
+    "conclusions about the mix as a whole — not a checklist recitation.\n"
+    "## Recommended Allocation\n"
+    "A short closing summary of the final numbers (prose or a simple "
+    "markdown table), immediately before the required trailing JSON "
+    "block.\n"
+    "## Outlook & Triggers to Revisit\n"
+    "Idle-cash deployment triggers (with their required time-based "
+    "fallback) and what would change this view going forward.\n"
+    "\n"
+    "Throughout, write in ONE confident, single-voice analyst register — "
+    "never reference the multi-stage or multi-model process that "
+    "produced this answer (no 'the audit flagged...', 'upon revision...', "
+    "'other models noted...', 'my draft said...'). Every conclusion, "
+    "whichever pass it originated in, is presented simply as this "
+    "report's own analysis; a reader should not be able to tell this was "
+    "a multi-stage process at all — that's process, and process isn't "
+    "content."
     "\n\n"
     "Prioritize thoroughness and rigor over brevity — there is no strict "
     "length limit on this response."
     "\n\n"
     "Write all of your reasoning and explanation as plain prose/markdown "
-    "— do not put any of it inside a fenced code block. The ONLY fenced "
-    "code block in your entire response must be a single one at the very "
-    "end, exactly like this (replace the example values with your actual "
-    "final numbers, one key per symbol plus one \"CASH\" key, pct values "
-    "summing to 100, no comments or extra text inside the block). Every "
-    "non-CASH key must be an object with three numbers: \"pct\" (the "
-    "target allocation), \"price\" (a specific, realistic entry price "
-    "given the symbol's current price shown above), and \"stop_loss\" (a "
-    "specific stop price, derived from volatility or support/resistance "
-    "as instructed above since ATR isn't available here):\n"
+    "using the section headers specified above — do not put any of it "
+    "inside a fenced code block. The ONLY fenced code block in your "
+    "entire response must be a single one at the very end (after the "
+    "'Recommended Allocation' section), exactly like this (replace the "
+    "example values with your actual final numbers, one key per symbol "
+    "plus one \"CASH\" key, pct values summing to 100, no comments or "
+    "extra text inside the block). Every non-CASH key must be an object "
+    "with three numbers: \"pct\" (the target allocation), \"price\" (a "
+    "specific, realistic entry price given the symbol's current price "
+    "shown above), and \"stop_loss\" (a specific stop price, derived "
+    "from volatility or support/resistance as instructed above since "
+    "ATR isn't available here):\n"
     "```json\n"
     '{"EXAMPLE_SYMBOL": {"pct": 15, "price": 82.50, "stop_loss": 74.00}, "CASH": 25}\n'
     "```"
@@ -444,11 +667,62 @@ AUDIT_INSTRUCTION = (
     "based on the data you both were given.\n"
     "- Note where you would weigh something differently, and why.\n"
     "\n"
-    "Produce a structured audit report — agreements, flaws, gaps, and "
-    "specific suggested improvements — not a rewritten competing "
-    "allocation. Since you have no live data access, don't claim to "
-    "fact-check anything beyond what's in the data given here. Keep your "
-    "response focused — under 400 words."
+    "BACKTEST THE DRAFT'S UNDERLYING LOGIC, not just its arithmetic. The "
+    "draft doesn't just state numbers — it implies a small system of "
+    "cause-and-effect rules about how these instruments behave (e.g. "
+    "'this stock's positive relative strength means it should keep "
+    "outperforming', 'this overbought reading means a pullback is likely', "
+    "'this beta means it will move roughly twice as much as the index'). "
+    "Treat the draft as implicitly claiming a function — given a "
+    "condition X (a technical reading, a regime), it asserts an expected "
+    "market response Y — and you have real historical evidence below to "
+    "test specific values of X against, the same way you'd test any "
+    "claimed function by plugging in inputs and checking the outputs it "
+    "actually produced in the past:\n"
+    "1. For each holding, identify the specific technical/behavioral "
+    "claim(s) the draft is relying on to justify it (momentum "
+    "continuing, a reversal being likely, beta implying a certain risk "
+    "level, etc.).\n"
+    "2. Cross-check EACH such claim against that exact instrument's own "
+    "historical backtest evidence given below (its real past RSI-"
+    "reaction rate and average forward return, whether its beta has been "
+    "stable or has swung across different historical windows, whether its "
+    "own history shows real momentum persistence or mean-reversion, "
+    "whether its own low-volatility episodes have historically been "
+    "followed by bigger or smaller moves — the 'coiled spring' question — "
+    "and how often price has actually held at support or been rejected at "
+    "resistance historically) — this is genuine historical evidence for "
+    "THIS instrument specifically, not a generic textbook assumption. If "
+    "the draft leans on an EPS growth story for a holding, cross-check it "
+    "against the real reported EPS growth trend given below too (the "
+    "consecutive-growth-year count and latest annual/quarterly % changes) "
+    "— a draft claiming 'strong earnings momentum' when the streak just "
+    "broke, or citing one good quarter while ignoring a longer decline, is "
+    "a real gap to flag.\n"
+    "3. Score each claim you checked: SUPPORTED (the historical evidence "
+    "agrees with the draft's implied logic), CONTRADICTED (the "
+    "instrument's own history shows the opposite — e.g. the draft treats "
+    "an overbought reading as bearish but this instrument's own reversal "
+    "rate after past overbought episodes is well under 50%, the draft "
+    "leans on beta as a stable risk measure but the backtest shows it "
+    "swinging widely across windows, the draft treats low volatility as a "
+    "'coiled spring' setup but this instrument's low-vol episodes have "
+    "historically been followed by SMALLER moves, or the draft leans on a "
+    "support/resistance level for its stop/entry logic despite this "
+    "instrument's own history showing that level rarely holds), or "
+    "UNTESTABLE (not enough real historical episodes were available to "
+    "judge either way — say so rather than guessing). Cite the actual "
+    "numbers you're basing this on.\n"
+    "4. A CONTRADICTED score is a real, concrete flaw to raise — treat it "
+    "with the same weight as a math error, not a minor stylistic note.\n"
+    "\n"
+    "Produce a structured audit report — agreements, flaws, gaps, the "
+    "backtest scorecard from above, and specific suggested improvements "
+    "— not a rewritten competing allocation. Since you have no live data "
+    "access, don't claim to fact-check anything beyond what's in the "
+    "data given here (the historical backtests ARE data given here, not "
+    "something you're fetching yourself). Keep your response focused — "
+    "under 550 words."
 )
 
 
@@ -489,6 +763,13 @@ class PSXAssetAnalysis:
     beta_vs_index: float | None = None
     week52_position_pct: float | None = None
     is_dividend20_member: bool = False
+    rsi_overbought_backtest: RSIReactionBacktest | None = None
+    rsi_oversold_backtest: RSIReactionBacktest | None = None
+    beta_stability_backtest: BetaStabilityBacktest | None = None
+    momentum_persistence_backtest: MomentumPersistenceBacktest | None = None
+    volatility_regime_backtest: VolatilityRegimeBacktest | None = None
+    support_resistance_backtest: SupportResistanceBacktest | None = None
+    eps_growth_trend: EPSGrowthTrend | None = None
 
 
 def analyze_psx_assets(
@@ -531,6 +812,7 @@ def analyze_psx_assets(
         fundamentals = company_data.fundamentals
         week52_low = fundamentals.week52_low if fundamentals else None
         week52_high = fundamentals.week52_high if fundamentals else None
+        rsi_overbought_bt, rsi_oversold_bt = backtest_rsi_reaction(prices)
         analyses.append(
             PSXAssetAnalysis(
                 symbol=asset.symbol,
@@ -550,11 +832,18 @@ def analyze_psx_assets(
                 benchmark_index=index_tag,
                 relative_strength_1m_pct=_relative(stats.change_1m_pct, index_stats.change_1m_pct),
                 relative_strength_3m_pct=_relative(stats.change_3m_pct, index_stats.change_3m_pct),
-                beta_vs_index=_compute_beta(prices, index_prices),
+                beta_vs_index=compute_beta(prices, index_prices),
                 week52_position_pct=_compute_week52_position_pct(
                     asset.current, week52_low, week52_high
                 ),
                 is_dividend20_member="PSXDIV20" in asset.listed_in,
+                rsi_overbought_backtest=rsi_overbought_bt,
+                rsi_oversold_backtest=rsi_oversold_bt,
+                beta_stability_backtest=backtest_beta_stability(prices, index_prices),
+                momentum_persistence_backtest=backtest_momentum_persistence(prices),
+                volatility_regime_backtest=backtest_volatility_regime(prices),
+                support_resistance_backtest=backtest_support_resistance_reaction(prices),
+                eps_growth_trend=compute_eps_growth_trend(company_data.financials),
             )
         )
     return analyses
@@ -590,6 +879,125 @@ def _format_financials(financials: PSXFinancials) -> list[str]:
     return lines
 
 
+def _format_rsi_backtest(bt: RSIReactionBacktest | None, condition: str) -> str:
+    if bt is None:
+        return (
+            f"  historical {condition} RSI reaction: not enough real historical episodes "
+            "in this instrument's own history to compute — treat any RSI-reversal claim "
+            "for it as unverified assumption, not evidence."
+        )
+    return (
+        f"  historical {condition} RSI reaction (real, this instrument's own past): "
+        f"{bt.occurrences} distinct past episodes where RSI reached {bt.threshold:.0f}, "
+        f"average {bt.forward_days}-trading-day return afterward = "
+        f"{bt.avg_forward_return_pct:+.2f}%, reversed as the textbook convention would "
+        f"predict {bt.reversal_rate_pct:.0f}% of the time"
+    )
+
+
+def _format_backtests(a: PSXAssetAnalysis) -> list[str]:
+    lines = [_format_rsi_backtest(a.rsi_overbought_backtest, "overbought")]
+    lines.append(_format_rsi_backtest(a.rsi_oversold_backtest, "oversold"))
+
+    bs = a.beta_stability_backtest
+    if bs is not None and bs.stable is not None:
+        windows = ", ".join(
+            f"{label}={_fmt(value)}"
+            for label, value in (
+                ("3m", bs.beta_3m),
+                ("6m", bs.beta_6m),
+                ("1y", bs.beta_1y),
+                ("full history", bs.beta_full_history),
+            )
+            if value is not None
+        )
+        verdict = (
+            "STABLE — beta looks like a genuine structural property, not a fluke of one window"
+            if bs.stable
+            else "UNSTABLE — beta swings substantially across windows, so treat the single "
+            "current-window beta shown above as circumstantial, not a reliable constant"
+        )
+        lines.append(f"  historical beta stability across windows ({windows}): {verdict}")
+    else:
+        lines.append("  historical beta stability: not enough aligned history to compute")
+
+    mp = a.momentum_persistence_backtest
+    if mp is not None:
+        lines.append(
+            f"  historical momentum pattern (this instrument's own history, "
+            f"{mp.sample_size} independent ~1-month periods): correlation between a "
+            f"period's own return and the NEXT period's return = {mp.correlation:+.2f} "
+            f"-> {mp.interpretation.replace('_', ' ')} "
+            "(persistent = past winners tended to keep winning; mean_reverting = past "
+            "winners tended to give it back; no_clear_pattern = neither reliably)"
+        )
+    else:
+        lines.append("  historical momentum pattern: not enough history to compute")
+
+    vr = a.volatility_regime_backtest
+    if vr is not None:
+        lines.append(
+            f"  historical volatility-regime reaction (this instrument's own past "
+            f"{vr.low_vol_episodes} low-volatility and {vr.high_vol_episodes} "
+            f"high-volatility episodes, {vr.forward_days}-trading-day forward move): "
+            f"avg move after LOW-vol episodes = {vr.low_vol_avg_abs_move_pct:.2f}%, "
+            f"avg move after HIGH-vol episodes = {vr.high_vol_avg_abs_move_pct:.2f}% -> "
+            + (
+                "supports the 'coiled spring' reading (quiet periods historically precede "
+                "bigger moves for this instrument)"
+                if vr.low_vol_avg_abs_move_pct > vr.high_vol_avg_abs_move_pct
+                else "CONTRADICTS the 'coiled spring' reading (this instrument's own low-"
+                "volatility periods have historically been followed by SMALLER moves, not "
+                "bigger ones — volatility has clustered/persisted instead)"
+            )
+        )
+    else:
+        lines.append("  historical volatility-regime reaction: not enough history to compute")
+
+    sr = a.support_resistance_backtest
+    if sr is not None:
+        lines.append(
+            f"  historical support/resistance reliability (this instrument's own past, "
+            f"{sr.forward_days}-trading-day forward check): support held (price higher "
+            f"afterward) {sr.support_hold_rate_pct:.0f}% of {sr.support_tests} real past "
+            f"tests; resistance rejected (price lower afterward) "
+            f"{sr.resistance_reject_rate_pct:.0f}% of {sr.resistance_tests} real past "
+            "tests — use this to judge how much weight the support/resistance range shown "
+            "above deserves for THIS instrument specifically, rather than assuming "
+            "support/resistance lines are reliable just because they're a well-known "
+            "charting concept."
+        )
+    else:
+        lines.append(
+            "  historical support/resistance reliability: not enough real historical "
+            "tests of these levels to compute"
+        )
+
+    eg = a.eps_growth_trend
+    if eg is not None:
+        annual_growth = (
+            f"{eg.annual_yoy_growth_pct:+.1f}%"
+            if eg.annual_yoy_growth_pct is not None
+            else "not meaningful (base period EPS was zero/negative)"
+        )
+        quarterly_growth = (
+            f"{eg.quarterly_yoy_growth_pct:+.1f}%"
+            if eg.quarterly_yoy_growth_pct is not None
+            else "not available or not meaningful"
+        )
+        lines.append(
+            f"  EPS growth trend (real reported figures): latest annual EPS="
+            f"{_fmt(eg.latest_annual_eps)} vs prior year {_fmt(eg.prior_annual_eps)} "
+            f"({annual_growth}); {eg.consecutive_growth_years} consecutive reported annual "
+            f"period(s) of EPS growth immediately preceding the latest; latest quarterly "
+            f"EPS={_fmt(eg.latest_quarterly_eps)} vs year-ago quarter "
+            f"{_fmt(eg.year_ago_quarterly_eps)} ({quarterly_growth})"
+        )
+    else:
+        lines.append("  EPS growth trend: not available — verify via WebSearch")
+    return lines
+
+
 def format_psx_asset_context(analyses: list[PSXAssetAnalysis]) -> str:
     lines = []
     for a in analyses:
@@ -622,6 +1030,7 @@ def format_psx_asset_context(analyses: list[PSXAssetAnalysis]) -> str:
             "negative moves opposite it — not available without ~3 "
             "months of aligned trading history)"
         )
+        lines += _format_backtests(a)
         if s.support is not None and s.resistance is not None:
             lines.append(
                 f"  pattern: support={s.support:.2f}, resistance={s.resistance:.2f}, "

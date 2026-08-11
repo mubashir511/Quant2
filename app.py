@@ -52,20 +52,30 @@ _LOSS_COLOR = "#e34948"
 
 
 def _render_pie(names: list[str], values: list[float], title: str) -> None:
+    # Slice text is percent-only (not the full name) — the always-present
+    # horizontal legend below already carries identity, and cramming both
+    # onto every wedge is exactly what caused labels to wrap and collide
+    # with each other/the title on a narrow pool of many small sectors.
+    # "inside" + radial orientation keeps text from spilling past the
+    # chart's own bounding box into whatever sits next to it.
     fig = px.pie(
         names=names,
         values=values,
-        hole=0.35,
+        hole=0.4,
         color_discrete_sequence=_CATEGORICAL_COLORS,
     )
     fig.update_traces(
-        textinfo="label+percent",
+        textinfo="percent",
+        textposition="inside",
+        insidetextorientation="radial",
+        textfont_size=14,
         hovertemplate="%{label}: %{value:.1f}%<extra></extra>",
     )
     fig.update_layout(
         title=title,
-        margin=dict(l=10, r=10, t=40, b=10),
-        legend=dict(orientation="h", yanchor="top", y=-0.15),
+        height=480,
+        margin=dict(l=20, r=20, t=60, b=20),
+        legend=dict(orientation="h", yanchor="top", y=-0.1, x=0.5, xanchor="center"),
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -112,8 +122,8 @@ def _render_sector_performance_chart(all_assets: list[PSXAsset]) -> None:
     fig.update_layout(
         title="Sector Performance Today — Whole PSX Market",
         xaxis_title="Average % change",
-        margin=dict(l=10, r=10, t=40, b=10),
-        height=max(320, 26 * len(sectors)),
+        margin=dict(l=20, r=20, t=50, b=20),
+        height=max(380, 34 * len(sectors)),
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -144,12 +154,107 @@ def _render_risk_return_scatter(analyses: list) -> None:
             "relative_strength": "1-Month Relative Strength vs. Index (%)",
         },
     )
-    fig.update_traces(textposition="top center", marker=dict(size=11, line=dict(width=1, color="white")))
+    fig.update_traces(textposition="top center", marker=dict(size=13, line=dict(width=1, color="white")))
     fig.add_hline(y=0, line_dash="dot", line_color="gray")
     fig.update_layout(
         title="Risk vs. Relative Strength — Enriched Candidates",
-        margin=dict(l=10, r=10, t=40, b=10),
+        margin=dict(l=20, r=20, t=50, b=20),
+        height=520,
         legend_title_text="Sector",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_capital_at_risk_chart(allocation: dict[str, AllocationEntry]) -> None:
+    """Visualizes the same "aggregate heat" figure the report's own risk-
+    management reasoning already computes in prose (% allocation × stop-
+    loss distance, summed across the mix) — needs only the allocation
+    block itself (price + stop_loss per symbol), so it works identically
+    for PMEX and PSX without any exchange-specific data."""
+    rows = []
+    for symbol, entry in allocation.items():
+        if symbol == "CASH" or not entry.price or entry.stop_loss is None:
+            continue
+        distance_pct = abs(entry.price - entry.stop_loss) / entry.price * 100
+        rows.append((symbol, entry.pct * distance_pct / 100, distance_pct))
+    if not rows:
+        return
+    # Ascending so the highest-risk position ends up at the TOP of the
+    # horizontal bar (Plotly draws categorical y-axes bottom-to-top in
+    # the order given), matching the sector-performance chart's convention.
+    rows.sort(key=lambda r: r[1])
+    symbols = [r[0] for r in rows]
+    risk = [r[1] for r in rows]
+    distances = [r[2] for r in rows]
+    total_heat = sum(risk)
+
+    fig = go.Figure(
+        go.Bar(
+            x=risk,
+            y=symbols,
+            orientation="h",
+            marker_color=_LOSS_COLOR,
+            customdata=distances,
+            hovertemplate="%{y}: %{x:.2f}% of total capital at risk (stop is %{customdata:.1f}% away)<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title=f"Capital at Risk by Position — {total_heat:.1f}% total portfolio heat",
+        xaxis_title="% of total capital at risk if stop is hit",
+        margin=dict(l=20, r=20, t=50, b=20),
+        height=max(360, 34 * len(symbols)),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_week52_position_chart(analyses: list) -> None:
+    """A floating range-bar per candidate (52-week low -> high, per PSX's
+    own published range) with a marker at today's price — the same
+    week52_position_pct number already narrated in the report text, made
+    visual across the whole enriched pool at once instead of read one
+    symbol at a time."""
+    rows = []
+    for a in analyses:
+        f = a.fundamentals
+        if f is None or f.week52_low is None or f.week52_high is None or f.week52_high <= f.week52_low:
+            continue
+        rows.append((a.symbol, f.week52_low, f.week52_high, a.current, a.week52_position_pct))
+    if not rows:
+        return
+    rows.sort(key=lambda r: r[4] if r[4] is not None else 0.0)
+    symbols = [r[0] for r in rows]
+    lows = [r[1] for r in rows]
+    spans = [r[2] - r[1] for r in rows]
+    currents = [r[3] for r in rows]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=spans,
+            y=symbols,
+            base=lows,
+            orientation="h",
+            marker_color="rgba(148, 148, 148, 0.35)",
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=currents,
+            y=symbols,
+            mode="markers",
+            marker=dict(size=13, color=_CATEGORICAL_COLORS[0], symbol="diamond", line=dict(width=1, color="white")),
+            name="Current price",
+            hovertemplate="%{y}: %{x:.2f} PKR today<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title="52-Week Range — Where Each Candidate Sits Today",
+        xaxis_title="Price (PKR)",
+        margin=dict(l=20, r=20, t=50, b=20),
+        height=max(360, 34 * len(symbols)),
+        showlegend=False,
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -180,13 +285,13 @@ def _render_instrument_chart(analysis: AssetAnalysis) -> None:
         )
     fig.update_layout(
         title=f"{analysis.symbol} ({analysis.display_name})",
-        height=260,
-        margin=dict(l=10, r=10, t=30, b=10),
+        height=320,
+        margin=dict(l=20, r=20, t=40, b=20),
         showlegend=False,
     )
     st.plotly_chart(fig, use_container_width=True)
 
-st.set_page_config(page_title="Quant2 Advisor", layout="centered")
+st.set_page_config(page_title="Quant2 Advisor", layout="wide")
 
 st.title("Quant2 Advisor")
 
@@ -496,6 +601,7 @@ if selected_exchange == "PSX":
                 _render_allocation_chart(psx_allocation)
             with sector_col:
                 _render_sector_allocation_chart(psx_allocation, psx_analyses)
+            _render_capital_at_risk_chart(psx_allocation)
 
         st.markdown(st.session_state["psx_last_suggestion_text"])
 
@@ -503,6 +609,7 @@ if selected_exchange == "PSX":
             _render_sector_performance_chart(psx_market_assets)
         if psx_analyses:
             _render_risk_return_scatter(psx_analyses)
+            _render_week52_position_chart(psx_analyses)
 
         psx_chartable = [a for a in psx_analyses if a.display_name is not None and not a.prices.empty]
         if psx_chartable:
@@ -522,6 +629,7 @@ else:
         allocation = st.session_state.get("suggested_allocation")
         if allocation:
             _render_allocation_chart(allocation)
+            _render_capital_at_risk_chart(allocation)
         st.markdown(st.session_state["last_suggestion_text"])
 
         analyses = st.session_state.get("last_suggestion_analyses") or []

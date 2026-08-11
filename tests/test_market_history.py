@@ -27,6 +27,12 @@ def test_fetch_price_history_ohlcv_returns_high_low_close_volume(mock_ticker_cls
     assert list(result["Volume"]) == [1000, 1100, 1200]
     assert "Open" not in result.columns
     mock_ticker_cls.assert_called_once_with("GC=F")
+    # Default period is 5y, not 1y — verified live that PMEX-mapped Yahoo
+    # tickers actually return ~5 years of real history for free, the same
+    # depth analysis/backtest.py's functions need (and already get on the
+    # PSX side), so this project's own prior 1y default was needlessly
+    # conservative rather than a real ceiling on what's available.
+    mock_ticker.history.assert_called_once_with(period="5y")
 
 
 @patch("yfinance.Ticker")

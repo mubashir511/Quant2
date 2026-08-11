@@ -36,6 +36,13 @@ from ai.portfolio_suggest import (
 from ai.claude_cli import CLI_FAILED_PREFIX, CLI_MISSING_MESSAGE
 from ai.openrouter_client import FAILED_MESSAGE as OPENROUTER_FAILED_MESSAGE
 from ai.openrouter_client import MISSING_KEY_MESSAGE as OPENROUTER_MISSING_KEY_MESSAGE
+from analysis.backtest import (
+    MomentumPersistenceBacktest,
+    RSIReactionBacktest,
+    SupportResistanceBacktest,
+    VolatilityRegimeBacktest,
+)
+from analysis.technical import compute_technical_stats
 from data.macro_source import CountryIndicators, MarketIndicators
 from data.mt5_source import ContractSpec
 from data.mt5_source import AccountSummary, MarketAsset, Position
@@ -241,6 +248,84 @@ def test_build_enriched_asset_context_respects_max_enriched_cap(mock_resolve):
             assert mock_resolve.call_count == 1
     finally:
         config.MAX_ENRICHED_ASSETS = original_cap
+
+
+@patch("ai.portfolio_suggest.backtest_support_resistance_reaction")
+@patch("ai.portfolio_suggest.backtest_volatility_regime")
+@patch("ai.portfolio_suggest.backtest_momentum_persistence")
+@patch("ai.portfolio_suggest.backtest_rsi_reaction")
+@patch("ai.portfolio_suggest.fetch_recent_headlines", return_value=[])
+@patch("ai.portfolio_suggest.fetch_price_history_ohlcv")
+@patch("ai.portfolio_suggest.resolve_yahoo_ticker")
+def test_analyze_assets_wires_backtests_onto_the_analysis(
+    mock_resolve, mock_history, mock_headlines, mock_rsi_bt, mock_momentum_bt, mock_vol_bt, mock_sr_bt
+):
+    mock_resolve.return_value = ("Gold", "GC=F")
+    mock_history.return_value = _ohlc([100.0 + i for i in range(30)])
+    overbought = RSIReactionBacktest("overbought", 70.0, 6, -5.0, 100.0, 10)
+    oversold = RSIReactionBacktest("oversold", 30.0, 5, 6.0, 80.0, 10)
+    mock_rsi_bt.return_value = (overbought, oversold)
+    momentum_bt = MomentumPersistenceBacktest(0.4, 20, "persistent")
+    mock_momentum_bt.return_value = momentum_bt
+    vol_bt = VolatilityRegimeBacktest(5.0, 15, 10.0, 20, 10)
+    mock_vol_bt.return_value = vol_bt
+    sr_bt = SupportResistanceBacktest(10, 70.0, 8, 60.0, 10)
+    mock_sr_bt.return_value = sr_bt
+
+    assets = [MarketAsset("GO10OZ", "Gold 10oz", bid=2000.0, ask=2000.5)]
+    a = analyze_assets(assets)[0]
+
+    assert a.rsi_overbought_backtest is overbought
+    assert a.rsi_oversold_backtest is oversold
+    assert a.momentum_persistence_backtest is momentum_bt
+    assert a.volatility_regime_backtest is vol_bt
+    assert a.support_resistance_backtest is sr_bt
+    mock_rsi_bt.assert_called_once()
+    mock_momentum_bt.assert_called_once()
+    mock_vol_bt.assert_called_once()
+    mock_sr_bt.assert_called_once()
+    # 5y, not the old 1y default — real multi-year history is what makes
+    # these backtests (which need real historical episodes, not just a
+    # recent window) usable at all.
+    mock_history.assert_called_once_with("GC=F", period="5y")
+
+
+def _analysis_with_stats(symbol="GOLD-DE26"):
+    history = _ohlc([100.0 + i for i in range(60)])
+    prices = history["Close"]
+    stats = compute_technical_stats(prices, history=history)
+    return AssetAnalysis(symbol, symbol, 2000.0, 2000.5, "Gold", prices, stats, [], None)
+
+
+def test_format_enriched_asset_context_includes_backtest_evidence():
+    analysis = _analysis_with_stats()
+    analysis.rsi_overbought_backtest = RSIReactionBacktest("overbought", 70.0, 6, -4.5, 83.0, 10)
+    analysis.rsi_oversold_backtest = RSIReactionBacktest("oversold", 30.0, 5, 3.2, 60.0, 10)
+    analysis.momentum_persistence_backtest = MomentumPersistenceBacktest(0.42, 25, "persistent")
+    analysis.volatility_regime_backtest = VolatilityRegimeBacktest(8.0, 15, 4.0, 20, 10)
+    analysis.support_resistance_backtest = SupportResistanceBacktest(10, 70.0, 8, 60.0, 10)
+
+    text = format_enriched_asset_context([analysis])
+    assert "6 distinct past episodes" in text
+    assert "reversed as the textbook convention would predict 83%" in text
+    assert "0.42" in text and "persistent" in text
+    assert "supports the 'coiled spring' reading" in text
+    assert "support held" in text and "resistance rejected" in text
+
+
+def test_format_enriched_asset_context_flags_volatility_regime_contradiction():
+    analysis = _analysis_with_stats()
+    analysis.volatility_regime_backtest = VolatilityRegimeBacktest(4.0, 15, 8.0, 20, 10)
+    text = format_enriched_asset_context([analysis])
+    assert "CONTRADICTS the 'coiled spring' reading" in text
+
+
+def test_format_enriched_asset_context_discloses_missing_backtest_evidence():
+    analysis = _analysis_with_stats()  # backtest fields default to None
+    text = format_enriched_asset_context([analysis])
+    assert "not enough real historical episodes" in text
+    assert "not enough history to compute" in text
+    assert "not enough real historical tests of these levels to compute" in text
 
 
 _NO_AUDIT = AuditResult(block="", audit_available=False)
@@ -842,7 +927,7 @@ def test_build_audit_block_all_succeed(mock_audit):
     mock_audit.side_effect = audit_side_effect
     result = build_audit_block("some summary", "Claude's draft mix.")
     assert result.audit_available is True
-    for _, model in AUDIT_MODELS:
+    for _, model, _ in AUDIT_MODELS:
         assert f"audit from {model}" in result.block
 
 
@@ -900,6 +985,16 @@ def test_build_audit_block_treats_one_audit_exception_as_unavailable_without_los
 def test_build_audit_block_queries_every_audit_model(mock_audit):
     build_audit_block("some summary", "Claude's draft mix.")
     assert mock_audit.call_count == len(AUDIT_MODELS)
+
+
+@patch("ai.portfolio_suggest.get_openrouter_audit", return_value="an audit")
+def test_build_audit_block_labels_each_audit_with_its_source_model_profile(mock_audit):
+    # Stage 2's weighting instruction only works if each model's own
+    # capability/specialization profile actually reaches the prompt
+    # alongside its audit text — not just the label.
+    result = build_audit_block("some summary", "Claude's draft mix.")
+    for label, _, profile in AUDIT_MODELS:
+        assert f"{label} ({profile}) audit:" in result.block
 
 
 @patch("ai.portfolio_suggest.get_openrouter_audit")
@@ -1139,7 +1234,8 @@ def test_build_stage2_instruction_audit_available_frames_synthesis_without_discl
 
 def test_build_stage2_instruction_audit_unavailable_requires_disclosure_and_self_review():
     lowered = build_stage2_instruction(False).lower()
-    assert "the independent audit of my draft was not available for this run" in lowered
+    assert "independent audit" in lowered and "not available this run" in lowered
+    assert "executive summary" in lowered  # disclosed within the report's own section now
 
 
 def test_build_stage1_and_stage2_share_failure_mode_checklist():

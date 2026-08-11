@@ -15,6 +15,16 @@ from ai.openrouter_client import FAILED_MESSAGE as OPENROUTER_FAILED_MESSAGE
 from ai.openrouter_client import MISSING_KEY_MESSAGE as OPENROUTER_MISSING_KEY_MESSAGE
 from ai.openrouter_client import run_openrouter
 from ai.session_record import SessionRecord, save_portfolio_session
+from analysis.backtest import (
+    MomentumPersistenceBacktest,
+    RSIReactionBacktest,
+    SupportResistanceBacktest,
+    VolatilityRegimeBacktest,
+    backtest_momentum_persistence,
+    backtest_rsi_reaction,
+    backtest_support_resistance_reaction,
+    backtest_volatility_regime,
+)
 from analysis.technical import TechnicalStats, compute_technical_stats
 from data.book_wisdom import format_book_wisdom
 from data.commodity_geography import INDEX_LINKED_COUNTRIES, METAL_LINKED_COUNTRIES
@@ -60,6 +70,34 @@ _INSTRUCTION_HEAD = (
     "a genuinely credible source can't be found for something, say so "
     "rather than falling back to a weak one or inventing a citation."
     "\n\n"
+    "EXPLICIT RISK CALIBRATION (stated directly by the user, treat this "
+    "as the goal every sizing/risk decision below serves): the user wants "
+    "genuinely CALCULATED risk-taking, not the most conservative mix that "
+    "technically diversifies, and not reckless/unresearched risk either — "
+    "they've been explicit that they don't want 'a gambling board' but "
+    "also don't want an overly cautious mix, specifically flagging that "
+    "an earlier run of this tool ended up too conservative (holding an "
+    "unnecessarily large, mostly-idle cash reserve). What makes risk "
+    "'calculated' rather than 'gambling' is unchanged and still fully "
+    "required: a real stop-loss on every position, sizing that reflects "
+    "each instrument's own volatility and how strong its supporting "
+    "evidence actually is (a high-conviction, well-evidenced case earns a "
+    "meaningfully larger size than a marginal one — don't spread equity "
+    "evenly across instruments regardless of conviction), genuine group/"
+    "correlation diversification, and every claim grounded in the real "
+    "macro/technical/research data given, not a hunch. Within those real "
+    "constraints, resolve genuine uncertainty toward being MORE invested, "
+    "not less. One specific failure mode to actively resist: the book-"
+    "wisdom principles below include a generic '~50% of equity in "
+    "reserve' cash-reserve default (Murphy) — that's a reasonable "
+    "starting anchor for a generic account, but following it reflexively "
+    "is exactly the over-conservative outcome this paragraph is "
+    "correcting. Absent a specific, genuinely elevated near-term risk "
+    "you've identified in your own research (not a generic 'markets can "
+    "always fall'), a cash reserve in roughly the 10-25% range is a more "
+    "appropriate default here; if you keep more in cash than that, say "
+    "explicitly why the specific evidence in front of you warrants it."
+    "\n\n"
     "If a 'Current Open Positions' section appears below, the account is "
     "not starting from empty — treat those as real, already-committed "
     "capital, not a hypothetical. Your final mix must explicitly reconcile "
@@ -91,6 +129,33 @@ _INSTRUCTION_HEAD = (
     "using any such level as a trigger price or citing it in your final "
     "answer, sanity-check its scale/units against a quick WebSearch for "
     "that instrument's current real-world price, and convert if needed; "
+    "REAL HISTORICAL BACKTESTS of this specific instrument's own past "
+    "behavior over its real ~5-year price history — not a generic "
+    "textbook assumption — covering exactly the kinds of claims a "
+    "technical read tempts you to make: how often its own past RSI "
+    "overbought/oversold episodes actually reversed as the textbook "
+    "convention predicts (with the real average forward return and "
+    "reversal rate), whether its own price history shows real momentum "
+    "persistence or mean-reversion, whether its own historically LOW-"
+    "volatility episodes have actually been followed by BIGGER "
+    "subsequent moves (supporting the textbook 'coiled spring' idea) or "
+    "by smaller ones (volatility clustering — quiet periods tend to stay "
+    "quiet for this instrument, contradicting that idea), and how often "
+    "price has actually held at the shown support level or been rejected "
+    "at the shown resistance level historically, rather than assuming a "
+    "support/resistance line is reliable just because it's a well-known "
+    "charting concept. Ground any claim you make about RSI, momentum, "
+    "volatility regime, or support/resistance reliability for a specific "
+    "instrument in ITS OWN backtest evidence rather than the generic "
+    "convention when the two disagree — say so explicitly when an "
+    "instrument's real history contradicts the textbook assumption. NOTE: "
+    "unlike PSX's equivalent equity backtests, there is deliberately NO "
+    "beta-vs-benchmark backtest here — PMEX instruments span metals, "
+    "energy, grains, currencies, and equity indices with no single "
+    "natural per-instrument benchmark the way PSX's own index "
+    "constituents have, and fabricating one (e.g. a generic S&P 500 beta "
+    "for corn futures) would be closer to noise than evidence, so it's "
+    "left out rather than invented; "
     "plus recent headlines "
     "where available, and a feasibility line: the REAL minimum-lot margin "
     "requirement (in the account's own margin currency) as a % of "
@@ -199,16 +264,45 @@ _ROLE_STAGE2_SYNTHESIZE = (
     "Your job now is chiefly revision: read the audit reports, weigh "
     "their specific criticisms against your own original reasoning and "
     "the raw data yourself, and revise your draft into a final "
-    "recommendation — for each point you accept, say what changed and "
-    "why; for each point you reject, say why you're sticking with your "
-    "original call rather than silently ignoring it. You do not need to "
-    "repeat your original research from scratch, but you remain the "
-    "final decision-maker, not a rubber stamp for the audits: use "
-    "WebSearch/WebFetch yourself to spot-check any specific claim the "
-    "audits flagged as contested, stale, or consequential enough to "
-    "double-check before you rely on it. The mix under review below is "
-    "your own draft from the first pass — revise it, don't restart from "
-    "a blank page."
+    "recommendation. This weighing is INTERNAL working process, not "
+    "content for the visible report: decide privately for each critique "
+    "whether it changes your view, and let that decision simply improve "
+    "the final analysis — do not narrate the back-and-forth (no 'the "
+    "audit flagged...', 'upon review, I now think...', 'other models "
+    "noted...', 'my initial draft said...' anywhere in the visible "
+    "answer). You do not need to repeat your original research from "
+    "scratch, but you remain the final decision-maker, not a rubber "
+    "stamp for the audits: use WebSearch/WebFetch yourself to spot-check "
+    "any specific claim the audits flagged as contested, stale, or "
+    "consequential enough to double-check before you rely on it. The mix "
+    "under review below is your own draft from the first pass — revise "
+    "it, don't restart from a blank page."
+    "\n\n"
+    "WEIGH EACH AUDIT BY ITS SOURCE MODEL, not equally by default. Each "
+    "audit below is labeled with its source model's own approximate "
+    "scale and specialization (e.g. '550B params, general-purpose "
+    "reasoning' vs. '30B total/3B active MoE, CODING-AGENT-specialized — "
+    "weigh its open-ended judgment calls with more caution'). Use this "
+    "as a starting prior, not a hard rule: a larger, general-purpose "
+    "reasoning model's open-ended judgment call (e.g. 'this sector "
+    "allocation looks too concentrated given the macro backdrop') "
+    "deserves more default trust than the same kind of judgment call "
+    "from a smaller or coding-specialized model, since the latter's own "
+    "training targeted a different kind of task. But this prior does "
+    "NOT apply to concrete, verifiable points — a real arithmetic error, "
+    "a real contradiction against the data given above, a real gap "
+    "against the failure-mode checklist — those stand on their own "
+    "merits regardless of which model raised them, and a smaller/"
+    "specialized model catching something every larger model missed is "
+    "still a genuine catch, not a fluke to discount. In short: verify "
+    "concrete claims by checking them against the real data (or "
+    "WebSearch) rather than by which model said it; use the scale/"
+    "specialization label mainly to decide how much extra scrutiny an "
+    "open-ended judgment call from a smaller/specialized model deserves "
+    "before you accept it. This weighing is internal analysis, same as "
+    "the rest of this paragraph — don't narrate it in the visible "
+    "answer either (no 'the larger model said X, the smaller one said "
+    "Y', no naming which specific model's critique swayed a decision)."
 )
 
 
@@ -220,14 +314,18 @@ _ROLE_STAGE2_SELF_REVIEW = (
     "now falls back to you. Re-examine your own draft critically: verify "
     "its key claims via WebSearch/WebFetch where practical, and run it "
     "through the failure-mode checklist below the way an independent "
-    "auditor would, rather than simply restating it. The mix under "
-    "review below is your own draft from the first pass."
+    "auditor would, rather than simply restating it — internally; this "
+    "self-check is process, not content, and shouldn't be narrated in "
+    "the visible report either. The mix under review below is your own "
+    "draft from the first pass."
     "\n\n"
-    "Because the independent audit was unavailable this run, state so "
-    "plainly and near the start of your visible answer (for example: "
-    "\"the independent audit of my draft was not available for this run, "
-    "so I re-checked it myself\") so the user understands this run had "
-    "one less layer of independent review."
+    "Because the independent audit was unavailable this run, disclose "
+    "that fact plainly as one sentence within the Executive Summary "
+    "section of your visible answer (defined below) — this is the one "
+    "piece of process information the user genuinely needs to know, "
+    "since it means this run had one less layer of independent review; "
+    "everything else about how the answer was produced stays out of the "
+    "report."
 )
 
 
@@ -272,19 +370,24 @@ _INSTRUCTION_TAIL = (
     "further during off-peak/lower-liquidity trading hours, so factor "
     "that into your order-type and timing guidance rather than treating "
     "the shown number as a ceiling.\n"
-    "   e. Idle cash — if the mix leaves a meaningful cash reserve, "
-    "define specific conditional triggers for deploying it, tied to the "
-    "support/resistance levels already given per instrument above (e.g. "
-    "'deploy X% if [instrument] pulls back to its support level' or "
-    "'deploy X% on a confirmed breakout above [instrument]'s resistance'). "
-    "Every such trigger must also have an explicit time-based fallback "
-    "(e.g. 'if not triggered within N trading days, do X instead') — an "
-    "open-ended trigger that could leave cash idle indefinitely is itself "
-    "a weakness. If the FX section above is present, also research the "
-    "account country's current short-term risk-free/policy rate via "
-    "WebSearch and explicitly weigh idle cash's opportunity cost against "
-    "it (and against staying invested) when sizing the reserve — don't "
-    "size cash as an arbitrary leftover percentage.\n"
+    "   e. Idle cash — per the risk-calibration objective above, treat "
+    "any cash reserve beyond roughly 10-25% of equity as needing its own "
+    "explicit justification (a specific, genuinely elevated near-term "
+    "risk you identified, not generic caution), the same as an unusually "
+    "large single-position bet would need justifying. Whatever reserve "
+    "you do leave, define specific conditional triggers for deploying it, "
+    "tied to the support/resistance levels already given per instrument "
+    "above (e.g. 'deploy X% if [instrument] pulls back to its support "
+    "level' or 'deploy X% on a confirmed breakout above [instrument]'s "
+    "resistance'). Every such trigger must also have an explicit time-"
+    "based fallback (e.g. 'if not triggered within N trading days, do X "
+    "instead') — an open-ended trigger that could leave cash idle "
+    "indefinitely is itself a weakness. If the FX section above is "
+    "present, also research the account country's current short-term "
+    "risk-free/policy rate via WebSearch and explicitly weigh idle "
+    "cash's opportunity cost against it (and against staying invested) "
+    "when sizing the reserve — don't size cash as an arbitrary leftover "
+    "percentage.\n"
     "   f. Position sizing vs. volatility, and hedge feasibility — size "
     "positions smaller, relative to equal-risk peers, for instruments "
     "showing higher annualized volatility% above. Only propose a hedge or "
@@ -295,10 +398,11 @@ _INSTRUCTION_TAIL = (
     "% allocation by its stop-loss distance (%) to get that position's "
     "contribution to capital at risk, then sum these across the whole "
     "mix. State this total explicitly (e.g. 'aggregate heat: 5.2% of "
-    "equity') and check it against a ~6-8% cap: if a simultaneous "
-    "worst-case stop-out across every position would erase more than "
-    "that, resize down until it doesn't, rather than sizing positions "
-    "independently of each other.\n"
+    "equity') and check it against a ~10-15% cap (raised from this "
+    "tool's earlier, more conservative 6-8% cap, per the calculated-risk "
+    "objective above): if a simultaneous worst-case stop-out across "
+    "every position would erase more than that, resize down until it "
+    "doesn't, rather than sizing positions independently of each other.\n"
     "   h. Sector/group concentration — group the mix's positions by "
     "correlated market/sector (e.g. precious metals, energy, grains, "
     "equity indices) and sum the % allocation within each group. State "
@@ -314,33 +418,97 @@ _INSTRUCTION_TAIL = (
     "0% in your final mix, state that exclusion explicitly and justify "
     "it, the same way you'd justify an inclusion — don't let an absence "
     "go unexplained just because there's no number to attach it to.\n"
+    "   j. Backtest grounding — for any instrument where you're leaning "
+    "on an RSI, momentum, volatility-regime, or support/resistance "
+    "argument, cross-check it against that exact instrument's own "
+    "backtest evidence given above. If the real historical evidence "
+    "contradicts the textbook convention you were about to lean on (e.g. "
+    "an overbought reading treated as bearish but this instrument's own "
+    "reversal rate after past overbought episodes is well under 50%), "
+    "either drop that specific argument in favor of a supported one or "
+    "explain concretely why you're keeping it despite the historical "
+    "evidence against it — don't silently keep the generic-convention "
+    "framing once contradicted.\n"
     "2. Revise the mix based on what step 1 found, incorporating whatever "
     "the strongest points were from this checklist pass, and from the "
     "audit/self-review findings above, whichever applied this run.\n"
     "\n"
-    "Now write your visible answer as ONE cohesive final recommendation — "
-    "not the three steps above shown separately. For each instrument and "
-    "for the cash reserve, explain the reasoning behind that decision "
-    "inline (weaving in whichever of the considerations above are "
-    "relevant to it) as part of justifying the number, the way an analyst "
-    "would write a finished recommendation rather than show their scratch "
-    "work. No deterministic sizing or risk rules are wired up yet for "
-    "this feature, so clearly state that the final answer is still an "
-    "early-stage, discretionary starting point for discussion, not a "
-    "precise or final recommendation."
+    "Now write your visible answer as a STRUCTURED INVESTMENT REPORT — "
+    "the way a professional futures/commodities research note reads "
+    "(clear sections, a real narrative arc), not a raw stream of "
+    "reasoning and not a transcript of the draft/audit/revise process "
+    "above. Use exactly these markdown section headers, in this order; "
+    "if a section is genuinely thin for this run, keep the header and "
+    "write one honest sentence under it rather than omitting the "
+    "section entirely — the structure itself is part of what makes this "
+    "readable:\n"
+    "## Executive Summary\n"
+    "3-5 sentences: your overall market stance, the headline allocation "
+    "idea, and the single biggest risk to watch this cycle. State here "
+    "too that no deterministic sizing/risk rules are wired up for this "
+    "feature yet, so this is an early-stage, discretionary starting "
+    "point for discussion, not a precise or final recommendation (and, "
+    "if applicable this run, that the independent audit layer wasn't "
+    "available — see above).\n"
+    "## Macro & Market Backdrop\n"
+    "A flowing narrative — interpretation, not a restated bullet list of "
+    "the yield-curve/DXY/VIX/FX numbers given above — on what the real "
+    "macro data actually implies for these instruments right now, plus "
+    "whatever geopolitical/policy context you found via WebSearch.\n"
+    "## Asset-Class Outlook\n"
+    "Group the instruments by asset class/correlated market (e.g. "
+    "precious metals, energy, grains, equity indices) and give your view "
+    "per group — including roll-yield/contango-backwardation dynamics "
+    "for that class, and explicit justification for any entire class "
+    "that's present and tradable but excluded from the mix (checklist "
+    "items b, h, i belong here).\n"
+    "## Investment Thesis by Position\n"
+    "One short subsection per included instrument — lead each with the "
+    "symbol in bold (e.g. \"**GOLD-DE26:**\") — covering in flowing "
+    "prose why it earns its place now (technical + fundamental + "
+    "research-based catalyst), and the sizing/entry/stop rationale, "
+    "including FX exposure, spread/liquidity, and volatility-based "
+    "sizing where relevant (checklist items a, d, f belong here, applied "
+    "per position rather than listed separately). If you're relying on "
+    "an RSI, momentum, volatility-regime, or support/resistance-based "
+    "argument for a holding, ground it explicitly in that instrument's "
+    "own real historical backtest evidence given above rather than the "
+    "generic textbook convention when the two disagree — checklist item "
+    "j belongs here too, applied per position.\n"
+    "## Portfolio Construction & Risk Management\n"
+    "Aggregate heat and correlation-under-stress findings (checklist "
+    "items c, g), synthesized as your own risk-management conclusions "
+    "about the mix as a whole — not a checklist recitation.\n"
+    "## Recommended Allocation\n"
+    "A short closing summary of the final numbers (prose or a simple "
+    "markdown table), immediately before the required trailing JSON "
+    "block.\n"
+    "## Outlook & Triggers to Revisit\n"
+    "Idle-cash deployment triggers (with their required time-based "
+    "fallback, checklist item e) and what would change this view going "
+    "forward.\n"
+    "\n"
+    "Throughout, write in ONE confident, single-voice analyst register — "
+    "never reference the multi-stage or multi-model process that "
+    "produced this answer (no 'the audit flagged...', 'upon revision...', "
+    "'other models noted...', 'my draft said...'). Every conclusion, "
+    "whichever pass it originated in, is presented simply as this "
+    "report's own analysis; a reader should not be able to tell this was "
+    "a multi-stage process at all — that's process, and process isn't "
+    "content."
     "\n\n"
     "Prioritize thoroughness and rigor over brevity — there is no strict "
     "length limit on this response. Take the time you need to research "
     "and reason properly; a longer, well-evidenced answer is preferred "
-    "over a shorter, shallower one. Stay organized (clear paragraphs or "
-    "bullet points per instrument) and avoid needless repetition."
+    "over a shorter, shallower one. Avoid needless repetition."
     "\n\n"
     "Write all of your reasoning and explanation as plain prose/markdown "
-    "(paragraphs, bullet points, bold text) — do not put any of it inside "
-    "a fenced code block. The ONLY fenced code block in your entire "
-    "response must be a single one at the very end, exactly like this "
-    "(replace the example values with your actual final numbers, one key "
-    "per instrument symbol traded above plus one \"CASH\" key, pct values "
+    "using the section headers specified above — do not put any of it "
+    "inside a fenced code block. The ONLY fenced code block in your "
+    "entire response must be a single one at the very end (after the "
+    "'Recommended Allocation' section), exactly like this (replace the "
+    "example values with your actual final numbers, one key per "
+    "instrument symbol traded above plus one \"CASH\" key, pct values "
     "summing to 100, no comments or extra text inside the block). Every "
     "non-CASH key must be an object with three numbers: \"pct\" (the "
     "target allocation), \"price\" (a specific limit-order entry price — "
@@ -400,6 +568,11 @@ class AssetAnalysis:
     )
     headlines: list[str] = field(default_factory=list)
     contract_spec: ContractSpec | None = None
+    rsi_overbought_backtest: RSIReactionBacktest | None = None
+    rsi_oversold_backtest: RSIReactionBacktest | None = None
+    momentum_persistence_backtest: MomentumPersistenceBacktest | None = None
+    volatility_regime_backtest: VolatilityRegimeBacktest | None = None
+    support_resistance_backtest: SupportResistanceBacktest | None = None
 
 
 def analyze_assets(assets: list[MarketAsset]) -> list[AssetAnalysis]:
@@ -428,15 +601,21 @@ def analyze_assets(assets: list[MarketAsset]) -> list[AssetAnalysis]:
         display_name, yahoo_ticker = resolved
         enriched_count += 1
 
-        history = fetch_price_history_ohlcv(yahoo_ticker)
+        history = fetch_price_history_ohlcv(yahoo_ticker, period="5y")
         prices = history["Close"]
         stats = compute_technical_stats(prices, history=history)
         headlines = fetch_recent_headlines(yahoo_ticker, limit=config.NEWS_HEADLINES_PER_ASSET)
+        rsi_overbought_bt, rsi_oversold_bt = backtest_rsi_reaction(prices)
 
         results.append(
             AssetAnalysis(
                 a.symbol, a.description, a.bid, a.ask, display_name,
                 prices, stats, headlines, contract_spec,
+                rsi_overbought_backtest=rsi_overbought_bt,
+                rsi_oversold_backtest=rsi_oversold_bt,
+                momentum_persistence_backtest=backtest_momentum_persistence(prices),
+                volatility_regime_backtest=backtest_volatility_regime(prices),
+                support_resistance_backtest=backtest_support_resistance_reaction(prices),
             )
         )
 
@@ -487,6 +666,92 @@ def _feasibility_line(r: AssetAnalysis, account_equity: float | None) -> str | N
         f"(multiply this directly for any lot count); "
         f"min lot size {spec.volume_min:g}, lot step {spec.volume_step:g}"
     )
+
+
+def _format_rsi_backtest(bt: RSIReactionBacktest | None, condition: str) -> str:
+    if bt is None:
+        return (
+            f"  historical {condition} RSI reaction: not enough real historical episodes "
+            "in this instrument's own history to compute — treat any RSI-reversal claim "
+            "for it as unverified assumption, not evidence."
+        )
+    return (
+        f"  historical {condition} RSI reaction (real, this instrument's own past): "
+        f"{bt.occurrences} distinct past episodes where RSI reached {bt.threshold:.0f}, "
+        f"average {bt.forward_days}-trading-day return afterward = "
+        f"{bt.avg_forward_return_pct:+.2f}%, reversed as the textbook convention would "
+        f"predict {bt.reversal_rate_pct:.0f}% of the time"
+    )
+
+
+def _format_backtests(r: AssetAnalysis) -> list[str]:
+    """Real multi-year backtests of this specific instrument's own price
+    history (see analysis/backtest.py) — mirrors ai/psx_suggest.py's own
+    `_format_backtests` in spirit and wording, kept as an independent
+    copy rather than a shared import since the two files' report
+    templates are each maintained standalone. Deliberately does NOT
+    include a beta-stability backtest the way the PSX version does: that
+    needs a per-instrument benchmark index, and PMEX spans metals,
+    energy, grains, currencies, and equity indices with no single
+    natural benchmark the way PSX's own index constituents have — rather
+    than fabricate one (e.g. a generic S&P 500 beta for corn futures
+    would be close to meaningless), it's left out here and disclosed as
+    out of scope in the prompt text instead."""
+    lines = [_format_rsi_backtest(r.rsi_overbought_backtest, "overbought")]
+    lines.append(_format_rsi_backtest(r.rsi_oversold_backtest, "oversold"))
+
+    mp = r.momentum_persistence_backtest
+    if mp is not None:
+        lines.append(
+            f"  historical momentum pattern (this instrument's own history, "
+            f"{mp.sample_size} independent ~1-month periods): correlation between a "
+            f"period's own return and the NEXT period's return = {mp.correlation:+.2f} "
+            f"-> {mp.interpretation.replace('_', ' ')} "
+            "(persistent = past winners tended to keep winning; mean_reverting = past "
+            "winners tended to give it back; no_clear_pattern = neither reliably)"
+        )
+    else:
+        lines.append("  historical momentum pattern: not enough history to compute")
+
+    vr = r.volatility_regime_backtest
+    if vr is not None:
+        lines.append(
+            f"  historical volatility-regime reaction (this instrument's own past "
+            f"{vr.low_vol_episodes} low-volatility and {vr.high_vol_episodes} "
+            f"high-volatility episodes, {vr.forward_days}-trading-day forward move): "
+            f"avg move after LOW-vol episodes = {vr.low_vol_avg_abs_move_pct:.2f}%, "
+            f"avg move after HIGH-vol episodes = {vr.high_vol_avg_abs_move_pct:.2f}% -> "
+            + (
+                "supports the 'coiled spring' reading (quiet periods historically precede "
+                "bigger moves for this instrument)"
+                if vr.low_vol_avg_abs_move_pct > vr.high_vol_avg_abs_move_pct
+                else "CONTRADICTS the 'coiled spring' reading (this instrument's own low-"
+                "volatility periods have historically been followed by SMALLER moves, not "
+                "bigger ones — volatility has clustered/persisted instead)"
+            )
+        )
+    else:
+        lines.append("  historical volatility-regime reaction: not enough history to compute")
+
+    sr = r.support_resistance_backtest
+    if sr is not None:
+        lines.append(
+            f"  historical support/resistance reliability (this instrument's own past, "
+            f"{sr.forward_days}-trading-day forward check): support held (price higher "
+            f"afterward) {sr.support_hold_rate_pct:.0f}% of {sr.support_tests} real past "
+            f"tests; resistance rejected (price lower afterward) "
+            f"{sr.resistance_reject_rate_pct:.0f}% of {sr.resistance_tests} real past "
+            "tests — use this to judge how much weight the support/resistance range shown "
+            "above deserves for THIS instrument specifically, rather than assuming "
+            "support/resistance lines are reliable just because they're a well-known "
+            "charting concept."
+        )
+    else:
+        lines.append(
+            "  historical support/resistance reliability: not enough real historical "
+            "tests of these levels to compute"
+        )
+    return lines
 
 
 def format_enriched_asset_context(
@@ -573,6 +838,7 @@ def format_enriched_asset_context(
                 pattern_bits.append(f"market type: {stats.market_regime}")
             if pattern_bits:
                 lines.append(f"  pattern: {', '.join(pattern_bits)}")
+            lines += _format_backtests(r)
         else:
             lines.append(
                 "  technical: not available (price-history fetch failed) — do not "
@@ -950,12 +1216,47 @@ AUDIT_INSTRUCTION = (
     "based on the data you both were given.\n"
     "- Note where you would weigh something differently, and why.\n"
     "\n"
-    "Produce a structured audit report — agreements, flaws, gaps, and "
-    "specific suggested improvements — not a rewritten competing "
-    "allocation. Since you have no live data access, don't claim to "
-    "fact-check anything beyond what's in the data given here; audit its "
-    "reasoning and internal consistency, not facts you can't verify. Keep "
-    "your response focused — under 400 words."
+    "BACKTEST THE DRAFT'S UNDERLYING LOGIC, not just its arithmetic. The "
+    "draft doesn't just state numbers — it implies a small system of "
+    "cause-and-effect rules about how these instruments behave (e.g. "
+    "'this overbought reading means a pullback is likely', 'this "
+    "instrument's positive momentum means it should keep outperforming'). "
+    "Treat the draft as implicitly claiming a function — given a "
+    "condition X (a technical reading, a regime), it asserts an expected "
+    "market response Y — and you have real historical evidence below to "
+    "test specific values of X against:\n"
+    "1. For each holding, identify the specific technical/behavioral "
+    "claim(s) the draft is relying on to justify it (momentum "
+    "continuing, a reversal being likely, a volatility-contraction "
+    "'coiled spring' setup, a support/resistance level holding).\n"
+    "2. Cross-check EACH such claim against that exact instrument's own "
+    "historical backtest evidence given below (its real past RSI-"
+    "reaction rate and average forward return, whether its own history "
+    "shows real momentum persistence or mean-reversion, whether its own "
+    "low-volatility episodes have historically been followed by bigger "
+    "or smaller moves, and how often its shown support/resistance levels "
+    "have actually held or been rejected) — this is genuine historical "
+    "evidence for THIS instrument specifically, not a generic textbook "
+    "assumption. Note: there is no beta-vs-benchmark backtest here (PMEX "
+    "spans too many uncorrelated asset classes for one natural "
+    "benchmark) — don't fault the draft for lacking one.\n"
+    "3. Score each claim you checked: SUPPORTED (the historical evidence "
+    "agrees with the draft's implied logic), CONTRADICTED (the "
+    "instrument's own history shows the opposite), or UNTESTABLE (not "
+    "enough real historical episodes were available to judge either way "
+    "— say so rather than guessing). Cite the actual numbers you're "
+    "basing this on.\n"
+    "4. A CONTRADICTED score is a real, concrete flaw to raise — treat it "
+    "with the same weight as a math error, not a minor stylistic note.\n"
+    "\n"
+    "Produce a structured audit report — agreements, flaws, gaps, the "
+    "backtest scorecard from above, and specific suggested improvements "
+    "— not a rewritten competing allocation. Since you have no live data "
+    "access, don't claim to fact-check anything beyond what's in the "
+    "data given here (the historical backtests ARE data given here, not "
+    "something you're fetching yourself); audit its reasoning and "
+    "internal consistency, not facts you can't verify. Keep your "
+    "response focused — under 550 words."
 )
 
 
@@ -981,7 +1282,15 @@ def get_openrouter_audit(
     return run_openrouter(prompt, model=model, timeout=timeout)
 
 
-AUDIT_MODELS: list[tuple[str, str]] = [
+# (label, OpenRouter model id, capability/specialization profile) — the
+# third element is shown to Claude alongside each model's own audit text
+# in build_audit_block's output specifically so the stage-2 synthesis can
+# weigh each critique by how much confidence its source model's scale/
+# specialization actually warrants (see _ROLE_STAGE2_SYNTHESIZE), rather
+# than treating a 550B general-reasoning model and a 30B coding-agent
+# model as equally authoritative by default just because both produced a
+# paragraph of audit text.
+AUDIT_MODELS: list[tuple[str, str, str]] = [
     # The largest/most-capable general-purpose text models among
     # OpenRouter's currently ~14 :free-tagged models (confirmed live via
     # /api/v1/models — this roster churns often and third-party "top
@@ -994,11 +1303,23 @@ AUDIT_MODELS: list[tuple[str, str]] = [
     # nvidia/nemotron-3.5-content-safety (a moderation classifier, wrong
     # task) and nvidia/nemotron-nano-12b-v2-vl (vision-language, unneeded
     # here) — both smoke-tested-irrelevant rather than tested.
-    ("Nvidia Nemotron-Ultra-550B", "nvidia/nemotron-3-ultra-550b-a55b:free"),  # 550B params
-    ("Nvidia Nemotron-Super-120B", "nvidia/nemotron-3-super-120b-a12b:free"),  # 120B params
-    ("Google Gemma 4 31B", "google/gemma-4-31b-it:free"),  # 31B params
-    ("Nvidia Nemotron-Nano-Omni-30B-Reasoning", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"),  # 30B, reasoning-tuned
-    ("OpenAI gpt-oss-20b", "openai/gpt-oss-20b:free"),  # 20B params
+    (
+        "Nvidia Nemotron-Ultra-550B",
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "550B params, general-purpose reasoning — the largest model in this pool",
+    ),
+    (
+        "Nvidia Nemotron-Super-120B",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "120B params, general-purpose reasoning",
+    ),
+    ("Google Gemma 4 31B", "google/gemma-4-31b-it:free", "31B params, general-purpose reasoning"),
+    (
+        "Nvidia Nemotron-Nano-Omni-30B-Reasoning",
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+        "30B total/3B active MoE, general-purpose, reasoning-tuned",
+    ),
+    ("OpenAI gpt-oss-20b", "openai/gpt-oss-20b:free", "20B params, general-purpose reasoning"),
     # A 6th model, deliberately not because it's stronger than the Gemma
     # above — confirmed live via /api/v1/models that OpenRouter currently
     # has exactly one other free Google model, and it's a 26B MoE with
@@ -1008,7 +1329,71 @@ AUDIT_MODELS: list[tuple[str, str]] = [
     # model in the pool is still one more chance of surviving a shared-
     # pool rate-limit that happens to hit several models simultaneously
     # (confirmed live earlier this session that this does happen).
-    ("Google Gemma 4 26B A4B", "google/gemma-4-26b-a4b-it:free"),  # 26B total / 4B active (MoE)
+    (
+        "Google Gemma 4 26B A4B",
+        "google/gemma-4-26b-a4b-it:free",
+        "26B total/4B active MoE, general-purpose reasoning — the smallest ACTIVE-parameter "
+        "count among the pool's general-purpose models, kept for provider redundancy over "
+        "raw capability",
+    ),
+    # Expanded 6 -> 10 (2026-08-11), re-checking /api/v1/models live rather
+    # than assuming the roster above was still current — it wasn't: 8 new
+    # free models had appeared since the 6th-model decision. After the same
+    # two task-fit exclusions as above (still present: nvidia/nemotron-3.5-
+    # content-safety, nvidia/nemotron-nano-12b-v2-vl), 6 genuinely new
+    # candidates remained. All 4 added below were smoke-tested live
+    # (a real, successful chat-completions round-trip) before being added,
+    # matching this list's established practice of never trusting an entry
+    # from the models listing alone.
+    #
+    # Honest caveat, not silently glossed over: 3 of these 4 (everything
+    # below except the Nemotron) are marketed as CODING-AGENT models
+    # (Poolside's own copy cites Terminal-Bench, a coding benchmark;
+    # Cohere's North family debuts as "its first agentic coding model") —
+    # a genuinely different post-training specialization than the general
+    # instruction-following/reasoning models that made up the first 6, even
+    # though they're still general chat-completion-capable LLMs that can
+    # produce a written audit. This is a real, deliberate size-over-fit
+    # tradeoff to reach 10 total: after excluding the content-safety/
+    # vision-language models, only 2 of the 6 remaining free candidates
+    # (the ones NOT added here — inclusionai/ling-3.0-tiny at 7.9B and
+    # nvidia/nemotron-nano-9b-v2 at 9B) are both general-purpose AND
+    # smaller than every model added below — there was no way to reach 10
+    # using only general-purpose models without going smaller than what's
+    # already in the pool. If a future audit run's OpenRouter transcripts
+    # show these three producing noticeably shallower/more code-flavored
+    # critiques than the general-purpose models, that's the first thing to
+    # revisit — swap one or more back out for ling-3.0-tiny/nemotron-nano-
+    # 9b-v2 despite their smaller size, rather than assuming the pooling/
+    # retry machinery itself is at fault. Per-model profile strings below
+    # are what let stage 2 actually act on this caveat per audit, rather
+    # than this comment being the only place it's recorded.
+    (
+        "Poolside Laguna S 2.1",
+        "poolside/laguna-s-2.1:free",
+        "118B total/8B active MoE, CODING-AGENT-specialized (tuned for coding-agent "
+        "benchmarks, not general financial/textual reasoning) — weigh its open-ended "
+        "judgment calls with more caution than the general-purpose models above, though "
+        "any concrete, verifiable point it raises still stands on its own merits",
+    ),
+    (
+        "Poolside Laguna XS 2.1",
+        "poolside/laguna-xs-2.1:free",
+        "33B total/3B active MoE, CODING-AGENT-specialized (tuned for coding-agent "
+        "benchmarks, not general financial/textual reasoning) — same lower-default-trust "
+        "caveat as Laguna S above",
+    ),
+    (
+        "Cohere North Mini Code",
+        "cohere/north-mini-code:free",
+        "30B total/3B active MoE, CODING-AGENT-specialized (Cohere's own debut agentic "
+        "CODING model) — same lower-default-trust caveat as the Poolside models above",
+    ),
+    (
+        "Nvidia Nemotron 3 Nano 30B A3B",
+        "nvidia/nemotron-3-nano-30b-a3b:free",
+        "30B total/3B active MoE, general-purpose agentic reasoning (not coding-specialized)",
+    ),
 ]
 
 
@@ -1222,10 +1607,15 @@ def build_audit_block(
     which are retrying and when, and which have given up, instead of one
     static line for the whole (up to ~10-minutes-per-model) audit phase."""
     status_map: dict[str, ModelAuditStatus] = {
-        label: ModelAuditStatus(state="waiting", attempt=0, max_attempts=0) for label, _ in AUDIT_MODELS
+        label: ModelAuditStatus(state="waiting", attempt=0, max_attempts=0)
+        for label, _, _ in AUDIT_MODELS
     }
+    # Looked up when composing audit_sections below, so each model's audit
+    # text can be shown to Claude alongside its own capability/
+    # specialization profile — see AUDIT_MODELS' own comment for why.
+    profile_by_label = {label: profile for label, _, profile in AUDIT_MODELS}
     # Computed once here, not per-model — it's the same file-read result
-    # for every model in the pool, so no reason to redo the I/O 6 times.
+    # for every model in the pool, so no reason to redo the I/O 10 times.
     past_lessons = build_past_audit_lessons(records_dir=records_dir)
 
     with ThreadPoolExecutor(max_workers=len(AUDIT_MODELS)) as pool:
@@ -1243,7 +1633,7 @@ def build_audit_block(
                 past_lessons,
                 audit_instruction,
             )
-            for label, model in AUDIT_MODELS
+            for label, model, _ in AUDIT_MODELS
         ]
 
         last_rendered = None
@@ -1262,10 +1652,11 @@ def build_audit_block(
     audit_sections = []
     audit_available = False
     for label, text in audit_results:
+        profile = profile_by_label[label]
         if text in (OPENROUTER_FAILED_MESSAGE, OPENROUTER_MISSING_KEY_MESSAGE):
-            audit_sections.append(f"{label} audit: not available this time.")
+            audit_sections.append(f"{label} ({profile}) audit: not available this time.")
         else:
-            audit_sections.append(f"{label} audit:\n{text}")
+            audit_sections.append(f"{label} ({profile}) audit:\n{text}")
             audit_available = True
 
     return AuditResult(block="\n\n".join(audit_sections), audit_available=audit_available)
