@@ -40,7 +40,21 @@ def run_claude(
     timeout: int = 60,
     allowed_tools: list[str] | None = None,
     model: str | None = None,
+    session_id: str | None = None,
+    resume_session_id: str | None = None,
 ) -> str:
+    """`session_id` and `resume_session_id` let a caller chain two calls
+    into one real conversation instead of two independent, fully self-
+    contained ones — pass a caller-generated UUID as `session_id` on the
+    first call, then the SAME UUID as `resume_session_id` on a later call
+    to continue it. Live-verified (including with real WebSearch results,
+    not just plain text) that a resumed call correctly retains the exact
+    facts/figures found in the first call without needing them repeated —
+    this is what lets a caller send a much smaller follow-up prompt (only
+    the genuinely NEW content) instead of re-sending unchanging context a
+    second time. `resume_session_id` takes priority if both are somehow
+    given (a call is either starting a session or continuing one, not
+    both)."""
     # On Windows, `claude` resolves to an npm .cmd shim that subprocess.run
     # won't launch by bare name without shell=True; resolving the full path
     # via shutil.which (which honors PATHEXT) sidesteps that.
@@ -53,6 +67,10 @@ def run_claude(
         args += ["--allowedTools", *allowed_tools]
     if model:
         args += ["--model", model]
+    if resume_session_id:
+        args += ["--resume", resume_session_id]
+    elif session_id:
+        args += ["--session-id", session_id]
 
     try:
         # Pass the (multi-line) prompt over stdin rather than as a CLI arg —

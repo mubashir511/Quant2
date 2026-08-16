@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,6 +12,9 @@ import pandas as pd
 
 import config
 from ai.claude_cli import CLI_FAILED_PREFIX, CLI_MISSING_MESSAGE, run_claude
+from ai.copilot_cli import CLI_FAILED_PREFIX as COPILOT_FAILED_PREFIX
+from ai.copilot_cli import CLI_MISSING_MESSAGE as COPILOT_MISSING_MESSAGE
+from ai.copilot_cli import run_copilot
 from ai.openrouter_client import FAILED_MESSAGE as OPENROUTER_FAILED_MESSAGE
 from ai.openrouter_client import MISSING_KEY_MESSAGE as OPENROUTER_MISSING_KEY_MESSAGE
 from ai.openrouter_client import run_openrouter
@@ -208,6 +212,19 @@ _INSTRUCTION_HEAD = (
     "suggested mix, sizing, and cash reserve. You may reason your way to "
     "a different conclusion than a principle would suggest, but say so "
     "and explain why, rather than silently ignoring it."
+    "\n\n"
+    "On the reward:risk principles specifically (2:1 Bulkowski/"
+    "Rockefeller, 3:1 Murphy): the ratio must be an HONEST OUTPUT of a "
+    "genuinely-derived entry, stop, and target — never work backward "
+    "from the ratio to pick a target. Derive the stop from real ATR/"
+    "volatility first, derive the target from a real technical level "
+    "(actual resistance, a real prior high) — then report whatever ratio "
+    "actually results, even if it's below 2:1. An instrument that "
+    "genuinely doesn't offer 2:1 right now is real information (size it "
+    "smaller, treat it as lower-conviction, or leave it out) — "
+    "stretching its target to an optimistic level just to clear the "
+    "ratio manufactures a number instead of reporting one, and is a "
+    "worse outcome than honestly saying the ratio falls short."
 )
 
 
@@ -254,6 +271,18 @@ _STAGE1_DRAFT_INSTRUCTION = (
     "their feedback before your final answer goes to the user — so be "
     "thorough and explicit about your reasoning now, not just your "
     "conclusion, to give the audit something substantial to check."
+    "\n\n"
+    "End this draft with a compact \"External Research Notes\" list: one "
+    "short bullet per genuinely WebSearch/WebFetch-sourced fact you're "
+    "relying on (the claim plus its source, e.g. \"Corn export forecast "
+    "cut 3% per the Aug 2026 USDA WASDE report\"), not a repeat of your "
+    "prose. The audit models below have no web access of their own and "
+    "can't tell a real researched fact from an invented one just by "
+    "reading your prose — this list is what lets them see exactly which "
+    "claims are genuine live research (to weigh and reason over) versus "
+    "unstated assumptions (to actually flag). Keep it to the facts that "
+    "materially influenced a sizing/inclusion decision, not every search "
+    "result you looked at."
 )
 
 
@@ -299,10 +328,19 @@ _ROLE_STAGE2_SYNTHESIZE = (
     "WebSearch) rather than by which model said it; use the scale/"
     "specialization label mainly to decide how much extra scrutiny an "
     "open-ended judgment call from a smaller/specialized model deserves "
-    "before you accept it. This weighing is internal analysis, same as "
-    "the rest of this paragraph — don't narrate it in the visible "
-    "answer either (no 'the larger model said X, the smaller one said "
-    "Y', no naming which specific model's critique swayed a decision)."
+    "before you accept it. One audit is a different kind of source "
+    "entirely: the GitHub Copilot CLI review, if present, has real live "
+    "web access and was asked to independently verify your own draft's "
+    "External Research Notes claims — treat what it reports as SUPPORTED "
+    "or CONTRADICTED with real authority (it's the only reviewer that can "
+    "actually confirm or deny a fact, not just judge whether your "
+    "reasoning about it sounds internally consistent), and if it flags a "
+    "claim as CONTRADICTED, correct or drop that claim rather than "
+    "weighing it against the OpenRouter models' opinions. This weighing "
+    "is internal analysis, same as the rest of this paragraph — don't "
+    "narrate it in the visible answer either (no 'the larger model said "
+    "X, the smaller one said Y', no naming which specific model's "
+    "critique swayed a decision)."
 )
 
 
@@ -329,11 +367,57 @@ _ROLE_STAGE2_SELF_REVIEW = (
 )
 
 
+# Session-continuation variants of the two roles above, used when stage 2
+# resumes stage 1's own `claude -p --session-id` conversation (see
+# suggest_portfolio) instead of a fresh, fully self-contained call. In
+# that mode _INSTRUCTION_HEAD, `summary` (the market/macro data dump),
+# and the stage-1 draft are ALL already in the model's own conversation
+# history — repeating them verbatim in stage 2's prompt would be pure
+# duplicate token cost with zero new information, since nothing about
+# them changed between stage 1 and stage 2. Derived from the originals
+# via .replace() (not hand-duplicated) so the two variants can never
+# silently drift apart when the source text above is edited — the
+# accompanying tests assert the swapped phrase is actually gone, so a
+# future wording change that breaks the .replace() match fails loudly
+# instead of leaving a stale "below" reference in the continued variant.
+_ROLE_STAGE2_SYNTHESIZE_CONTINUED = _ROLE_STAGE2_SYNTHESIZE.replace(
+    "Below is your own draft suggestion and reasoning from the first "
+    "pass, plus independent audit reports from other models that "
+    "reviewed your specific draft for flaws, gaps, and disagreements.",
+    "Your own draft suggestion and reasoning from the first pass is "
+    "already above in this conversation — no need to repeat it. Below "
+    "are independent audit reports from other models that reviewed your "
+    "specific draft for flaws, gaps, and disagreements.",
+).replace(
+    "The mix under review below is your own draft from the first pass — "
+    "revise it, don't restart from a blank page.",
+    "The mix under review is your own draft from the first pass, already "
+    "shown above in this conversation — revise it, don't restart from a "
+    "blank page.",
+)
+
+_ROLE_STAGE2_SELF_REVIEW_CONTINUED = _ROLE_STAGE2_SELF_REVIEW.replace(
+    "Below is your own draft suggestion and reasoning from the first "
+    "pass. The independent audit that normally reviews it was not "
+    "available this run",
+    "Your own draft suggestion and reasoning from the first pass is "
+    "already above in this conversation. The independent audit that "
+    "normally reviews it was not available this run",
+).replace(
+    "The mix under review below is your own draft from the first pass.",
+    "The mix under review is your own draft from the first pass, already "
+    "shown above in this conversation.",
+)
+
+
 _INSTRUCTION_TAIL = (
     "Work through this reasoning internally, in order, before you write "
     "your visible answer — but do NOT print it as separate labeled "
-    "stages. Do not use headers like 'Draft', 'Stress-Test', or 'Revised' "
-    "anywhere in your response:\n"
+    "stages. Do not use headers like 'Draft', 'Internal Review', "
+    "'Revision Process', 'Stress-Test', or 'Revised' anywhere in your "
+    "response — there is no such thing as a visible internal-review "
+    "section; every one of the mandatory headers below is the only "
+    "structure this answer has:\n"
     "1. Run the mix under review through these failure modes "
     "specifically, using real numbers already given above (and WebSearch "
     "where noted) rather than generic caveats. Skip a point only if it's "
@@ -482,7 +566,12 @@ _INSTRUCTION_TAIL = (
     "## Recommended Allocation\n"
     "A short closing summary of the final numbers (prose or a simple "
     "markdown table), immediately before the required trailing JSON "
-    "block.\n"
+    "block. The cash % stated here MUST exactly equal the JSON block's "
+    "\"CASH\" value below — if a position is conditional/not-yet-"
+    "triggered (e.g. a buy-on-pullback target not hit yet), it is NOT "
+    "in the JSON and its % must still count as cash in both places; "
+    "don't state a lower cash % in prose than the JSON actually shows "
+    "just because a pending target is discussed elsewhere in the report.\n"
     "## Outlook & Triggers to Revisit\n"
     "Idle-cash deployment triggers (with their required time-based "
     "fallback, checklist item e) and what would change this view going "
@@ -510,11 +599,22 @@ _INSTRUCTION_TAIL = (
     "example values with your actual final numbers, one key per "
     "instrument symbol traded above plus one \"CASH\" key, pct values "
     "summing to 100, no comments or extra text inside the block). Every "
-    "non-CASH key must be an object with three numbers: \"pct\" (the "
+    "non-CASH key must be an object with four numbers: \"pct\" (the "
     "target allocation), \"price\" (a specific limit-order entry price — "
     "it must be realistic and achievable given the instrument's current "
     "bid/ask shown above, not a distant support/resistance level or an "
-    "arbitrary round number), and \"stop_loss\" (a specific stop price). "
+    "arbitrary round number; also weigh missed-fill risk against price "
+    "improvement — a price shaded meaningfully below the current quote "
+    "in the hope of a pullback can mean the position is simply never "
+    "entered if the instrument instead runs, which is a real cost for "
+    "your highest-conviction ideas specifically, not a free option), "
+    "\"stop_loss\" (a specific stop price), and \"take_profit\" (a "
+    "specific target price on the CORRECT side of your entry — above it "
+    "for a long — matching the exact target level your own reward:risk "
+    "reasoning above already derives; this is the field that actually "
+    "gets sent to the broker as the position's real take-profit order, "
+    "not just prose, so it must be the same real number your analysis "
+    "used, not a rounded-off or re-guessed one). "
     "When a real ATR figure is shown for that instrument above, derive "
     "the stop distance from it (e.g. price minus roughly 1.5x ATR for a "
     "long, per Bulkowski's principle above) rather than an assumed flat "
@@ -529,7 +629,7 @@ _INSTRUCTION_TAIL = (
     "distinguished from an oversight, and this pipeline treats an "
     "omitted held instrument as being closed:\n"
     "```json\n"
-    '{"EXAMPLE_SYMBOL": {"pct": 15, "price": 82.50, "stop_loss": 78.00}, "CASH": 25}\n'
+    '{"EXAMPLE_SYMBOL": {"pct": 15, "price": 82.50, "stop_loss": 78.00, "take_profit": 94.00}, "CASH": 25}\n'
     "```"
 )
 
@@ -575,17 +675,29 @@ class AssetAnalysis:
     support_resistance_backtest: SupportResistanceBacktest | None = None
 
 
-def analyze_assets(assets: list[MarketAsset]) -> list[AssetAnalysis]:
+def analyze_assets(
+    assets: list[MarketAsset], on_progress: Callable[[str], None] | None = None
+) -> list[AssetAnalysis]:
     """Resolve, fetch, and compute technical stats for the first assets (up
     to config.MAX_ENRICHED_ASSETS) that map to a Yahoo ticker. Instruments
     without a mapping, or beyond the cap, still get an entry (display_name
     = None) so callers can list them plainly without a network round-trip.
     Contract spec (real order-size/margin constraints) is fetched for
     every asset regardless of Yahoo mapping — it only needs the PMEX
-    symbol via the already-open MT5 connection, no extra network call."""
+    symbol via the already-open MT5 connection, no extra network call.
+
+    `on_progress`, if given, is called once per instrument with a single
+    updating message (not one line per symbol — a caller wires this to
+    an in-place-updating UI element, the same pattern build_audit_block's
+    own on_progress already uses) — this loop can genuinely take a while
+    across a couple dozen instruments (a real network round-trip per
+    enriched one), and previously had no progress visibility at all."""
     results = []
     enriched_count = 0
-    for a in assets:
+    total = len(assets)
+    for i, a in enumerate(assets, start=1):
+        if on_progress is not None:
+            on_progress(f"Analyzing instruments: {i}/{total} — {a.symbol}")
         contract_spec = get_contract_spec(a.symbol)
 
         resolved = None
@@ -1129,6 +1241,7 @@ class AllocationEntry:
     pct: float
     price: float | None = None
     stop_loss: float | None = None
+    take_profit: float | None = None
 
 
 def parse_final_allocation(response_text: str) -> dict[str, AllocationEntry] | None:
@@ -1164,14 +1277,18 @@ def parse_final_allocation(response_text: str) -> dict[str, AllocationEntry] | N
             return None
         price = value.get("price")
         stop_loss = value.get("stop_loss")
+        take_profit = value.get("take_profit")
         if price is not None and not isinstance(price, (int, float)):
             return None
         if stop_loss is not None and not isinstance(stop_loss, (int, float)):
+            return None
+        if take_profit is not None and not isinstance(take_profit, (int, float)):
             return None
         result[key] = AllocationEntry(
             pct=float(value["pct"]),
             price=float(price) if price is not None else None,
             stop_loss=float(stop_loss) if stop_loss is not None else None,
+            take_profit=float(take_profit) if take_profit is not None else None,
         )
     return result
 
@@ -1190,6 +1307,27 @@ def strip_allocation_block(response_text: str) -> str:
     return (response_text[: match.start()] + response_text[match.end() :]).strip()
 
 
+def strip_leading_process_narration(response_text: str) -> str:
+    """A prompt-only defense against a model narrating its internal
+    draft/audit/revision process (e.g. a leading "## Internal Review &
+    Revision Process" section listing "Key audit findings I'm accepting")
+    isn't fully reliable — confirmed live: a real haiku run did this
+    despite the explicit instruction not to. This is a zero-token, purely
+    mechanical backstop: every report from this pipeline is contractually
+    required to open with "## Executive Summary" as its first section, so
+    anything before that exact header is process scaffolding the model
+    wasn't supposed to print, not real report content — strip it rather
+    than trusting prompt wording alone across every model in the picker.
+    A no-op if the response already starts there (idx == 0) or doesn't
+    contain the marker at all (idx == -1, can't safely guess what's
+    leading content in that case)."""
+    marker = "## Executive Summary"
+    idx = response_text.find(marker)
+    if idx <= 0:
+        return response_text
+    return response_text[idx:].strip()
+
+
 AUDIT_INSTRUCTION = (
     "You are an independent audit reviewer in a multi-stage "
     "portfolio-suggestion pipeline. You do NOT have web search or any "
@@ -1199,6 +1337,18 @@ AUDIT_INSTRUCTION = (
     "portfolio mix and reasoning, produced from that same data using live "
     "web research (WebSearch/WebFetch)."
     "\n\n"
+    "The draft ends with an \"External Research Notes\" list — each line "
+    "there is a fact the draft-writer found via a real live web search "
+    "you cannot independently repeat or verify. Not being able to verify "
+    "one of these is NOT the same as it being fabricated or "
+    "unreliable: treat it as a real, reasonably trustworthy input and "
+    "focus your scrutiny on how it was WEIGHTED or APPLIED to a sizing/"
+    "inclusion decision, not on the mere fact that you can't check it "
+    "yourself. Reserve genuine skepticism for numeric claims that appear "
+    "in the draft's prose but nowhere in this Notes list or the "
+    "structured data given below — an unlisted, oddly-precise figure "
+    "(e.g. a specific yield % or growth rate cited without a matching "
+    "Notes entry) is a real gap worth flagging.\n\n"
     "Your job is NOT to produce your own independent competing mix — it "
     "is to critically audit that draft's specific suggestion and "
     "reasoning:\n"
@@ -1313,7 +1463,29 @@ AUDIT_MODELS: list[tuple[str, str, str]] = [
         "nvidia/nemotron-3-super-120b-a12b:free",
         "120B params, general-purpose reasoning",
     ),
-    ("Google Gemma 4 31B", "google/gemma-4-31b-it:free", "31B params, general-purpose reasoning"),
+    # Google Gemma 4 31B occupied this slot originally, but was swapped
+    # out 2026-08-16 after being confirmed persistently unavailable, not
+    # just transiently rate-limited: it failed EVERY real session across
+    # multiple days (user-reported), and a direct live smoke test with a
+    # trivial one-word prompt (not even a real audit-sized one) still
+    # got a 429 from "Google AI Studio" with `limit_source: upstream_
+    # provider_shared_pool` — that shared pool is saturated at a level
+    # this pipeline's existing 10-attempt/600s retry loop can't route
+    # around, so this is a genuine dead slot, not noise. Confirmed the
+    # OTHER Gemma already in this pool (26B A4B, below) does NOT share
+    # this problem — smoke-tested clean — so only this one entry needed
+    # replacing, not "avoid Gemma/Google AI Studio entirely." Re-checked
+    # the live /api/v1/models roster rather than reusing the fallback
+    # candidate named in an earlier round's comment (inclusionai/
+    # ling-3.0-tiny:free) — it had disappeared from the roster entirely
+    # since then, confirming this list really does churn and must be
+    # re-verified live each time, not assumed stable.
+    (
+        "Dots Studio Dots3-Note Preview",
+        "dots-studio/dots-3-note-preview:free",
+        "280B total/16B active MoE, general-purpose reasoning — the lightest model in "
+        "its own family but still comfortably larger than most of this pool",
+    ),
     (
         "Nvidia Nemotron-Nano-Omni-30B-Reasoning",
         "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
@@ -1455,6 +1627,128 @@ def build_past_audit_lessons(
     )
 
 
+def build_past_outcome_lessons(
+    fetch_current_price: Callable[[str], float | None],
+    records_dir: Path | None = None,
+    max_sessions: int = 2,
+    max_symbols_per_session: int = 10,
+) -> str:
+    """Real, computed evidence of how recently-suggested positions have
+    actually performed since — the half of "learning from past mistakes"
+    build_past_audit_lessons doesn't cover. That function carries forward
+    what a past AUDIT criticized about the REASONING (a subjective
+    judgment call); this carries forward what the REAL MARKET actually
+    did afterward (an objective fact) — a genuinely different, more
+    direct way to catch an actual market misunderstanding rather than
+    just a methodology slip an audit happened to notice.
+
+    Pure computation, no LLM call: parses each of the last `max_sessions`
+    saved sessions' own final (Stage 3) allocation JSON via
+    parse_final_allocation, then for every non-CASH symbol with both a
+    suggested price and stop_loss, fetches ONE current price via the
+    caller-supplied `fetch_current_price` (exchange-specific — PSX uses
+    its own symbols directly, PMEX needs Yahoo-ticker resolution first;
+    see each module's own small wrapper) and reports the real % move
+    since the suggestion and whether the stop would already have been
+    breached. Deliberately does NOT claim a limit entry actually filled
+    (PSX's feed has no intraday High/Low to know that for certain) —
+    states the entry/current/stop numbers and lets the reasoning stage
+    draw its own conclusion, the same "compute the real number, let the
+    model reason about what it means" split this project uses everywhere
+    else (backtests, feasibility %, aggregate heat).
+
+    A symbol `fetch_current_price` can't resolve/fetch returns None and
+    is silently skipped, not fabricated — same disclosure convention as
+    everywhere else in this codebase. "" when there's nothing to report
+    (no past sessions, or none of them had a re-priceable symbol)."""
+    records_dir = Path(config.PORTFOLIO_RECORDS_DIR) if records_dir is None else records_dir
+    if not records_dir.exists():
+        return ""
+
+    files = sorted(records_dir.glob("portfolio_suggestion_*.md"), reverse=True)[:max_sessions]
+    if not files:
+        return ""
+
+    sections = []
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        parts = text.split("## Stage 3 — Claude's final revised suggestion\n\n", 1)
+        if len(parts) < 2:
+            continue
+        allocation = parse_final_allocation(parts[1])
+        if not allocation:
+            continue
+
+        lines = []
+        checked = 0
+        for symbol, entry in allocation.items():
+            if symbol == "CASH" or not entry.price or entry.stop_loss is None:
+                continue
+            if checked >= max_symbols_per_session:
+                break
+            checked += 1
+            current = fetch_current_price(symbol)
+            if current is None:
+                continue
+            pct_change = (current - entry.price) / entry.price * 100
+            stop_status = (
+                "STOP WOULD HAVE BEEN HIT" if current <= entry.stop_loss else "stop not hit"
+            )
+            lines.append(
+                f"- {symbol}: suggested entry {entry.price:g}, stop {entry.stop_loss:g} -> "
+                f"current price {current:g} ({pct_change:+.1f}%), {stop_status}"
+            )
+
+        if lines:
+            sections.append(f"--- From a past session ({path.stem}) ---\n" + "\n".join(lines))
+
+    if not sections:
+        return ""
+
+    return (
+        "REAL, computed outcomes of positions suggested in this account's "
+        "most recent past Portfolio Suggestion session(s), re-priced just "
+        "now — use this as genuine evidence for whether that past thesis "
+        "has been validated or contradicted by actual subsequent market "
+        "behavior, not just whether the reasoning sounded sound at the "
+        "time. A position still well above its entry and away from its "
+        "stop is a real confirmation, worth noting briefly; a position "
+        "that has already breached its stop or moved sharply against the "
+        "original thesis is real evidence the underlying market read may "
+        "have been wrong — say so explicitly if the current draft is "
+        "making a similar case for the same symbol or sector again, "
+        "rather than silently repeating an already-contradicted read:\n\n"
+        + "\n\n".join(sections)
+    )
+
+
+def build_past_lessons(
+    fetch_current_price: Callable[[str], float | None],
+    records_dir: Path | None = None,
+) -> str:
+    """Combines both kinds of "learning from past sessions" this pipeline
+    has — build_past_audit_lessons (what a past AUDIT criticized about
+    the reasoning) and build_past_outcome_lessons (what the REAL MARKET
+    actually did to past suggestions since) — into the single block
+    computed ONCE per run and given to stage 1's draft, the resumed
+    stage-2 session (for free, via session continuity — see
+    suggest_portfolio), and every audit model. Each half already carries
+    its own usage guidance inline in its own returned text, so nothing
+    further needs to be said about it in the static instruction prompts
+    — this only ever appears in a run's actual token cost when there's
+    real past-session data to show, unlike a permanent instruction
+    paragraph that would cost tokens on every run regardless."""
+    parts = [
+        build_past_audit_lessons(records_dir=records_dir),
+        build_past_outcome_lessons(fetch_current_price=fetch_current_price, records_dir=records_dir),
+    ]
+    return "\n\n".join(p for p in parts if p)
+
+
 @dataclass
 class AuditResult:
     block: str
@@ -1469,6 +1763,13 @@ class ModelAuditStatus:
     attempt: int
     max_attempts: int
     retry_at: float | None = None  # time.monotonic() timestamp of next retry attempt
+    # The real failure reason, when known (confirmed live: this was
+    # previously discarded everywhere on a "gave_up" — the UI showed a
+    # bare "unavailable, giving up" and Claude's own audit block showed
+    # "not available this time", with the actual cause — a timeout, an
+    # auth failure, a non-zero exit code with real stderr — visible
+    # nowhere, forcing a manual re-run just to find out why).
+    detail: str | None = None
 
 
 def _run_audit_with_retry(
@@ -1553,7 +1854,10 @@ def _format_audit_progress(status_map: dict[str, ModelAuditStatus]) -> str:
             lines.append(f"✓ {label} — audit received")
         elif status.state == "gave_up":
             gave_up += 1
-            lines.append(f"✗ {label} — unavailable after {status.max_attempts} attempts, giving up")
+            reason = f" — {status.detail}" if status.detail else ""
+            lines.append(
+                f"✗ {label} — unavailable after {status.max_attempts} attempts, giving up{reason}"
+            )
         elif status.state == "retrying":
             retrying += 1
             wait_left = max(0, round(status.retry_at - time.monotonic())) if status.retry_at else 0
@@ -1578,12 +1882,122 @@ def _format_audit_progress(status_map: dict[str, ModelAuditStatus]) -> str:
     return "\n".join([summary_line, *(f"- {line}" for line in lines)])
 
 
+_EXTERNAL_NOTES_HEADING = "External Research Notes"
+_NO_EXTERNAL_NOTES_MESSAGE = (
+    f'No "{_EXTERNAL_NOTES_HEADING}" section found in the draft — nothing to '
+    "independently verify this run."
+)
+
+
+def build_copilot_verification(draft: str, timeout: int | None = None) -> str:
+    """One independent live-web fact-check of the draft's own "External
+    Research Notes" list, via GitHub Copilot CLI — the only reviewer in
+    this pipeline with real internet access (the 10 OpenRouter audit
+    models have none, and can only judge a claim's internal consistency,
+    never confirm or deny it against the real world).
+
+    Deliberately scoped to a bounded, already-extracted list of claims
+    rather than open-ended research: a live smoke test confirmed Copilot
+    CLI has no dedicated search-engine tool (only web_fetch/curl), so
+    open-ended "go find relevant news" is slow, trial-and-error fetching
+    against guessed URLs — a bounded "check these specific claims" task is
+    the mode that actually worked reliably in that same test.
+
+    A free, zero-token, zero-subprocess guard: if the draft has no
+    External Research Notes section at all, there's nothing to check —
+    skip spawning Copilot entirely rather than paying for a call that
+    would just report that back.
+
+    Also deliberately sends Copilot ONLY that Notes section, not the
+    entire draft: its actual job is bounded to those specific listed
+    claims (stage 1 is instructed to put this section LAST, so slicing
+    from its first occurrence to the end of the draft captures exactly
+    that), and the surrounding investment-thesis prose is both unrelated
+    to what it needs to check and meaningfully larger — cheaper for
+    Copilot's own request budget, and a tighter task with less to get
+    distracted by, not just a smaller prompt for its own sake."""
+    if _EXTERNAL_NOTES_HEADING not in draft:
+        return _NO_EXTERNAL_NOTES_MESSAGE
+    notes_section = draft[draft.index(_EXTERNAL_NOTES_HEADING) :]
+    timeout = config.COPILOT_VERIFICATION_TIMEOUT_SECONDS if timeout is None else timeout
+    prompt = (
+        "You are an independent fact-checker for a portfolio-suggestion "
+        "pipeline. Below is an \"External Research Notes\" list — specific "
+        "claims (each with a claimed source) that another AI's draft "
+        "relies on. You have real, live web access — USE IT via your "
+        "web_fetch/curl tools: for each claim listed, try to independently "
+        "find and fetch corroborating or contradicting evidence, then "
+        "report, per claim: SUPPORTED (you found matching evidence), "
+        "CONTRADICTED (you found evidence against it), or COULDN'T VERIFY "
+        "(no clear evidence within reasonable effort) — with a one-line "
+        "reason and the URL you checked.\n\n"
+        f"{notes_section}"
+    )
+    return run_copilot(prompt, timeout=timeout)
+
+
+# The label Copilot's own live progress is tracked/rendered under in
+# status_map — deliberately short (unlike copilot_label below, the long
+# descriptive one used in the final audit_sections text for Claude),
+# since this one appears in the live per-model UI ticker alongside the
+# 10 OpenRouter models' own short labels.
+_COPILOT_STATUS_LABEL = "Copilot CLI"
+
+
+def _run_copilot_with_status(draft: str, status_map: dict[str, ModelAuditStatus] | None = None) -> str:
+    """Wraps build_copilot_verification with the same live status_map
+    tracking _run_audit_with_retry gives the 10 OpenRouter models —
+    without this, Copilot's real progress was invisible to on_progress
+    (confirmed: it never appeared in the live UI ticker at all), and
+    since build_audit_block's polling loop only watched the OpenRouter
+    futures, a slow Copilot call left the whole audit phase looking
+    frozen at its last OpenRouter-only render while Copilot kept running
+    silently underneath it — a real, confirmed cause of "the page looks
+    stuck." Copilot has no retry loop (see build_copilot_verification's
+    own docstring), so this only ever has one real state transition:
+    waiting -> in_progress -> succeeded/gave_up."""
+    if status_map is not None:
+        status_map[_COPILOT_STATUS_LABEL] = ModelAuditStatus(state="in_progress", attempt=1, max_attempts=1)
+
+    result = build_copilot_verification(draft)
+
+    if status_map is not None:
+        failed = result == COPILOT_MISSING_MESSAGE or result.startswith(COPILOT_FAILED_PREFIX)
+        status_map[_COPILOT_STATUS_LABEL] = ModelAuditStatus(
+            state="gave_up" if failed else "succeeded",
+            attempt=1,
+            max_attempts=1,
+            detail=result if failed else None,
+        )
+    return result
+
+
+def _fetch_current_pmex_price(symbol: str) -> float | None:
+    """The PMEX-specific `fetch_current_price` callable for
+    build_past_outcome_lessons — a past suggestion's saved allocation only
+    has the raw PMEX symbol (e.g. "GO10OZ"), not a resolved Yahoo ticker,
+    so this re-resolves it the same way analyze_assets does. Deliberately
+    fetches only "5d" of history (not the 5y default used for backtests)
+    since only the latest close is actually needed here — a much smaller,
+    faster request for a task that doesn't need years of context. None if
+    the symbol can't be resolved or the fetch comes back empty — silently
+    skipped by the caller, not fabricated."""
+    resolved = resolve_yahoo_ticker(symbol)
+    if resolved is None:
+        return None
+    _, yahoo_ticker = resolved
+    history = fetch_price_history_ohlcv(yahoo_ticker, period="5d")
+    if history.empty:
+        return None
+    return float(history["Close"].iloc[-1])
+
+
 def build_audit_block(
     summary: str,
     draft: str,
     on_progress: Callable[[str], None] | None = None,
     audit_instruction: str = AUDIT_INSTRUCTION,
-    records_dir: Path | None = None,
+    past_lessons: str = "",
 ) -> AuditResult:
     """Runs every model in AUDIT_MODELS in parallel against Claude's own
     stage-1 draft, retrying each one individually (see
@@ -1593,12 +2007,16 @@ def build_audit_block(
     *any* model responds, so the pool tolerates several being down at once
     (see AUDIT_MODELS for why it's spread across multiple providers).
 
-    `audit_instruction` and `records_dir` let a different market's
-    suggestion pipeline (see ai/psx_suggest.py) reuse this exact retry/
-    pooling/progress machinery with its own failure-mode checklist and its
-    own past-session lessons, without duplicating any of the threading
-    logic below — defaults preserve the original PMEX-futures behavior
-    exactly for every existing caller.
+    `audit_instruction` lets a different market's suggestion pipeline (see
+    ai/psx_suggest.py) reuse this exact retry/pooling/progress machinery
+    with its own failure-mode checklist, without duplicating any of the
+    threading logic below — the default preserves the original PMEX-
+    futures behavior exactly for every existing caller. `past_lessons` is
+    computed ONCE by the caller (build_past_lessons) before stage 1 even
+    runs — not recomputed here — specifically so stage 1's draft prompt,
+    the resumed stage-2 session, and this audit pool all reason over the
+    exact same past-session evidence without paying for the real price-
+    fetching it involves more than once per run.
 
     `on_progress`, if given, is called from THIS function's own thread
     (not from the worker threads themselves — Streamlit commands aren't
@@ -1610,15 +2028,17 @@ def build_audit_block(
         label: ModelAuditStatus(state="waiting", attempt=0, max_attempts=0)
         for label, _, _ in AUDIT_MODELS
     }
+    # Copilot gets its own entry too — see _run_copilot_with_status's own
+    # docstring for why this matters: without it, a slow Copilot call was
+    # invisible to on_progress and could leave the UI looking frozen
+    # after every OpenRouter model had already finished.
+    status_map[_COPILOT_STATUS_LABEL] = ModelAuditStatus(state="waiting", attempt=0, max_attempts=1)
     # Looked up when composing audit_sections below, so each model's audit
     # text can be shown to Claude alongside its own capability/
     # specialization profile — see AUDIT_MODELS' own comment for why.
     profile_by_label = {label: profile for label, _, profile in AUDIT_MODELS}
-    # Computed once here, not per-model — it's the same file-read result
-    # for every model in the pool, so no reason to redo the I/O 10 times.
-    past_lessons = build_past_audit_lessons(records_dir=records_dir)
 
-    with ThreadPoolExecutor(max_workers=len(AUDIT_MODELS)) as pool:
+    with ThreadPoolExecutor(max_workers=len(AUDIT_MODELS) + 1) as pool:
         # Submitted as individual futures (not list(pool.map(...))) so one
         # audit's exception can't abort iteration before a sibling's
         # already-completed result is collected.
@@ -1635,9 +2055,17 @@ def build_audit_block(
             )
             for label, model, _ in AUDIT_MODELS
         ]
+        # Runs alongside the OpenRouter pool, not after it, so it doesn't
+        # add net wall-clock time to every run — no retry loop (see
+        # build_copilot_verification's own docstring for why that's a
+        # deliberate simplification, not an oversight), but its live
+        # status IS now tracked (_run_copilot_with_status) and included
+        # in the loop's own completion check below, so it can't finish
+        # invisibly after every OpenRouter model already has.
+        copilot_future = pool.submit(_run_copilot_with_status, draft, status_map)
 
         last_rendered = None
-        while not all(f.done() for f in futures):
+        while not (all(f.done() for f in futures) and copilot_future.done()):
             if on_progress is not None:
                 text = _format_audit_progress(status_map)
                 if text != last_rendered:
@@ -1648,6 +2076,7 @@ def build_audit_block(
             on_progress(_format_audit_progress(status_map))
 
         audit_results = [f.result() for f in futures]
+        copilot_result = copilot_future.result()
 
     audit_sections = []
     audit_available = False
@@ -1658,6 +2087,23 @@ def build_audit_block(
         else:
             audit_sections.append(f"{label} ({profile}) audit:\n{text}")
             audit_available = True
+
+    copilot_label = "GitHub Copilot CLI (live web access — the only reviewer that can independently verify a claim, not just judge its internal consistency)"
+    if copilot_result == COPILOT_MISSING_MESSAGE or copilot_result.startswith(COPILOT_FAILED_PREFIX):
+        # The real reason (a timeout, an auth failure, a non-zero exit
+        # code with its actual stderr) travels with the failure, not
+        # just a generic "not available" — this is what gets saved into
+        # the session record, the only place a real cause survives past
+        # the live UI ticker's own lifetime.
+        audit_sections.append(f"{copilot_label} audit: not available this time ({copilot_result}).")
+    elif copilot_result == _NO_EXTERNAL_NOTES_MESSAGE:
+        # Nothing was actually verified — show the note but don't count it
+        # as a contributing audit voice (audit_available stays whatever the
+        # 10 OpenRouter models already decided).
+        audit_sections.append(f"{copilot_label} audit: {copilot_result}")
+    else:
+        audit_sections.append(f"{copilot_label} audit:\n{copilot_result}")
+        audit_available = True
 
     return AuditResult(block="\n\n".join(audit_sections), audit_available=audit_available)
 
@@ -1683,39 +2129,97 @@ def suggest_portfolio(
         if on_stage:
             on_stage(message)
 
+    # A caller-generated session ID lets stage 2 RESUME stage 1's own
+    # conversation (see below) instead of paying to resend _INSTRUCTION_
+    # HEAD, the whole `summary` market/macro dump, and the stage-1 draft
+    # a second time — none of that changed between the two calls, and
+    # live-verified `claude -p --resume` correctly retains it (including
+    # specific WebSearch-found figures) without needing it repeated.
+    session_id = str(uuid.uuid4())
+    # Computed ONCE, before stage 1 even runs, so both what a past AUDIT
+    # criticized and what the REAL MARKET actually did to past
+    # suggestions since reach stage 1's draft, the resumed stage-2
+    # session (for free, via session continuity), and every audit model
+    # — without re-reading past session files or re-fetching real prices
+    # a second time for the audit stage's own benefit.
+    _notify(
+        "Building past-session context (real market outcomes and audit "
+        "lessons from previous runs)..."
+    )
+    past_lessons = build_past_lessons(fetch_current_price=_fetch_current_pmex_price)
     _notify("Claude is researching the market and drafting an initial suggestion (live web search)...")
     draft_prompt = f"{build_stage1_instruction()}\n\n{summary}"
+    if past_lessons:
+        draft_prompt += f"\n\n{past_lessons}"
     draft = run_claude(
         draft_prompt,
         timeout=timeout,
         allowed_tools=["WebSearch", "WebFetch"],
         model=model,
+        session_id=session_id,
     )
     if draft == CLI_MISSING_MESSAGE or draft.startswith(CLI_FAILED_PREFIX):
         # Nothing meaningful to record — the draft itself never happened.
         return draft
 
     _notify(f"Sending the draft to {len(AUDIT_MODELS)} independent free models for audit...")
-    audit = build_audit_block(summary, draft, on_progress=on_audit_progress)
+    audit = build_audit_block(summary, draft, on_progress=on_audit_progress, past_lessons=past_lessons)
     _notify(
         "Audit received — Claude is revising its suggestion..."
         if audit.audit_available
         else "Independent audit wasn't available this run — Claude is re-checking its own draft instead..."
     )
 
-    revise_prompt = (
-        f"{build_stage2_instruction(audit.audit_available)}\n\n{summary}\n\n"
-        f"Your own draft from the first pass:\n{draft}\n\n"
-        f"Independent audit reports on that draft:\n{audit.block}"
+    role_continued = (
+        _ROLE_STAGE2_SYNTHESIZE_CONTINUED if audit.audit_available else _ROLE_STAGE2_SELF_REVIEW_CONTINUED
+    )
+    lean_revise_prompt = (
+        f"{role_continued}\n\n{_INSTRUCTION_TAIL}\n\n"
+        f"Independent audit reports on your draft above:\n{audit.block}"
     )
     final_answer = run_claude(
-        revise_prompt,
+        lean_revise_prompt,
         timeout=revision_timeout,
         allowed_tools=["WebSearch", "WebFetch"],
         model=model,
+        resume_session_id=session_id,
     )
 
+    # Never let an infrastructure hiccup in the lean path (session
+    # expired/evicted between calls, a CLI version without --resume
+    # support, etc.) degrade the actual answer — fall back to today's
+    # fully self-contained prompt, which needs no session at all, so the
+    # worst case is exactly the pre-existing behavior, not a worse one.
+    if final_answer == CLI_MISSING_MESSAGE or final_answer.startswith(CLI_FAILED_PREFIX):
+        logger.warning(
+            "suggest_portfolio: resumed stage-2 call failed (%s), falling back to a full-context retry",
+            final_answer[:200],
+        )
+        _notify(
+            "The quick revision attempt didn't respond — retrying with a "
+            "fresh, fully self-contained request (takes a bit longer, but "
+            "doesn't rely on the earlier session still being live)..."
+        )
+        revise_prompt = (
+            f"{build_stage2_instruction(audit.audit_available)}\n\n{summary}\n\n"
+            f"Your own draft from the first pass:\n{draft}\n\n"
+            f"Independent audit reports on that draft:\n{audit.block}"
+        )
+        if past_lessons:
+            # The resumed session (where past_lessons originally arrived,
+            # inside stage 1's prompt) is exactly what just failed — this
+            # brand-new, non-resumed fallback call has no memory of it at
+            # all unless it's included here explicitly.
+            revise_prompt += f"\n\n{past_lessons}"
+        final_answer = run_claude(
+            revise_prompt,
+            timeout=revision_timeout,
+            allowed_tools=["WebSearch", "WebFetch"],
+            model=model,
+        )
+
     if save_record:
+        _notify("Saving session record for future reference...")
         save_portfolio_session(
             SessionRecord(
                 summary=summary,

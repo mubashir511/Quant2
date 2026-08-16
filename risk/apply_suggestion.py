@@ -14,6 +14,7 @@ class PlannedOrder:
     order_type: str  # "limit" | "market" | "none"
     price: float | None
     stop_loss: float | None
+    take_profit: float | None = None
     tickets_to_close: list[tuple[int, float]] = field(default_factory=list)
     reason: str = ""
 
@@ -49,9 +50,10 @@ def compute_rebalance_plan(
     as the safety-net default in case that instruction is ever missed.
 
     Any proposed limit-entry price is clamped to within
-    `price_sanity_band_pct` of the live ask, and a stop-loss on the wrong
-    side of the entry price is dropped rather than sent to the broker —
-    both noted in `reason`, never silently substituted without a trace.
+    `price_sanity_band_pct` of the live ask, and a stop-loss OR take-
+    profit on the wrong side of the (possibly-clamped) entry price is
+    dropped rather than sent to the broker — both noted in `reason`,
+    never silently substituted without a trace.
     """
     plans: list[PlannedOrder] = []
 
@@ -162,11 +164,17 @@ def compute_rebalance_plan(
                 stop_loss = None
                 note += " (suggested stop was on the wrong side of entry, dropped)"
 
+            take_profit = entry.take_profit if entry is not None else None
+            if take_profit is not None and take_profit <= clamped_price:
+                take_profit = None
+                note += " (suggested take-profit was on the wrong side of entry, dropped)"
+
             action = "open" if current_lots == 0 else "increase"
             plans.append(
                 PlannedOrder(
                     symbol=symbol, action=action, side="buy", volume=delta,
                     order_type="limit", price=clamped_price, stop_loss=stop_loss,
+                    take_profit=take_profit,
                     reason=f"Target {pct:.1f}% of equity.{note}",
                 )
             )

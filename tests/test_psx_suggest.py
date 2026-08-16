@@ -10,6 +10,7 @@ from ai.portfolio_suggest import AllocationEntry, AuditResult
 from ai.psx_suggest import (
     EPSGrowthTrend,
     PSXAssetAnalysis,
+    _fetch_current_psx_price,
     analyze_psx_assets,
     build_psx_macro_context,
     build_psx_summary,
@@ -35,6 +36,17 @@ from data.psx_source import (
     PSXFinancials,
     PSXFundamentals,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_past_lessons():
+    """Same rationale as ai/portfolio_suggest.py's own copy of this
+    fixture: build_past_lessons does real file I/O against this actual
+    project's real records/psx/ directory and real network calls to
+    re-price past symbols — patch it to inert by default so every
+    suggest_psx_portfolio()-calling test stays fast and network-free."""
+    with patch("ai.psx_suggest.build_past_lessons", return_value=""):
+        yield
 
 
 def _make_fundamentals(**overrides):
@@ -121,6 +133,22 @@ def test_analyze_psx_assets_only_considers_kse100_members(mock_history, mock_com
     ]
     analyses = analyze_psx_assets(assets)
     assert [a.symbol for a in analyses] == ["KSEONE"]
+
+
+@patch("ai.psx_suggest.get_psx_company_data")
+@patch("ai.psx_suggest.get_psx_history")
+def test_analyze_psx_assets_reports_per_symbol_progress(mock_history, mock_company_data):
+    mock_history.return_value = _make_history()
+    mock_company_data.return_value = _make_company_data()
+    assets = [
+        _make_asset("A", listed_in=("KSE100",)),
+        _make_asset("B", listed_in=("KSE100",)),
+    ]
+    calls = []
+    analyze_psx_assets(assets, on_progress=calls.append)
+    assert len(calls) == 2
+    assert "1/2" in calls[0]
+    assert "2/2" in calls[1]
 
 
 @patch("ai.psx_suggest.get_psx_company_data")
@@ -712,7 +740,92 @@ def test_suggest_psx_portfolio_runs_draft_audit_revise(mock_run_claude, mock_aud
     assert mock_run_claude.call_count == 2
     mock_audit.assert_called_once()
     _, kwargs = mock_audit.call_args
-    assert kwargs["records_dir"] == Path(config.PSX_RECORDS_DIR)
+    assert "past_lessons" in kwargs
+    assert "records_dir" not in kwargs  # build_audit_block no longer takes this param
+
+
+@patch("ai.psx_suggest.get_psx_history")
+def test_fetch_current_psx_price_returns_latest_close(mock_history):
+    history = _make_history(n=5)
+    mock_history.return_value = history
+    assert _fetch_current_psx_price("ABC") == history["Close"].iloc[-1]
+
+
+@patch("ai.psx_suggest.get_psx_history")
+def test_fetch_current_psx_price_none_on_empty_history(mock_history):
+    mock_history.return_value = pd.DataFrame()
+    assert _fetch_current_psx_price("ABC") is None
+
+
+@patch("ai.psx_suggest.build_past_lessons", return_value="PAST LESSONS TEXT")
+@patch("ai.psx_suggest.build_audit_block", return_value=AuditResult(block="", audit_available=False))
+@patch("ai.psx_suggest.run_claude")
+def test_suggest_psx_portfolio_includes_past_lessons_in_stage1_draft_prompt(
+    mock_run_claude, mock_audit, mock_lessons
+):
+    mock_run_claude.side_effect = ["draft", "final"]
+    suggest_psx_portfolio("some psx summary")
+    draft_prompt = mock_run_claude.call_args_list[0].args[0]
+    assert "PAST LESSONS TEXT" in draft_prompt
+
+
+@patch("ai.psx_suggest.build_past_lessons", return_value="PAST LESSONS TEXT")
+@patch("ai.psx_suggest.build_audit_block")
+@patch("ai.psx_suggest.run_claude")
+def test_suggest_psx_portfolio_passes_past_lessons_into_build_audit_block(mock_run_claude, mock_audit, mock_lessons):
+    mock_run_claude.side_effect = ["draft", "final"]
+    mock_audit.return_value = AuditResult(block="", audit_available=False)
+    suggest_psx_portfolio("some psx summary")
+    _, kwargs = mock_audit.call_args
+    assert kwargs["past_lessons"] == "PAST LESSONS TEXT"
+
+
+@patch("ai.psx_suggest.build_audit_block", return_value=AuditResult(block="", audit_available=False))
+@patch("ai.psx_suggest.run_claude")
+def test_suggest_psx_portfolio_resumes_stage1_session_for_a_lean_stage2_call(mock_run_claude, mock_audit):
+    # Mirrors ai/portfolio_suggest.py's own version of this test — same
+    # session-continuation mechanism, same rationale (see that file's
+    # test for the full comment).
+    mock_run_claude.side_effect = ["draft", "final"]
+    suggest_psx_portfolio("some psx summary")
+    draft_call, final_call = mock_run_claude.call_args_list
+    session_id = draft_call.kwargs.get("session_id")
+    assert session_id
+    assert final_call.kwargs.get("resume_session_id") == session_id
+    final_prompt = final_call.args[0]
+    assert "some psx summary" not in final_prompt
+
+
+@patch("ai.psx_suggest.build_audit_block", return_value=AuditResult(block="", audit_available=False))
+@patch("ai.psx_suggest.run_claude")
+def test_suggest_psx_portfolio_falls_back_to_full_context_when_resume_fails(mock_run_claude, mock_audit):
+    fallback_failure = f"{CLI_FAILED_PREFIX} (no conversation found)."
+    mock_run_claude.side_effect = ["draft text", fallback_failure, "final answer after retry"]
+    messages = []
+    result = suggest_psx_portfolio("some psx summary", on_stage=messages.append)
+    assert result == "final answer after retry"
+    assert mock_run_claude.call_count == 3
+    retry_call = mock_run_claude.call_args_list[2]
+    assert "resume_session_id" not in retry_call.kwargs
+    retry_prompt = retry_call.args[0]
+    assert "some psx summary" in retry_prompt
+    assert "draft text" in retry_prompt
+    assert any("retrying with a" in m.lower() for m in messages)
+
+
+@patch("ai.psx_suggest.save_portfolio_session")
+@patch("ai.psx_suggest.build_audit_block")
+@patch("ai.psx_suggest.run_claude")
+def test_suggest_psx_portfolio_on_stage_message_sequence_is_detailed(mock_run_claude, mock_audit, mock_save):
+    mock_run_claude.side_effect = ["draft", "final"]
+    mock_audit.return_value = AuditResult(block="", audit_available=True)
+    messages = []
+    suggest_psx_portfolio("summary", on_stage=messages.append, save_record=True)
+    assert any("past-session context" in m.lower() for m in messages)
+    assert any("drafting" in m.lower() for m in messages)
+    assert any("audit" in m.lower() for m in messages)
+    assert any("revising" in m.lower() for m in messages)
+    assert any("saving session record" in m.lower() for m in messages)
 
 
 @patch("ai.psx_suggest.build_audit_block")

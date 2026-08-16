@@ -12,7 +12,12 @@ class OrderResult:
 
 
 def open_position(
-    symbol: str, side: str, volume: float, price: float, stop_loss: float | None = None
+    symbol: str,
+    side: str,
+    volume: float,
+    price: float,
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
 ) -> OrderResult:
     """Places a pending LIMIT order to open/increase exposure — never a
     market order for entries, so an unclamped or stale price never fills
@@ -36,6 +41,8 @@ def open_position(
     }
     if stop_loss is not None:
         request["sl"] = stop_loss
+    if take_profit is not None:
+        request["tp"] = take_profit
 
     result = mt5.order_send(request)
     if result is None:

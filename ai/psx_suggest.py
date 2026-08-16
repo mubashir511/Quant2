@@ -1,3 +1,5 @@
+import logging
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -6,7 +8,7 @@ import pandas as pd
 
 import config
 from ai.claude_cli import CLI_FAILED_PREFIX, CLI_MISSING_MESSAGE, run_claude
-from ai.portfolio_suggest import AUDIT_MODELS, AllocationEntry, build_audit_block
+from ai.portfolio_suggest import AUDIT_MODELS, AllocationEntry, build_audit_block, build_past_lessons
 from ai.session_record import SessionRecord, save_portfolio_session
 from analysis.backtest import (
     BetaStabilityBacktest,
@@ -35,6 +37,8 @@ from data.psx_source import (
     get_psx_history,
     get_sector_name,
 )
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_INDEX = "KSE100"
 
@@ -280,7 +284,17 @@ _INSTRUCTION_HEAD = (
     "looks fine in isolation; fundamental context "
     "(P/E ratio, market "
     "capitalization, shares outstanding, free-float %) where available; "
-    "PSX's own published circuit-breaker band and 52-week range PLUS "
+    "PSX's own published circuit-breaker band — a DAILY limit only: it "
+    "resets every session around that day's own previous close, so it "
+    "is NOT a multi-day or multi-week price ceiling. A multi-week price "
+    "target sitting outside today's circuit-breaker band is completely "
+    "normal and not a constraint on that target at all — the stock "
+    "simply needs more than one session to get there. Never describe a "
+    "target as 'within' or 'against' the circuit-breaker band, or size a "
+    "target down to fit inside it; the band is only ever relevant to "
+    "near-term execution timing (e.g. whether a stop placed close to "
+    "today's boundary might not fill the specific day it's triggered) — "
+    "and 52-week range PLUS "
     "where the current price sits within that 52-week range as a % (0 = "
     "at the 52-week low, 100 = at the 52-week high — a longer-horizon "
     "complement to the ~3-month support/resistance range, since a stock "
@@ -386,6 +400,20 @@ _INSTRUCTION_HEAD = (
     "use that reasoning to inform your suggested mix, sizing, and cash "
     "reserve. You may reason your way to a different conclusion than a "
     "principle would suggest, but say so and explain why."
+    "\n\n"
+    "On the reward:risk principles specifically (2:1 Bulkowski/"
+    "Rockefeller, 3:1 Murphy): the ratio must be an HONEST OUTPUT of a "
+    "genuinely-derived entry, stop, and target — never work backward "
+    "from the ratio to pick a target. Derive the stop from real "
+    "volatility/support first, derive the target from a real technical "
+    "level (actual resistance, a real prior high) or a real fundamental "
+    "projection — then report whatever ratio actually results, even if "
+    "it's below 2:1. A stock that genuinely doesn't offer 2:1 right now "
+    "is real information (size it smaller, treat it as lower-conviction, "
+    "or leave it out) — stretching its target to an optimistic level "
+    "just to clear the ratio manufactures a number instead of reporting "
+    "one, and is a worse outcome than honestly saying the ratio falls "
+    "short."
 )
 
 
@@ -413,6 +441,18 @@ _STAGE1_DRAFT_INSTRUCTION = (
     "their feedback before your final answer goes to the user — so be "
     "thorough and explicit about your reasoning now, not just your "
     "conclusion."
+    "\n\n"
+    "End this draft with a compact \"External Research Notes\" list: one "
+    "short bullet per genuinely WebSearch/WebFetch-sourced fact you're "
+    "relying on (the claim plus its source, e.g. \"SBP held the policy "
+    "rate at 11% per the Aug 2026 MPC statement — Business Recorder\"), "
+    "not a repeat of your prose. The audit models below have no web "
+    "access of their own and can't tell a real researched fact from an "
+    "invented one just by reading your prose — this list is what lets "
+    "them see exactly which claims are genuine live research (to weigh "
+    "and reason over) versus unstated assumptions (to actually flag). "
+    "Keep it to the facts that materially influenced a sizing/inclusion "
+    "decision, not every search result you looked at."
 )
 
 
@@ -455,10 +495,19 @@ _ROLE_STAGE2_SYNTHESIZE = (
     "WebSearch) rather than by which model said it; use the scale/"
     "specialization label mainly to decide how much extra scrutiny an "
     "open-ended judgment call from a smaller/specialized model deserves "
-    "before you accept it. This weighing is internal analysis, same as "
-    "the rest of this paragraph — don't narrate it in the visible "
-    "answer either (no 'the larger model said X, the smaller one said "
-    "Y', no naming which specific model's critique swayed a decision)."
+    "before you accept it. One audit is a different kind of source "
+    "entirely: the GitHub Copilot CLI review, if present, has real live "
+    "web access and was asked to independently verify your own draft's "
+    "External Research Notes claims — treat what it reports as SUPPORTED "
+    "or CONTRADICTED with real authority (it's the only reviewer that can "
+    "actually confirm or deny a fact, not just judge whether your "
+    "reasoning about it sounds internally consistent), and if it flags a "
+    "claim as CONTRADICTED, correct or drop that claim rather than "
+    "weighing it against the OpenRouter models' opinions. This weighing "
+    "is internal analysis, same as the rest of this paragraph — don't "
+    "narrate it in the visible answer either (no 'the larger model said "
+    "X, the smaller one said Y', no naming which specific model's "
+    "critique swayed a decision)."
 )
 
 
@@ -483,10 +532,42 @@ _ROLE_STAGE2_SELF_REVIEW = (
 )
 
 
+# Session-continuation variants — see ai/portfolio_suggest.py's own copy
+# of this comment for the full rationale (identical here): used when
+# stage 2 resumes stage 1's own `claude -p --session-id` conversation
+# instead of a fresh, fully self-contained call, so _INSTRUCTION_HEAD,
+# `summary`, and the stage-1 draft (all unchanged since stage 1, already
+# in the model's own conversation history) don't need to be resent.
+# Derived via .replace(), not hand-duplicated, so they can't silently
+# drift from the originals above.
+_ROLE_STAGE2_SYNTHESIZE_CONTINUED = _ROLE_STAGE2_SYNTHESIZE.replace(
+    "Below is your own draft suggestion and reasoning from the first "
+    "pass, plus independent audit reports from other models that "
+    "reviewed your specific draft for flaws, gaps, and disagreements.",
+    "Your own draft suggestion and reasoning from the first pass is "
+    "already above in this conversation — no need to repeat it. Below "
+    "are independent audit reports from other models that reviewed your "
+    "specific draft for flaws, gaps, and disagreements.",
+)
+
+_ROLE_STAGE2_SELF_REVIEW_CONTINUED = _ROLE_STAGE2_SELF_REVIEW.replace(
+    "Below is your own draft suggestion and reasoning from the first "
+    "pass. The independent audit that normally reviews it was not "
+    "available this run",
+    "Your own draft suggestion and reasoning from the first pass is "
+    "already above in this conversation. The independent audit that "
+    "normally reviews it was not available this run",
+)
+
+
 _INSTRUCTION_TAIL = (
     "Work through this reasoning internally, in order, before you write "
     "your visible answer — but do NOT print it as separate labeled "
-    "stages:\n"
+    "stages. Do not use headers like 'Draft', 'Internal Review', "
+    "'Revision Process', 'Stress-Test', or 'Revised' anywhere in your "
+    "response — there is no such thing as a visible internal-review "
+    "section; every one of the mandatory headers below is the only "
+    "structure this answer has:\n"
     "1. Run the mix under review through these failure modes "
     "specifically, using real numbers already given above (and WebSearch "
     "where noted):\n"
@@ -506,11 +587,22 @@ _INSTRUCTION_TAIL = (
     "   b. Liquidity/free-float risk — a low free-float % or thin volume "
     "relative to the position size means the position may be hard to "
     "exit at the quoted price; flag any holding where this applies and "
-    "size it more conservatively.\n"
+    "size it more conservatively. Also say so explicitly in that "
+    "holding's own thesis section: the entry/stop prices given are clean "
+    "theoretical levels, and on a genuinely thin/low-free-float name, "
+    "real fills can slip meaningfully away from them — note that a "
+    "limit order (not a market order) and some tolerance for a worse-"
+    "than-planned fill are appropriate for that specific holding, rather "
+    "than presenting the stated prices as if they're guaranteed.\n"
     "   c. Circuit-breaker awareness — the shown circuit-breaker band "
-    "limits how far a symbol can move in a single session; factor this "
-    "into any stop-loss placed near that boundary (a stop just outside "
-    "the band may not fill the day it's triggered).\n"
+    "limits how far a symbol can move in a SINGLE SESSION only (it "
+    "resets daily); factor this into any stop-loss placed near that "
+    "boundary (a stop just outside the band may not fill the day it's "
+    "triggered) — but never into a multi-day/week price TARGET. If a "
+    "target sits outside today's band, that is not a squeeze, a "
+    "constraint, or a reason to resize the target down — it just means "
+    "the move plays out over more than one session, which is normal for "
+    "a fundamentals/macro-driven multi-week thesis.\n"
     "   d. Currency/political risk — construct one adverse scenario "
     "(e.g. a PKR devaluation, a delayed IMF tranche, political "
     "instability) and assess which holdings would be hit hardest and "
@@ -607,7 +699,12 @@ _INSTRUCTION_TAIL = (
     "## Recommended Allocation\n"
     "A short closing summary of the final numbers (prose or a simple "
     "markdown table), immediately before the required trailing JSON "
-    "block.\n"
+    "block. The cash % stated here MUST exactly equal the JSON block's "
+    "\"CASH\" value below — if a position is conditional/not-yet-"
+    "triggered (e.g. a buy-on-pullback target not hit yet), it is NOT "
+    "in the JSON and its % must still count as cash in both places; "
+    "don't state a lower cash % in prose than the JSON actually shows "
+    "just because a pending target is discussed elsewhere in the report.\n"
     "## Outlook & Triggers to Revisit\n"
     "Idle-cash deployment triggers (with their required time-based "
     "fallback) and what would change this view going forward.\n"
@@ -632,13 +729,20 @@ _INSTRUCTION_TAIL = (
     "example values with your actual final numbers, one key per symbol "
     "plus one \"CASH\" key, pct values summing to 100, no comments or "
     "extra text inside the block). Every non-CASH key must be an object "
-    "with three numbers: \"pct\" (the target allocation), \"price\" (a "
+    "with four numbers: \"pct\" (the target allocation), \"price\" (a "
     "specific, realistic entry price given the symbol's current price "
-    "shown above), and \"stop_loss\" (a specific stop price, derived "
-    "from volatility or support/resistance as instructed above since "
-    "ATR isn't available here):\n"
+    "shown above — weigh missed-fill risk against price improvement: a "
+    "price shaded meaningfully below the current quote in the hope of a "
+    "pullback can mean the position is simply never entered if the stock "
+    "instead runs, which is a real cost for your highest-conviction "
+    "ideas specifically, not a free option), \"stop_loss\" (a "
+    "specific stop price, derived from volatility or support/resistance "
+    "as instructed above since ATR isn't available here), and "
+    "\"take_profit\" (a specific target price on the correct side of "
+    "your entry — above it for a long — matching the exact target level "
+    "your own reward:risk reasoning above already derives):\n"
     "```json\n"
-    '{"EXAMPLE_SYMBOL": {"pct": 15, "price": 82.50, "stop_loss": 74.00}, "CASH": 25}\n'
+    '{"EXAMPLE_SYMBOL": {"pct": 15, "price": 82.50, "stop_loss": 74.00, "take_profit": 96.00}, "CASH": 25}\n'
     "```"
 )
 
@@ -652,6 +756,18 @@ AUDIT_INSTRUCTION = (
     "own first-pass suggested mix and reasoning, produced from that same "
     "data using live web research."
     "\n\n"
+    "The draft ends with an \"External Research Notes\" list — each line "
+    "there is a fact the draft-writer found via a real live web search "
+    "you cannot independently repeat or verify. Not being able to verify "
+    "one of these is NOT the same as it being fabricated or "
+    "unreliable: treat it as a real, reasonably trustworthy input and "
+    "focus your scrutiny on how it was WEIGHTED or APPLIED to a sizing/"
+    "inclusion decision, not on the mere fact that you can't check it "
+    "yourself. Reserve genuine skepticism for numeric claims that appear "
+    "in the draft's prose but nowhere in this Notes list or the "
+    "structured data given below — an unlisted, oddly-precise figure "
+    "(e.g. a specific yield % or growth rate cited without a matching "
+    "Notes entry) is a real gap worth flagging.\n\n"
     "Your job is NOT to produce your own independent competing mix — it "
     "is to critically audit that draft's specific suggestion and "
     "reasoning:\n"
@@ -773,7 +889,9 @@ class PSXAssetAnalysis:
 
 
 def analyze_psx_assets(
-    assets: list[PSXAsset], index_tag: str = DEFAULT_INDEX
+    assets: list[PSXAsset],
+    index_tag: str = DEFAULT_INDEX,
+    on_progress: Callable[[str], None] | None = None,
 ) -> list[PSXAssetAnalysis]:
     """Picks the top config.MAX_PSX_ENRICHED_ASSETS constituents of the
     given index (by volume) for full technical + fundamental + financial-
@@ -782,7 +900,11 @@ def analyze_psx_assets(
     PSX_INDICES), by explicit user request, rather than always drawing
     from the full ~490-symbol listing. Used here the way a user's own
     curated MT5 Market Watch list sizes the pool on the PMEX side, since
-    there's no equivalent per-user curation for PSX."""
+    there's no equivalent per-user curation for PSX.
+
+    `on_progress`, if given, is called once per pool constituent with a
+    single updating message — same contract as
+    ai.portfolio_suggest.analyze_assets' own param."""
     members = [a for a in assets if index_tag in a.listed_in]
     pool = sorted(members, key=lambda a: a.volume, reverse=True)[: config.MAX_PSX_ENRICHED_ASSETS]
 
@@ -804,7 +926,10 @@ def analyze_psx_assets(
         return stock_change - index_change
 
     analyses = []
-    for asset in pool:
+    total = len(pool)
+    for i, asset in enumerate(pool, start=1):
+        if on_progress is not None:
+            on_progress(f"Analyzing PSX constituents: {i}/{total} — {asset.symbol}")
         history = get_psx_history(asset.symbol)
         prices = history["Close"] if not history.empty else pd.Series(dtype=float)
         stats = compute_technical_stats(prices, history=history if not history.empty else None)
@@ -1334,6 +1459,19 @@ def build_psx_summary(
     return "\n".join(lines)
 
 
+def _fetch_current_psx_price(symbol: str) -> float | None:
+    """The PSX-specific `fetch_current_price` callable for
+    build_past_outcome_lessons — PSX symbols are already native (no
+    ticker-resolution step needed, unlike PMEX), so this is just the
+    latest close from the same endpoint every other PSX price read in
+    this codebase uses. None on an empty/failed fetch, silently skipped
+    by the caller rather than fabricated."""
+    history = get_psx_history(symbol)
+    if history.empty:
+        return None
+    return float(history["Close"].iloc[-1])
+
+
 def suggest_psx_portfolio(
     summary: str,
     timeout: int | None = None,
@@ -1359,13 +1497,32 @@ def suggest_psx_portfolio(
         if on_stage:
             on_stage(message)
 
+    # A caller-generated session ID lets stage 2 RESUME stage 1's own
+    # conversation (see below) instead of paying to resend _INSTRUCTION_
+    # HEAD, the whole `summary` market/macro dump, and the stage-1 draft
+    # a second time — none of that changed between the two calls, and
+    # live-verified `claude -p --resume` correctly retains it (including
+    # specific WebSearch-found figures) without needing it repeated.
+    session_id = str(uuid.uuid4())
+    # Computed ONCE, before stage 1 even runs — see ai/portfolio_suggest.py
+    # ::suggest_portfolio's own copy of this comment for the full
+    # rationale (identical here, just pointed at PSX's own records dir and
+    # its own native-symbol price fetcher).
+    _notify(
+        "Building past-session context (real market outcomes and audit "
+        "lessons from previous PSX runs)..."
+    )
+    past_lessons = build_past_lessons(fetch_current_price=_fetch_current_psx_price, records_dir=records_dir)
     _notify("Claude is researching PSX and drafting an initial hypothetical mix (live web search)...")
     draft_prompt = f"{build_psx_stage1_instruction()}\n\n{summary}"
+    if past_lessons:
+        draft_prompt += f"\n\n{past_lessons}"
     draft = run_claude(
         draft_prompt,
         timeout=timeout,
         allowed_tools=["WebSearch", "WebFetch"],
         model=model,
+        session_id=session_id,
     )
     if draft == CLI_MISSING_MESSAGE or draft.startswith(CLI_FAILED_PREFIX):
         return draft
@@ -1376,7 +1533,7 @@ def suggest_psx_portfolio(
         draft,
         on_progress=on_audit_progress,
         audit_instruction=AUDIT_INSTRUCTION,
-        records_dir=records_dir,
+        past_lessons=past_lessons,
     )
     _notify(
         "Audit received — Claude is revising its suggestion..."
@@ -1384,19 +1541,52 @@ def suggest_psx_portfolio(
         else "Independent audit wasn't available this run — Claude is re-checking its own draft instead..."
     )
 
-    revise_prompt = (
-        f"{build_psx_stage2_instruction(audit.audit_available)}\n\n{summary}\n\n"
-        f"Your own draft from the first pass:\n{draft}\n\n"
-        f"Independent audit reports on that draft:\n{audit.block}"
+    role_continued = (
+        _ROLE_STAGE2_SYNTHESIZE_CONTINUED if audit.audit_available else _ROLE_STAGE2_SELF_REVIEW_CONTINUED
+    )
+    lean_revise_prompt = (
+        f"{role_continued}\n\n{_INSTRUCTION_TAIL}\n\n"
+        f"Independent audit reports on your draft above:\n{audit.block}"
     )
     final_answer = run_claude(
-        revise_prompt,
+        lean_revise_prompt,
         timeout=revision_timeout,
         allowed_tools=["WebSearch", "WebFetch"],
         model=model,
+        resume_session_id=session_id,
     )
 
+    # Never let an infrastructure hiccup in the lean path (session
+    # expired/evicted between calls, a CLI version without --resume
+    # support, etc.) degrade the actual answer — fall back to the fully
+    # self-contained prompt, which needs no session at all, so the worst
+    # case is exactly the pre-existing behavior, not a worse one.
+    if final_answer == CLI_MISSING_MESSAGE or final_answer.startswith(CLI_FAILED_PREFIX):
+        logger.warning(
+            "suggest_psx_portfolio: resumed stage-2 call failed (%s), falling back to a full-context retry",
+            final_answer[:200],
+        )
+        _notify(
+            "The quick revision attempt didn't respond — retrying with a "
+            "fresh, fully self-contained request (takes a bit longer, but "
+            "doesn't rely on the earlier session still being live)..."
+        )
+        revise_prompt = (
+            f"{build_psx_stage2_instruction(audit.audit_available)}\n\n{summary}\n\n"
+            f"Your own draft from the first pass:\n{draft}\n\n"
+            f"Independent audit reports on that draft:\n{audit.block}"
+        )
+        if past_lessons:
+            revise_prompt += f"\n\n{past_lessons}"
+        final_answer = run_claude(
+            revise_prompt,
+            timeout=revision_timeout,
+            allowed_tools=["WebSearch", "WebFetch"],
+            model=model,
+        )
+
     if save_record:
+        _notify("Saving session record for future reference...")
         save_portfolio_session(
             SessionRecord(
                 summary=summary,

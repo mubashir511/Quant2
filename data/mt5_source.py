@@ -4,6 +4,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 
+import pandas as pd
+
 import config
 
 logger = logging.getLogger(__name__)
@@ -98,18 +100,46 @@ class MT5ConnectionError(RuntimeError):
     pass
 
 
-def connect() -> None:
+def connect(
+    login: str | int | None = None,
+    password: str | None = None,
+    server: str | None = None,
+    path: str | None = None,
+) -> None:
+    """Connects to an MT5 terminal/account. Each param overrides the
+    matching `config.MT5_*` global when given, and falls back to it
+    otherwise — every existing call site (which calls `connect()` with
+    no args, for the original PMEX account) keeps working unchanged.
+
+    The MetaTrader5 Python package supports exactly one active terminal
+    connection per process (confirmed against official MQL5 docs before
+    this was written) — there is no way to hold two accounts connected
+    simultaneously. Switching accounts within one process means this
+    function gets called again with different credentials, which
+    `mt5.initialize()` documents as supported but real-world reports
+    show can silently leave stale state from the previous connection
+    behind. To catch that instead of trusting it blindly, this
+    explicitly re-reads `mt5.account_info()` after a successful
+    `initialize()` and verifies it actually matches the account that
+    was just requested — a mismatch raises the same MT5ConnectionError
+    a real connection failure would, rather than silently proceeding
+    against the wrong account."""
     import MetaTrader5 as mt5
 
+    path = path if path is not None else config.MT5_PATH
+    login = login if login is not None else config.MT5_LOGIN
+    password = password if password is not None else config.MT5_PASSWORD
+    server = server if server is not None else config.MT5_SERVER
+
     kwargs = {}
-    if config.MT5_PATH:
-        kwargs["path"] = config.MT5_PATH
-    if config.MT5_LOGIN:
-        kwargs["login"] = int(config.MT5_LOGIN)
-    if config.MT5_PASSWORD:
-        kwargs["password"] = config.MT5_PASSWORD
-    if config.MT5_SERVER:
-        kwargs["server"] = config.MT5_SERVER
+    if path:
+        kwargs["path"] = path
+    if login:
+        kwargs["login"] = int(login)
+    if password:
+        kwargs["password"] = password
+    if server:
+        kwargs["server"] = server
 
     if not mt5.initialize(**kwargs):
         error = mt5.last_error()
@@ -117,6 +147,65 @@ def connect() -> None:
             f"Could not connect to the MT5 terminal ({error}). "
             "Make sure the terminal is running and logged in."
         )
+
+    if login:
+        info = mt5.account_info()
+        if info is None:
+            raise MT5ConnectionError(
+                f"Connected to the MT5 terminal, but could not verify it's the "
+                f"requested account (login {login}) — account_info() returned "
+                f"nothing right after a successful initialize()."
+            )
+        if info.login != int(login):
+            raise MT5ConnectionError(
+                f"MT5 terminal is connected to a DIFFERENT account than "
+                f"requested: asked for login {login}, but the terminal is "
+                f"showing login {info.login} ({info.server}). This looks like "
+                f"stale state left over from a previous connection — try "
+                f"again, or check the terminal itself."
+            )
+        if server and server.lower() != info.server.lower():
+            raise MT5ConnectionError(
+                f"MT5 terminal is connected to login {login}, but on server "
+                f"{info.server!r} instead of the requested {server!r} — "
+                f"refusing to proceed against a mismatched account."
+            )
+
+
+def is_trading_permitted() -> tuple[bool, str]:
+    """Whether the CURRENTLY connected terminal/account can actually
+    place a real order right now — distinct from whether the ACCOUNT is
+    configured for algo trading at all (account_info().trade_expert can
+    be True while this is False). Confirmed live: this project's own
+    real FTMO account had terminal_info().trade_allowed=False (the
+    "AutoTrading" toggle in the MT5 terminal's own toolbar was off) —
+    every order_send() call would have silently failed with
+    TRADE_RETCODE_CLIENT_DISABLES_AT (10027) regardless of how correct
+    the order itself was, which is exactly the kind of failure that
+    looks like "Apply Suggestion doesn't work" without a clear enough
+    reason to explain why. Returns (permitted, reason) so a caller can
+    show something actionable instead of waiting to decode a bare MT5
+    retcode after the fact — check this BEFORE offering "Confirm and
+    Execute", not just after a rejection."""
+    import MetaTrader5 as mt5
+
+    terminal = mt5.terminal_info()
+    account = mt5.account_info()
+    if terminal is None or account is None:
+        return False, "Could not read the terminal/account trading-permission status."
+    if not terminal.trade_allowed:
+        return False, (
+            "AutoTrading is turned OFF in the MT5 terminal itself (the "
+            "AutoTrading button in the terminal's own toolbar) — real "
+            "orders cannot be sent until it's enabled there."
+        )
+    if not account.trade_allowed:
+        return False, (
+            "This account is not currently permitted to trade (check "
+            "Tools > Options > Expert Advisors in the terminal, or "
+            "contact your broker if this is unexpected)."
+        )
+    return True, ""
 
 
 def get_open_positions() -> list[Position]:
@@ -232,6 +321,36 @@ def _load_symbol_spec_from_csv(symbol: str, csv_path: str) -> ContractSpec | Non
     return None
 
 
+def _compute_margin_via_order_calc(symbol: str) -> float:
+    """Real per-1.0-lot margin via mt5.order_calc_margin() — MT5's own
+    calc-mode-agnostic margin calculation (works for FOREX/CFD calc
+    modes, unlike the static symbol_info().margin_initial field). Needs
+    a live ask price, so re-reads the tick rather than assuming the
+    caller already has a fresh one. 0.0 (not None — matches
+    ContractSpec.margin_initial's own type, and compute_rebalance_plan's
+    existing margin_initial<=0 check treats it as "no usable spec"
+    either way) if the tick or the calc call itself comes back empty."""
+    import MetaTrader5 as mt5
+
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None or tick.ask <= 0:
+        logger.warning(
+            "_compute_margin_via_order_calc(%s): no usable ask price to calc margin from",
+            symbol,
+        )
+        return 0.0
+
+    margin = mt5.order_calc_margin(mt5.ORDER_TYPE_BUY, symbol, 1.0, tick.ask)
+    if margin is None:
+        error = mt5.last_error()
+        logger.warning(
+            "_compute_margin_via_order_calc(%s): order_calc_margin returned None (last_error=%s)",
+            symbol, error,
+        )
+        return 0.0
+    return margin
+
+
 def get_contract_spec(symbol: str) -> ContractSpec | None:
     """Real order-size/margin constraints for a symbol — e.g. a minimum
     lot can require far more margin than a small account holds at all,
@@ -257,7 +376,21 @@ def get_contract_spec(symbol: str) -> ContractSpec | None:
     If the live API still has nothing after that, falls back to
     config.MT5_SYMBOL_SPECS_CSV_PATH when configured (see
     _load_symbol_spec_from_csv) — a genuinely independent second data
-    path, not just another retry of the same one."""
+    path, not just another retry of the same one.
+
+    `margin_initial` specifically also falls back to mt5.order_calc_margin()
+    when symbol_info() reports it as 0 — confirmed live on a real FTMO
+    account that FOREX-calc-mode symbols (SYMBOL_CALC_MODE_FOREX, e.g.
+    EURUSD) always report margin_initial=0 via symbol_info(); that field
+    only ever carries a real number for futures-style calc modes like
+    PMEX's own contracts. risk/apply_suggestion.py's compute_rebalance_plan
+    treats margin_initial<=0 as "no spec available" and marks the symbol
+    infeasible — without this fallback, EVERY forex/CFD-calc-mode symbol
+    (i.e. most of FTMO's own tradable universe) would silently be
+    unactionable via Apply Suggestion. order_calc_margin() is MT5's own
+    calc-mode-agnostic margin calculation, the same one the terminal
+    itself uses — confirmed live to return the correct number (matched
+    contract_size * price / leverage by hand for FTMO's EURUSD)."""
     spec = None
     try:
         import MetaTrader5 as mt5
@@ -276,13 +409,16 @@ def get_contract_spec(symbol: str) -> ContractSpec | None:
 
     if info is not None:
         try:
+            margin_initial = info.margin_initial
+            if margin_initial <= 0:
+                margin_initial = _compute_margin_via_order_calc(symbol)
             spec = ContractSpec(
                 volume_min=info.volume_min,
                 volume_step=info.volume_step,
                 volume_max=info.volume_max,
                 trade_contract_size=info.trade_contract_size,
                 currency_margin=info.currency_margin,
-                margin_initial=info.margin_initial,
+                margin_initial=margin_initial,
             )
         except AttributeError as e:
             logger.warning("mt5.symbol_info(%s) returned an incomplete object: %s", symbol, e)
@@ -293,3 +429,215 @@ def get_contract_spec(symbol: str) -> ContractSpec | None:
             logger.info("get_contract_spec: used CSV fallback for %s (live API had nothing)", symbol)
 
     return spec
+
+
+@dataclass
+class HistoricalDeal:
+    ticket: int
+    time: datetime
+    symbol: str
+    profit: float  # total realized effect on balance: profit + swap + commission
+    volume: float
+
+
+def get_history_deals(date_from: datetime, date_to: datetime | None = None) -> list[HistoricalDeal]:
+    """Real closed-trade history from the currently-connected account —
+    the raw material risk/ftmo_rules.py needs to reconstruct real daily
+    P&L and the account's own historical equity curve, since MT5 exposes
+    no direct "history of daily EOD balances" query. `profit` sums
+    MT5's own `profit`/`swap`/`commission` deal fields, since all three
+    genuinely affect the account's real balance, not just the headline
+    trade P&L. Deliberately includes every deal (including zero-profit
+    position-opening entries), not just closes — callers decide their
+    own aggregation rather than this function making that choice.
+
+    Empty list on any failure, same "don't fabricate, don't raise for a
+    normal empty result" contract as every other read-only fetch in this
+    file — a genuinely fresh account with zero trade history is a real,
+    expected case (e.g. a brand-new FTMO Challenge before its first
+    trade), not an error."""
+    import MetaTrader5 as mt5
+
+    date_to = date_to if date_to is not None else datetime.now()
+    raw = mt5.history_deals_get(date_from, date_to)
+    if raw is None:
+        error = mt5.last_error()
+        logger.warning("get_history_deals: history_deals_get returned nothing (last_error=%s)", error)
+        return []
+
+    return [
+        HistoricalDeal(
+            ticket=d.ticket,
+            time=datetime.fromtimestamp(d.time),
+            symbol=d.symbol,
+            profit=d.profit + d.swap + d.commission,
+            volume=d.volume,
+        )
+        for d in raw
+    ]
+
+
+_MT5_TIMEFRAMES = ("H1", "H4", "D1")
+
+
+def fetch_mt5_price_history(symbol: str, timeframe: str, count: int = 300) -> pd.DataFrame:
+    """Real OHLCV bars for `symbol` at `timeframe` ("H1"/"H4"/"D1"),
+    fetched directly from the currently-connected MT5 terminal's own
+    price feed — the broker's real data for the exact symbol, not a
+    best-effort external ticker match the way PMEX's Yahoo-based
+    enrichment needs (see data/underlying.py). Shaped into the same
+    Open/High/Low/Close/Volume, oldest-first DataFrame shape
+    analysis/technical.py already expects, so compute_technical_stats()
+    works on it unchanged — no new analysis code needed for a new
+    timeframe, only this fetch. Volume here is MT5's tick_volume (real
+    tick counts), not a settled trade-volume figure — same caveat this
+    project already states for Yahoo's own volume data.
+
+    Empty (but correctly-typed) DataFrame on any failure — no data for
+    this symbol/timeframe combination is a normal, expected outcome (a
+    newly-listed symbol, a broker that doesn't retain intraday history
+    that far back — bar availability is bounded by the broker's own
+    server-side history retention, not something this function
+    controls), not treated as a connection failure. Matches every other
+    price-history fetch function's contract in this codebase
+    (data/market_history.py, data/psx_source.py)."""
+    empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"], dtype=float)
+    if timeframe not in _MT5_TIMEFRAMES:
+        raise ValueError(f"Unsupported timeframe {timeframe!r} — expected one of {_MT5_TIMEFRAMES}")
+
+    import MetaTrader5 as mt5
+
+    mt5_timeframe = {
+        "H1": mt5.TIMEFRAME_H1,
+        "H4": mt5.TIMEFRAME_H4,
+        "D1": mt5.TIMEFRAME_D1,
+    }[timeframe]
+
+    _ensure_symbol_selected(mt5, symbol)
+    rates = mt5.copy_rates_from_pos(symbol, mt5_timeframe, 0, count)
+    if rates is None or len(rates) == 0:
+        error = mt5.last_error()
+        logger.warning(
+            "fetch_mt5_price_history(%s, %s): copy_rates_from_pos returned nothing (last_error=%s)",
+            symbol, timeframe, error,
+        )
+        return empty
+
+    raw = pd.DataFrame(rates)
+    # .values, not the bare Series — raw's default integer index and the
+    # new DatetimeIndex below share no labels, so building this dict from
+    # the Series themselves would align-by-label against the `index=`
+    # param and silently fill every value with NaN (confirmed live via a
+    # failing test) rather than raising anything.
+    return pd.DataFrame(
+        {
+            "Open": raw["open"].astype(float).values,
+            "High": raw["high"].astype(float).values,
+            "Low": raw["low"].astype(float).values,
+            "Close": raw["close"].astype(float).values,
+            "Volume": raw["tick_volume"].astype(float).values,
+        },
+        index=pd.to_datetime(raw["time"], unit="s"),
+    )
+
+
+@dataclass
+class TradeCost:
+    """Real, MT5-native cost-of-trade figures for a symbol — deliberately
+    separate from ContractSpec (which risk/apply_suggestion.py depends on
+    for order sizing): this is informational data for the AI prompt, not
+    an execution input, and keeping it out of ContractSpec avoids
+    widening that dataclass's actual purpose. Commission is NOT included
+    here — MT5's API has no field for it at all (confirmed live: not on
+    symbol_info(), not on account_info() beyond an unrelated margin-calc
+    "commission_blocked" figure) — callers that know their own broker's
+    real commission schedule (see ai/ftmo_suggest.py) layer it on top of
+    this using `category` to look up the right rate."""
+
+    category: str  # broker's own top-level symbol-path category, e.g. "Forex", "Metals CFD"
+    spread_pct_of_price: float  # round-trip cost from crossing the spread once, as a % of price
+    swap_long_pct_per_day: float | None  # holding a BUY overnight, %-of-notional/day (negative = a cost)
+    swap_short_pct_per_day: float | None  # same, for a SELL
+
+
+# MT5's own swap-calculation-mode constants this project has verified a
+# real conversion formula for (confirmed live: a single FTMO account can
+# mix both — EURUSD/XAUUSD use POINTS, BTCUSD uses INTEREST_CURRENT).
+# Values match MetaTrader5.SYMBOL_SWAP_MODE_POINTS / _INTEREST_CURRENT /
+# _INTEREST_OPEN — hardcoded rather than imported from the mt5 module so
+# this stays evaluable without a live MT5 import at module load time.
+_SWAP_MODE_POINTS = 1
+_SWAP_MODE_INTEREST_CURRENT = 5
+_SWAP_MODE_INTEREST_OPEN = 6
+# Standard forex/CFD market convention for accruing an annual swap rate
+# daily — not this project's own choice, matches how brokers themselves
+# compute it.
+_SWAP_DAYS_PER_YEAR = 360
+
+
+def _compute_swap_pct_per_day(info, price: float) -> tuple[float | None, float | None]:
+    """Real swap cost as a %-of-notional-per-day figure, handling the
+    two swap_mode conventions this project has verified live (see the
+    constants above). SYMBOL_SWAP_MODE_POINTS: swap_long/short are a raw
+    point value, converted to money via trade_tick_value scaled by
+    point/trade_tick_size (equal for most symbols, but not guaranteed —
+    confirmed live this broker's own point==tick_size for every symbol
+    checked, so this scaling is a no-op here, but it's not assumed).
+    SYMBOL_SWAP_MODE_INTEREST_CURRENT/_OPEN: swap_long/short are already
+    annual % rates of notional, accrued daily on the conventional
+    360-day basis. Returns (None, None) for any other, rarer swap_mode —
+    this project hasn't verified a formula for those, and a silently
+    wrong cost figure is worse than an honest gap."""
+    if price <= 0:
+        return None, None
+
+    if info.swap_mode == _SWAP_MODE_POINTS:
+        if info.trade_tick_size <= 0 or info.trade_contract_size <= 0:
+            return None, None
+        point_value = info.trade_tick_value * (info.point / info.trade_tick_size)
+        notional = info.trade_contract_size * price
+        if notional <= 0:
+            return None, None
+        return (
+            info.swap_long * point_value / notional * 100,
+            info.swap_short * point_value / notional * 100,
+        )
+
+    if info.swap_mode in (_SWAP_MODE_INTEREST_CURRENT, _SWAP_MODE_INTEREST_OPEN):
+        return info.swap_long / _SWAP_DAYS_PER_YEAR, info.swap_short / _SWAP_DAYS_PER_YEAR
+
+    return None, None
+
+
+def get_trade_economics(symbol: str) -> TradeCost | None:
+    """Real spread + swap cost for `symbol`, straight from the live MT5
+    feed — the deterministic, "don't make the model guess a number
+    Python can compute exactly" counterpart to letting the AI reason
+    about whether a trade's edge actually survives real trading costs
+    (matters most on a short holding horizon, where a modest edge can be
+    mostly or entirely eaten by round-trip spread plus a night or two of
+    swap). None on any failure (no live quote, no symbol info) — never
+    fabricated, matching every other real-data fetch in this file."""
+    try:
+        import MetaTrader5 as mt5
+
+        _ensure_symbol_selected(mt5, symbol)
+        info = mt5.symbol_info(symbol)
+        tick = mt5.symbol_info_tick(symbol)
+    except Exception as e:
+        logger.warning("get_trade_economics raised for %s: %s: %s", symbol, type(e).__name__, e)
+        return None
+
+    if info is None or tick is None or tick.ask <= 0 or tick.bid <= 0:
+        return None
+
+    spread_pct = (tick.ask - tick.bid) / tick.ask * 100
+    swap_long_pct, swap_short_pct = _compute_swap_pct_per_day(info, tick.ask)
+    category = info.path.split("\\")[0] if getattr(info, "path", "") else "Uncategorized"
+
+    return TradeCost(
+        category=category,
+        spread_pct_of_price=spread_pct,
+        swap_long_pct_per_day=swap_long_pct,
+        swap_short_pct_per_day=swap_short_pct,
+    )

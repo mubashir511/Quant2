@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from analysis.technical import compute_technical_stats
 
@@ -172,3 +173,34 @@ def test_volume_trend_none_when_no_volume_column():
     history = make_history(30, start=100.0, daily_drift=1.0).drop(columns=["Volume"])
     stats = compute_technical_stats(history["Close"], history=history)
     assert stats.volume_trend_pct is None
+
+
+def test_periods_per_year_defaults_to_daily_trading_days():
+    import random
+
+    random.seed(42)
+    prices = pd.Series([100.0 + random.uniform(-1, 1) for _ in range(30)])
+    default_call = compute_technical_stats(prices)
+    explicit_daily = compute_technical_stats(prices, periods_per_year=252)
+    assert default_call.volatility_annualized_pct == explicit_daily.volatility_annualized_pct
+
+
+def test_periods_per_year_scales_volatility_correctly_for_a_different_bar_frequency():
+    # Regression: compute_technical_stats used to always scale by
+    # sqrt(TRADING_DAYS_PER_YEAR) regardless of the actual bar frequency
+    # it was fed — confirmed live this understated real annualized
+    # volatility by ~2.5x-6x for H4/H1 data (a live EURUSD H1 read came
+    # back LESS volatile than its own daily figure). The ratio between
+    # two periods_per_year values must translate directly into the ratio
+    # between their reported volatility, since the underlying per-bar
+    # std is identical for the same price series either way.
+    import random
+
+    random.seed(7)
+    prices = pd.Series([100.0 + random.uniform(-1, 1) for _ in range(30)])
+    daily = compute_technical_stats(prices, periods_per_year=252)
+    hourly_scale = compute_technical_stats(prices, periods_per_year=24 * 252)
+
+    expected_ratio = (24 * 252) ** 0.5 / 252**0.5
+    actual_ratio = hourly_scale.volatility_annualized_pct / daily.volatility_annualized_pct
+    assert actual_ratio == pytest.approx(expected_ratio)

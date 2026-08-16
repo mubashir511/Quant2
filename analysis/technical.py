@@ -120,7 +120,7 @@ def _compute_atr(ohlc: pd.DataFrame) -> float | None:
 
 
 def compute_technical_stats(
-    prices: pd.Series, history: pd.DataFrame | None = None
+    prices: pd.Series, history: pd.DataFrame | None = None, periods_per_year: float = TRADING_DAYS_PER_YEAR
 ) -> TechnicalStats:
     """Pure computation over a close-price series, oldest first. `history`
     (High/Low/Close/Volume, same source/period) is optional and only
@@ -131,7 +131,18 @@ def compute_technical_stats(
     Any stat that needs more history than is actually available (e.g. a
     3-month change on a contract that only just started trading) is left
     as None rather than computed from a shorter, misleading window.
-    """
+
+    `periods_per_year` defaults to TRADING_DAYS_PER_YEAR (252) — correct
+    for every existing caller, which all feed daily bars. It ONLY scales
+    volatility_annualized_pct (every other stat here — SMA/trend, the
+    Kaufman efficiency ratio, RSI, ATR — is a pure bar-count window, not
+    tied to a calendar-time assumption, so timeframe doesn't distort it).
+    A caller feeding a DIFFERENT bar frequency (confirmed live: FTMO's
+    own H4/H1 reads, previously always scaled by sqrt(252) regardless of
+    being fed 4-hour or 1-hour bars, understated real annualized
+    volatility by roughly 2.5x-6x — H1 EURUSD read as LESS volatile than
+    its own daily figure, the opposite of a sanity check) must pass the
+    real number of bars per year for its own timeframe here."""
     prices = prices.dropna()
     if prices.empty:
         return TechnicalStats(*([None] * 16))
@@ -163,10 +174,10 @@ def compute_technical_stats(
 
     volatility_annualized_pct = None
     if len(prices) > VOLATILITY_WINDOW:
-        daily_returns = prices.pct_change().dropna().tail(VOLATILITY_WINDOW)
-        if len(daily_returns) >= 2:
+        period_returns = prices.pct_change().dropna().tail(VOLATILITY_WINDOW)
+        if len(period_returns) >= 2:
             volatility_annualized_pct = float(
-                daily_returns.std() * (TRADING_DAYS_PER_YEAR**0.5) * 100
+                period_returns.std() * (periods_per_year**0.5) * 100
             )
 
     support = resistance = range_width_pct = market_regime = None

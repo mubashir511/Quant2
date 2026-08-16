@@ -46,6 +46,35 @@ def test_open_position_omits_sl_when_not_given(mock_order_send):
 
 
 @patch("MetaTrader5.order_send")
+def test_open_position_sends_take_profit_when_given(mock_order_send):
+    mock_result = MagicMock()
+    mock_result.retcode = 10009
+    mock_result.comment = "Request executed"
+    mock_result.order = 12347
+    mock_order_send.return_value = mock_result
+
+    open_position("GO10OZ", "buy", 1.0, 2005.5, stop_loss=1950.0, take_profit=2100.0)
+
+    request = mock_order_send.call_args.args[0]
+    assert request["sl"] == 1950.0
+    assert request["tp"] == 2100.0
+
+
+@patch("MetaTrader5.order_send")
+def test_open_position_omits_tp_when_not_given(mock_order_send):
+    mock_result = MagicMock()
+    mock_result.retcode = 10009
+    mock_result.comment = "Request executed"
+    mock_result.order = 12348
+    mock_order_send.return_value = mock_result
+
+    open_position("GO10OZ", "buy", 1.0, 2005.5)
+
+    request = mock_order_send.call_args.args[0]
+    assert "tp" not in request
+
+
+@patch("MetaTrader5.order_send")
 def test_open_position_reports_rejection_without_raising(mock_order_send):
     mock_result = MagicMock()
     mock_result.retcode = 10006  # TRADE_RETCODE_REJECT

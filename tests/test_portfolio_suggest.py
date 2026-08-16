@@ -3,6 +3,7 @@ from datetime import datetime
 from unittest.mock import patch
 
 import pandas as pd
+import pytest
 
 from ai.portfolio_suggest import (
     AUDIT_INSTRUCTION,
@@ -12,11 +13,16 @@ from ai.portfolio_suggest import (
     AuditResult,
     ModelAuditStatus,
     _detect_present_commodities,
+    _fetch_current_pmex_price,
     _format_audit_progress,
     _run_audit_with_retry,
+    _run_copilot_with_status,
     analyze_assets,
     build_audit_block,
+    build_copilot_verification,
     build_past_audit_lessons,
+    build_past_lessons,
+    build_past_outcome_lessons,
     build_crop_supply_demand_context,
     build_enriched_asset_context,
     build_fx_context,
@@ -31,9 +37,12 @@ from ai.portfolio_suggest import (
     get_openrouter_audit,
     parse_final_allocation,
     strip_allocation_block,
+    strip_leading_process_narration,
     suggest_portfolio,
 )
 from ai.claude_cli import CLI_FAILED_PREFIX, CLI_MISSING_MESSAGE
+from ai.copilot_cli import CLI_FAILED_PREFIX as COPILOT_FAILED_PREFIX
+from ai.copilot_cli import CLI_MISSING_MESSAGE as COPILOT_MISSING_MESSAGE
 from ai.openrouter_client import FAILED_MESSAGE as OPENROUTER_FAILED_MESSAGE
 from ai.openrouter_client import MISSING_KEY_MESSAGE as OPENROUTER_MISSING_KEY_MESSAGE
 from analysis.backtest import (
@@ -46,6 +55,23 @@ from analysis.technical import compute_technical_stats
 from data.macro_source import CountryIndicators, MarketIndicators
 from data.mt5_source import ContractSpec
 from data.mt5_source import AccountSummary, MarketAsset, Position
+
+
+@pytest.fixture(autouse=True)
+def _no_real_past_lessons():
+    """build_past_lessons does real file I/O (reads this actual project's
+    real records/ directory, which genuinely has saved sessions from real
+    runs) and real network calls (re-prices every symbol in them) —
+    without this, every suggest_portfolio()-calling test in this file
+    would silently pick up real production data and make real Yahoo
+    Finance calls, turning a normally-instant test suite into one that
+    takes minutes and depends on live network state. Same "autouse
+    fixture patches a real-environment dependency to empty by default,
+    individual tests override it explicitly when they need to exercise
+    it" pattern already used for MT5_SYMBOL_SPECS_CSV_PATH elsewhere in
+    this project's test suite."""
+    with patch("ai.portfolio_suggest.build_past_lessons", return_value=""):
+        yield
 
 
 def _ohlc(closes: list[float], start: str = "2026-01-01") -> pd.DataFrame:
@@ -290,6 +316,26 @@ def test_analyze_assets_wires_backtests_onto_the_analysis(
     mock_history.assert_called_once_with("GC=F", period="5y")
 
 
+@patch("ai.portfolio_suggest.resolve_yahoo_ticker", return_value=None)
+def test_analyze_assets_reports_per_symbol_progress(mock_resolve):
+    assets = [
+        MarketAsset("A", "Asset A", bid=1.0, ask=1.1),
+        MarketAsset("B", "Asset B", bid=2.0, ask=2.1),
+    ]
+    calls = []
+    analyze_assets(assets, on_progress=calls.append)
+    assert len(calls) == 2
+    assert "1/2" in calls[0] and "A" in calls[0]
+    assert "2/2" in calls[1] and "B" in calls[1]
+
+
+def test_analyze_assets_without_on_progress_still_works():
+    assets = [MarketAsset("A", "Asset A", bid=1.0, ask=1.1)]
+    with patch("ai.portfolio_suggest.resolve_yahoo_ticker", return_value=None):
+        results = analyze_assets(assets)
+    assert len(results) == 1
+
+
 def _analysis_with_stats(symbol="GOLD-DE26"):
     history = _ohlc([100.0 + i for i in range(60)])
     prices = history["Close"]
@@ -339,9 +385,26 @@ def test_suggest_portfolio_calls_run_claude_twice_with_draft_then_final(mock_run
     assert result == "final answer"
     assert mock_run_claude.call_count == 2
     draft_prompt = mock_run_claude.call_args_list[0].args[0]
-    final_prompt = mock_run_claude.call_args_list[1].args[0]
     assert "some summary" in draft_prompt
-    assert "some summary" in final_prompt
+
+
+@patch("ai.portfolio_suggest.build_audit_block", return_value=_NO_AUDIT)
+@patch("ai.portfolio_suggest.run_claude")
+def test_suggest_portfolio_resumes_stage1_session_for_a_lean_stage2_call(mock_run_claude, mock_audit):
+    # The whole point of session continuation: stage 2 must reuse stage
+    # 1's own session rather than resending the huge unchanging context
+    # (the market/macro summary, _INSTRUCTION_HEAD, the draft itself) a
+    # second time — live-verified separately that `claude -p --resume`
+    # actually retains this without repeating it.
+    mock_run_claude.side_effect = ["draft", "final"]
+    suggest_portfolio("some summary")
+    draft_call, final_call = mock_run_claude.call_args_list
+    session_id = draft_call.kwargs.get("session_id")
+    assert session_id  # a real value was generated and passed
+    assert final_call.kwargs.get("resume_session_id") == session_id
+    assert "resume_session_id" not in draft_call.kwargs
+    final_prompt = final_call.args[0]
+    assert "some summary" not in final_prompt
 
 
 @patch("ai.portfolio_suggest.build_audit_block", return_value=_NO_AUDIT)
@@ -385,14 +448,18 @@ def test_suggest_portfolio_uses_separate_timeout_and_revision_timeout(mock_run_c
 
 @patch("ai.portfolio_suggest.build_audit_block")
 @patch("ai.portfolio_suggest.run_claude")
-def test_suggest_portfolio_passes_draft_and_audit_block_into_revision_prompt(mock_run_claude, mock_audit):
+def test_suggest_portfolio_passes_audit_block_into_lean_revision_prompt(mock_run_claude, mock_audit):
     mock_run_claude.side_effect = ["my draft text", "final answer"]
     mock_audit.return_value = AuditResult(block="Audit block: XYZ", audit_available=True)
     suggest_portfolio("some summary")
     final_prompt = mock_run_claude.call_args_list[1].args[0]
-    assert "my draft text" in final_prompt
     assert "Audit block: XYZ" in final_prompt
-    mock_audit.assert_called_once_with("some summary", "my draft text", on_progress=None)
+    # The draft itself is NOT repeated — it's already in the resumed
+    # session's own history, per the whole point of this design.
+    assert "my draft text" not in final_prompt
+    mock_audit.assert_called_once_with(
+        "some summary", "my draft text", on_progress=None, past_lessons=""
+    )
 
 
 _SAMPLE_CLI_FAILURE = f"{CLI_FAILED_PREFIX} (the `claude` CLI exited with code 1: boom)."
@@ -464,10 +531,11 @@ def test_suggest_portfolio_invokes_on_stage_callback_with_expected_message_seque
     mock_audit.return_value = AuditResult(block="", audit_available=True)
     messages = []
     suggest_portfolio("some summary", on_stage=messages.append)
-    assert len(messages) == 3
-    assert "drafting" in messages[0].lower()
-    assert "audit" in messages[1].lower()
-    assert "revising" in messages[2].lower()
+    assert len(messages) == 4
+    assert "past-session context" in messages[0].lower()
+    assert "drafting" in messages[1].lower()
+    assert "audit" in messages[2].lower()
+    assert "revising" in messages[3].lower()
 
 
 @patch("ai.portfolio_suggest.build_audit_block")
@@ -477,31 +545,51 @@ def test_suggest_portfolio_on_stage_discloses_when_audit_unavailable(mock_run_cl
     mock_audit.return_value = AuditResult(block="", audit_available=False)
     messages = []
     suggest_portfolio("some summary", on_stage=messages.append)
-    assert "wasn't available" in messages[2] or "re-checking" in messages[2].lower()
+    assert "wasn't available" in messages[3] or "re-checking" in messages[3].lower()
 
 
-@patch("ai.portfolio_suggest.build_stage2_instruction", return_value="instruction text")
 @patch("ai.portfolio_suggest.build_audit_block")
 @patch("ai.portfolio_suggest.run_claude")
-def test_suggest_portfolio_selects_stage2_instruction_with_audit_available_true(
-    mock_run_claude, mock_audit, mock_stage2
-):
+def test_suggest_portfolio_uses_synthesize_role_when_audit_available_true(mock_run_claude, mock_audit):
+    # build_stage2_instruction (the full, non-lean builder) is only used
+    # by the fallback path now — the normal, successful path picks
+    # between the two _CONTINUED role variants directly.
     mock_run_claude.side_effect = ["draft", "final"]
     mock_audit.return_value = AuditResult(block="", audit_available=True)
     suggest_portfolio("some summary")
-    mock_stage2.assert_called_once_with(True)
+    final_prompt = mock_run_claude.call_args_list[1].args[0]
+    assert "WEIGH EACH AUDIT BY ITS SOURCE MODEL" in final_prompt
+    assert "already above in this conversation" in final_prompt
 
 
-@patch("ai.portfolio_suggest.build_stage2_instruction", return_value="instruction text")
 @patch("ai.portfolio_suggest.build_audit_block")
 @patch("ai.portfolio_suggest.run_claude")
-def test_suggest_portfolio_selects_stage2_instruction_with_audit_available_false(
-    mock_run_claude, mock_audit, mock_stage2
-):
+def test_suggest_portfolio_uses_self_review_role_when_audit_available_false(mock_run_claude, mock_audit):
     mock_run_claude.side_effect = ["draft", "final"]
     mock_audit.return_value = AuditResult(block="", audit_available=False)
     suggest_portfolio("some summary")
-    mock_stage2.assert_called_once_with(False)
+    final_prompt = mock_run_claude.call_args_list[1].args[0]
+    assert "independent audit that normally reviews it was not available this run" in final_prompt
+    assert "WEIGH EACH AUDIT BY ITS SOURCE MODEL" not in final_prompt
+
+
+@patch("ai.portfolio_suggest.build_audit_block", return_value=_NO_AUDIT)
+@patch("ai.portfolio_suggest.run_claude")
+def test_suggest_portfolio_falls_back_to_full_context_when_resume_fails(mock_run_claude, mock_audit):
+    # A resumed session can fail for reasons unrelated to content quality
+    # (expired/evicted session, a CLI without --resume support) — that
+    # must never degrade the final answer, so a failed lean call triggers
+    # one full-context retry with no session dependency at all.
+    fallback_failure = f"{CLI_FAILED_PREFIX} (the `claude` CLI exited with code 1: no conversation found)."
+    mock_run_claude.side_effect = ["draft suggestion text", fallback_failure, "final answer after retry"]
+    result = suggest_portfolio("some summary")
+    assert result == "final answer after retry"
+    assert mock_run_claude.call_count == 3
+    retry_call = mock_run_claude.call_args_list[2]
+    assert "resume_session_id" not in retry_call.kwargs
+    retry_prompt = retry_call.args[0]
+    assert "some summary" in retry_prompt
+    assert "draft suggestion text" in retry_prompt
 
 
 @patch("ai.portfolio_suggest.resolve_yahoo_ticker")
@@ -805,6 +893,34 @@ def test_strip_allocation_block_only_removes_the_last_block_not_earlier_ones():
     }
 
 
+def test_strip_leading_process_narration_removes_leaked_internal_section():
+    # Regression test for a real live run (haiku): a leaked
+    # "## Internal Review & Revision Process" section narrating which
+    # audit findings it accepted, printed BEFORE the real report despite
+    # the explicit instruction not to.
+    text = (
+        "I'll work through the audits and produce the final report.\n\n"
+        "## Internal Review & Revision Process\n\n"
+        "**Key audit findings I'm accepting:**\n1. Something internal.\n\n"
+        "## Executive Summary\n\nThe real report starts here."
+    )
+    result = strip_leading_process_narration(text)
+    assert result == "## Executive Summary\n\nThe real report starts here."
+    assert "Internal Review" not in result
+
+
+def test_strip_leading_process_narration_noop_when_already_clean():
+    text = "## Executive Summary\n\nThe real report starts here."
+    assert strip_leading_process_narration(text) == text
+
+
+def test_strip_leading_process_narration_noop_when_marker_missing():
+    # Can't safely guess what's leading content without the marker to
+    # anchor on — leave the text untouched rather than guess wrong.
+    text = "Some unusual response with no standard headers at all."
+    assert strip_leading_process_narration(text) == text
+
+
 def test_system_instruction_forbids_extra_code_fences():
     lowered = build_stage1_instruction().lower()
     assert "only fenced code block" in lowered
@@ -997,31 +1113,105 @@ def test_build_audit_block_labels_each_audit_with_its_source_model_profile(mock_
         assert f"{label} ({profile}) audit:" in result.block
 
 
+@patch("ai.portfolio_suggest.run_copilot")
+def test_build_copilot_verification_skips_subprocess_when_no_notes_section(mock_run_copilot):
+    result = build_copilot_verification("Claude's draft mix with no notes section.")
+    assert "nothing to independently verify" in result
+    mock_run_copilot.assert_not_called()
+
+
+@patch("ai.portfolio_suggest.run_copilot", return_value="SUPPORTED: found matching evidence.")
+def test_build_copilot_verification_calls_run_copilot_when_notes_present(mock_run_copilot):
+    draft = "Some reasoning.\n\n## External Research Notes\n- A claim — Source."
+    result = build_copilot_verification(draft)
+    assert result == "SUPPORTED: found matching evidence."
+    prompt = mock_run_copilot.call_args.args[0]
+    assert "External Research Notes" in prompt
+    assert "- A claim — Source." in prompt
+
+
+@patch("ai.portfolio_suggest.run_copilot", return_value="SUPPORTED: found matching evidence.")
+def test_build_copilot_verification_sends_only_the_notes_section_not_the_whole_draft(mock_run_copilot):
+    # Copilot's task is bounded to the listed claims — the surrounding
+    # investment-thesis prose is both irrelevant to that task and the
+    # larger part of the draft, so it must not be sent at all.
+    draft = (
+        "Some lengthy reasoning about sector allocation and position sizing "
+        "that has nothing to do with fact-checking.\n\n"
+        "## External Research Notes\n- A claim — Source."
+    )
+    build_copilot_verification(draft)
+    prompt = mock_run_copilot.call_args.args[0]
+    assert "sector allocation and position sizing" not in prompt
+    assert "- A claim — Source." in prompt
+
+
+@patch("config.AUDIT_RETRY_TIMEOUT_SECONDS", 1)
+@patch("config.AUDIT_RETRY_INTERVAL_SECONDS", 1)
+@patch("ai.portfolio_suggest.get_openrouter_audit", return_value=OPENROUTER_FAILED_MESSAGE)
+@patch("ai.portfolio_suggest.run_copilot", return_value="SUPPORTED: verified live.")
+def test_build_audit_block_includes_successful_copilot_verification(mock_run_copilot, mock_audit):
+    draft = "Draft.\n\n## External Research Notes\n- A claim — Source."
+    result = build_audit_block("some summary", draft)
+    assert "GitHub Copilot CLI" in result.block
+    assert "SUPPORTED: verified live." in result.block
+    assert result.audit_available is True  # Copilot alone can carry this, even if all 10 OpenRouter fail.
+
+
+@patch("config.AUDIT_RETRY_TIMEOUT_SECONDS", 1)
+@patch("config.AUDIT_RETRY_INTERVAL_SECONDS", 1)
+@patch("ai.portfolio_suggest.get_openrouter_audit", return_value=OPENROUTER_FAILED_MESSAGE)
+@patch("ai.portfolio_suggest.run_copilot", return_value=COPILOT_MISSING_MESSAGE)
+def test_build_audit_block_marks_copilot_unavailable_on_failure(mock_run_copilot, mock_audit):
+    draft = "Draft.\n\n## External Research Notes\n- A claim — Source."
+    result = build_audit_block("some summary", draft)
+    assert "GitHub Copilot CLI" in result.block
+    assert result.block.count("not available this time") == len(AUDIT_MODELS) + 1
+    assert result.audit_available is False
+
+
+@patch("config.AUDIT_RETRY_TIMEOUT_SECONDS", 1)
+@patch("config.AUDIT_RETRY_INTERVAL_SECONDS", 1)
+@patch("ai.portfolio_suggest.get_openrouter_audit", return_value=OPENROUTER_FAILED_MESSAGE)
+@patch("ai.portfolio_suggest.run_copilot")
+def test_build_audit_block_surfaces_the_real_copilot_failure_reason(mock_run_copilot, mock_audit):
+    # Regression: a Copilot failure used to collapse to a bare "not
+    # available this time" everywhere (the live UI ticker AND the saved
+    # session record), with the actual cause (timeout, auth failure, a
+    # real exit code/stderr) visible nowhere — forcing a manual re-run
+    # just to find out why.
+    real_reason = f"{COPILOT_FAILED_PREFIX} (the `copilot` CLI did not respond within 240s and was terminated)."
+    mock_run_copilot.return_value = real_reason
+    draft = "Draft.\n\n## External Research Notes\n- A claim — Source."
+    result = build_audit_block("some summary", draft)
+    assert "did not respond within 240s" in result.block
+
+
+@patch("config.AUDIT_RETRY_TIMEOUT_SECONDS", 1)
+@patch("config.AUDIT_RETRY_INTERVAL_SECONDS", 1)
+@patch("ai.portfolio_suggest.get_openrouter_audit", return_value=OPENROUTER_FAILED_MESSAGE)
+def test_build_audit_block_no_notes_case_does_not_flip_audit_available(mock_audit):
+    # Regression guard: a draft with nothing for Copilot to check must NOT
+    # make audit_available True on its own when every real audit failed —
+    # "nothing to verify" is not the same as "a successful audit ran."
+    result = build_audit_block("some summary", "Claude's draft mix with no notes section.")
+    assert result.audit_available is False
+    assert "nothing to independently verify" in result.block
+
+
 @patch("ai.portfolio_suggest.get_openrouter_audit")
-def test_build_audit_block_passes_past_lessons_to_every_model(mock_audit, tmp_path):
+def test_build_audit_block_passes_past_lessons_to_every_model(mock_audit):
+    # build_audit_block no longer computes past_lessons itself (that now
+    # happens ONCE in suggest_portfolio, before stage 1, so stage 1's
+    # draft can see it too — see build_past_lessons) — it just forwards
+    # whatever the caller already computed to every audit model.
     def audit_side_effect(summary, draft, model, **kwargs):
         return kwargs.get("past_lessons", "")
 
     mock_audit.side_effect = audit_side_effect
-
-    session_dir = tmp_path
-    session_dir.mkdir(exist_ok=True)
-    (session_dir / "portfolio_suggestion_2026-08-09_120000.md").write_text(
-        "# Portfolio Suggestion Session\n\n"
-        "## Stage 2 — Independent audits\n\n"
-        "Some model found: margin math was wrong for SL10-SE26.\n\n"
-        "## Stage 3 — Claude's final revised suggestion\n\nfinal text\n",
-        encoding="utf-8",
+    result = build_audit_block(
+        "some summary", "Claude's draft mix.", past_lessons="margin math was wrong for SL10-SE26"
     )
-
-    import config
-    original_dir = config.PORTFOLIO_RECORDS_DIR
-    config.PORTFOLIO_RECORDS_DIR = str(session_dir)
-    try:
-        result = build_audit_block("some summary", "Claude's draft mix.")
-    finally:
-        config.PORTFOLIO_RECORDS_DIR = original_dir
-
     assert "margin math was wrong for SL10-SE26" in result.block
 
 
@@ -1091,6 +1281,170 @@ def test_build_past_audit_lessons_skips_file_missing_stage_2_section(tmp_path):
         "# No stage sections at all\n", encoding="utf-8"
     )
     assert build_past_audit_lessons(records_dir=tmp_path) == ""
+
+
+_STAGE3_MARKER = "## Stage 3 — Claude's final revised suggestion\n\n"
+
+
+def _write_stage3_record(tmp_path, allocation_json: str, filename="portfolio_suggestion_2026-08-09_120000.md"):
+    (tmp_path / filename).write_text(f"{_STAGE3_MARKER}Some prose.\n\n```json\n{allocation_json}\n```\n", encoding="utf-8")
+
+
+def test_build_past_outcome_lessons_empty_when_records_dir_missing(tmp_path):
+    missing = tmp_path / "does-not-exist"
+    assert build_past_outcome_lessons(fetch_current_price=lambda s: 100.0, records_dir=missing) == ""
+
+
+def test_build_past_outcome_lessons_empty_when_no_matching_files(tmp_path):
+    (tmp_path / "not_a_record.txt").write_text("irrelevant", encoding="utf-8")
+    assert build_past_outcome_lessons(fetch_current_price=lambda s: 100.0, records_dir=tmp_path) == ""
+
+
+def test_build_past_outcome_lessons_empty_when_no_json_allocation(tmp_path):
+    (tmp_path / "portfolio_suggestion_2026-08-09_120000.md").write_text(
+        f"{_STAGE3_MARKER}No JSON block here.\n", encoding="utf-8"
+    )
+    assert build_past_outcome_lessons(fetch_current_price=lambda s: 100.0, records_dir=tmp_path) == ""
+
+
+def test_build_past_outcome_lessons_computes_real_pct_change_and_stop_status(tmp_path):
+    _write_stage3_record(
+        tmp_path, '{"GOLD-DE26": {"pct": 10, "price": 3400.00, "stop_loss": 3300.00}, "CASH": 90}'
+    )
+    result = build_past_outcome_lessons(fetch_current_price=lambda s: 3434.0, records_dir=tmp_path)
+    assert "GOLD-DE26" in result
+    assert "+1.0%" in result
+    assert "stop not hit" in result
+
+
+def test_build_past_outcome_lessons_flags_a_breached_stop(tmp_path):
+    _write_stage3_record(
+        tmp_path, '{"GOLD-DE26": {"pct": 10, "price": 3400.00, "stop_loss": 3300.00}, "CASH": 90}'
+    )
+    result = build_past_outcome_lessons(fetch_current_price=lambda s: 3250.0, records_dir=tmp_path)
+    assert "STOP WOULD HAVE BEEN HIT" in result
+
+
+def test_build_past_outcome_lessons_skips_cash_and_symbols_missing_price_or_stop(tmp_path):
+    _write_stage3_record(
+        tmp_path,
+        '{"NOPRICE": {"pct": 5}, "GOLD-DE26": {"pct": 10, "price": 3400.00, "stop_loss": 3300.00}, "CASH": 85}',
+    )
+    calls = []
+
+    def fetch(symbol):
+        calls.append(symbol)
+        return 3400.0
+
+    result = build_past_outcome_lessons(fetch_current_price=fetch, records_dir=tmp_path)
+    assert calls == ["GOLD-DE26"]  # CASH and the price-less symbol never even queried
+    assert "NOPRICE" not in result
+
+
+def test_build_past_outcome_lessons_skips_symbol_price_cannot_be_fetched(tmp_path):
+    _write_stage3_record(
+        tmp_path, '{"GOLD-DE26": {"pct": 10, "price": 3400.00, "stop_loss": 3300.00}, "CASH": 90}'
+    )
+    result = build_past_outcome_lessons(fetch_current_price=lambda s: None, records_dir=tmp_path)
+    assert result == ""  # nothing could be re-priced — not fabricated
+
+
+def test_build_past_outcome_lessons_respects_max_symbols_per_session(tmp_path):
+    import json as _json
+
+    symbols = {f"SYM{i}": {"pct": 1, "price": 100.0, "stop_loss": 90.0} for i in range(5)}
+    symbols["CASH"] = 95
+    _write_stage3_record(tmp_path, _json.dumps(symbols))
+    result = build_past_outcome_lessons(
+        fetch_current_price=lambda s: 105.0, records_dir=tmp_path, max_symbols_per_session=2
+    )
+    assert result.count("SYM") == 2
+
+
+@patch("ai.portfolio_suggest.build_past_outcome_lessons", return_value="outcome text")
+@patch("ai.portfolio_suggest.build_past_audit_lessons", return_value="audit text")
+def test_build_past_lessons_combines_both_when_both_present(mock_audit_lessons, mock_outcome_lessons):
+    result = build_past_lessons(fetch_current_price=lambda s: 1.0)
+    assert "audit text" in result
+    assert "outcome text" in result
+
+
+@patch("ai.portfolio_suggest.build_past_outcome_lessons", return_value="")
+@patch("ai.portfolio_suggest.build_past_audit_lessons", return_value="audit text only")
+def test_build_past_lessons_omits_the_empty_half(mock_audit_lessons, mock_outcome_lessons):
+    assert build_past_lessons(fetch_current_price=lambda s: 1.0) == "audit text only"
+
+
+@patch("ai.portfolio_suggest.build_past_outcome_lessons", return_value="")
+@patch("ai.portfolio_suggest.build_past_audit_lessons", return_value="")
+def test_build_past_lessons_empty_when_both_empty(mock_audit_lessons, mock_outcome_lessons):
+    assert build_past_lessons(fetch_current_price=lambda s: 1.0) == ""
+
+
+@patch("ai.portfolio_suggest.fetch_price_history_ohlcv")
+@patch("ai.portfolio_suggest.resolve_yahoo_ticker")
+def test_fetch_current_pmex_price_returns_latest_close_over_a_short_fetch(mock_resolve, mock_history):
+    mock_resolve.return_value = ("Gold", "GC=F")
+    mock_history.return_value = _ohlc([100.0, 101.0, 102.5])
+    assert _fetch_current_pmex_price("GO10OZ") == 102.5
+    # Only the latest close is needed here — a much smaller/faster
+    # request than the 5y default used for backtests.
+    mock_history.assert_called_once_with("GC=F", period="5d")
+
+
+@patch("ai.portfolio_suggest.resolve_yahoo_ticker", return_value=None)
+def test_fetch_current_pmex_price_none_when_symbol_unresolvable(mock_resolve):
+    assert _fetch_current_pmex_price("UNKNOWN123") is None
+
+
+@patch("ai.portfolio_suggest.fetch_price_history_ohlcv")
+@patch("ai.portfolio_suggest.resolve_yahoo_ticker")
+def test_fetch_current_pmex_price_none_on_empty_history(mock_resolve, mock_history):
+    mock_resolve.return_value = ("Gold", "GC=F")
+    mock_history.return_value = _ohlc([])
+    assert _fetch_current_pmex_price("GO10OZ") is None
+
+
+@patch("ai.portfolio_suggest.build_past_lessons", return_value="PAST LESSONS TEXT")
+@patch("ai.portfolio_suggest.build_audit_block", return_value=_NO_AUDIT)
+@patch("ai.portfolio_suggest.run_claude")
+def test_suggest_portfolio_includes_past_lessons_in_stage1_draft_prompt(mock_run_claude, mock_audit, mock_lessons):
+    mock_run_claude.side_effect = ["draft", "final"]
+    suggest_portfolio("some summary")
+    draft_prompt = mock_run_claude.call_args_list[0].args[0]
+    assert "PAST LESSONS TEXT" in draft_prompt
+
+
+@patch("ai.portfolio_suggest.build_past_lessons", return_value="PAST LESSONS TEXT")
+@patch("ai.portfolio_suggest.build_audit_block")
+@patch("ai.portfolio_suggest.run_claude")
+def test_suggest_portfolio_passes_past_lessons_into_build_audit_block(mock_run_claude, mock_audit, mock_lessons):
+    mock_run_claude.side_effect = ["draft", "final"]
+    mock_audit.return_value = _NO_AUDIT
+    suggest_portfolio("some summary")
+    _, kwargs = mock_audit.call_args
+    assert kwargs["past_lessons"] == "PAST LESSONS TEXT"
+
+
+@patch("ai.portfolio_suggest.build_past_lessons", return_value="")
+@patch("ai.portfolio_suggest.build_audit_block", return_value=_NO_AUDIT)
+@patch("ai.portfolio_suggest.run_claude")
+def test_suggest_portfolio_draft_prompt_unchanged_when_no_past_lessons(mock_run_claude, mock_audit, mock_lessons):
+    mock_run_claude.side_effect = ["draft", "final"]
+    suggest_portfolio("some summary")
+    draft_prompt = mock_run_claude.call_args_list[0].args[0]
+    assert draft_prompt == f"{build_stage1_instruction()}\n\nsome summary"
+
+
+@patch("ai.portfolio_suggest.build_past_lessons", return_value="PAST LESSONS TEXT")
+@patch("ai.portfolio_suggest.build_audit_block", return_value=_NO_AUDIT)
+@patch("ai.portfolio_suggest.run_claude")
+def test_suggest_portfolio_includes_past_lessons_in_fallback_retry_prompt(mock_run_claude, mock_audit, mock_lessons):
+    fallback_failure = f"{CLI_FAILED_PREFIX} (no conversation found)."
+    mock_run_claude.side_effect = ["draft", fallback_failure, "final after retry"]
+    suggest_portfolio("some summary")
+    retry_prompt = mock_run_claude.call_args_list[2].args[0]
+    assert "PAST LESSONS TEXT" in retry_prompt
 
 
 @patch("ai.portfolio_suggest.get_openrouter_audit", return_value="a fine audit")
@@ -1192,6 +1546,55 @@ def test_run_audit_with_retry_sets_gave_up_status(mock_audit, mock_sleep):
     assert status_map["Label"].attempt == 2  # 120 // 60 = 2 max attempts
 
 
+@patch("ai.portfolio_suggest.run_copilot", return_value="SUPPORTED: verified live.")
+def test_run_copilot_with_status_marks_succeeded(mock_run_copilot):
+    status_map = {}
+    draft = "Draft.\n\n## External Research Notes\n- A claim — Source."
+    result = _run_copilot_with_status(draft, status_map)
+    assert result == "SUPPORTED: verified live."
+    assert status_map["Copilot CLI"].state == "succeeded"
+    assert status_map["Copilot CLI"].detail is None
+
+
+@patch("ai.portfolio_suggest.run_copilot", return_value=COPILOT_MISSING_MESSAGE)
+def test_run_copilot_with_status_marks_gave_up_on_failure(mock_run_copilot):
+    status_map = {}
+    draft = "Draft.\n\n## External Research Notes\n- A claim — Source."
+    _run_copilot_with_status(draft, status_map)
+    assert status_map["Copilot CLI"].state == "gave_up"
+
+
+def test_run_copilot_with_status_records_the_real_failure_reason():
+    real_reason = f"{COPILOT_FAILED_PREFIX} (the `copilot` CLI exited with code 1: rate limited)."
+    status_map = {}
+    draft = "Draft.\n\n## External Research Notes\n- A claim — Source."
+    with patch("ai.portfolio_suggest.run_copilot", return_value=real_reason):
+        _run_copilot_with_status(draft, status_map)
+    assert status_map["Copilot CLI"].detail == real_reason
+
+
+def test_format_audit_progress_includes_the_gave_up_detail_when_present():
+    status_map = {
+        "Copilot CLI": ModelAuditStatus(
+            state="gave_up", attempt=1, max_attempts=1,
+            detail=f"{COPILOT_FAILED_PREFIX} (timed out after 240s).",
+        ),
+    }
+    text = _format_audit_progress(status_map)
+    assert "timed out after 240s" in text
+
+
+@patch("ai.portfolio_suggest.run_copilot")
+def test_run_copilot_with_status_succeeds_without_calling_copilot_when_no_notes(mock_run_copilot):
+    # The zero-subprocess guard still applies — no notes section means no
+    # real CLI call, but the status still resolves to a real terminal state.
+    status_map = {}
+    result = _run_copilot_with_status("Draft with no notes section.", status_map)
+    mock_run_copilot.assert_not_called()
+    assert status_map["Copilot CLI"].state == "succeeded"
+    assert "nothing to independently verify" in result
+
+
 def test_format_audit_progress_counts_and_lists_each_state():
     status_map = {
         "A": ModelAuditStatus(state="succeeded", attempt=1, max_attempts=10),
@@ -1212,10 +1615,52 @@ def test_format_audit_progress_counts_and_lists_each_state():
 @patch("ai.portfolio_suggest.time.sleep")
 @patch("ai.portfolio_suggest.get_openrouter_audit", return_value="an audit")
 def test_build_audit_block_calls_on_progress_and_reports_final_completion(mock_audit, mock_sleep):
+    # +1 for Copilot CLI, which gets its own tracked status_map entry
+    # alongside the OpenRouter pool — "draft" has no External Research
+    # Notes section, so Copilot's own zero-subprocess guard fires and it
+    # completes instantly, without a real CLI call.
     progress_calls = []
     build_audit_block("summary", "draft", on_progress=progress_calls.append)
     assert progress_calls
-    assert f"{len(AUDIT_MODELS)}/{len(AUDIT_MODELS)} models completed" in progress_calls[-1]
+    total = len(AUDIT_MODELS) + 1
+    assert f"{total}/{total} models completed" in progress_calls[-1]
+    assert "Copilot CLI" in progress_calls[-1]
+
+
+def test_build_audit_block_keeps_polling_while_copilot_is_still_running():
+    # The actual bug being fixed: previously the polling loop's exit
+    # condition only watched the 10 OpenRouter futures — if Copilot was
+    # still running after all of them finished, on_progress simply
+    # stopped being called, and the UI froze on a stale "10/10 complete"
+    # render while Copilot kept working invisibly underneath it. Here
+    # Copilot genuinely takes longer (a real short sleep) than the
+    # instant-mocked OpenRouter calls, so a correct fix must show at
+    # least one progress render with Copilot still "in progress".
+    import time as real_time
+
+    def _slow_copilot(prompt, timeout=None):
+        real_time.sleep(0.3)
+        return "SUPPORTED: verified live."
+
+    progress_calls = []
+    draft = "Draft.\n\n## External Research Notes\n- A claim — Source."
+    with patch("ai.portfolio_suggest.get_openrouter_audit", return_value="an audit"), \
+         patch("ai.portfolio_suggest.run_copilot", side_effect=_slow_copilot), \
+         patch("ai.portfolio_suggest.time.sleep"):  # only the polling/retry sleep, not the real one above
+        build_audit_block("summary", draft, on_progress=progress_calls.append)
+
+    # At least one render must show every OpenRouter model already
+    # succeeded while Copilot has NOT (whichever of "waiting to start" or
+    # "waiting for response" its worker thread had reached by then — a
+    # real, harmless scheduling race, not something worth pinning down
+    # more precisely than "visibly not finished yet").
+    assert any(
+        f"{len(AUDIT_MODELS)}/{len(AUDIT_MODELS) + 1} models completed" in call
+        and "Copilot CLI — audit received" not in call
+        for call in progress_calls
+    )
+    # And it does eventually finish and get reported.
+    assert "Copilot CLI — audit received" in progress_calls[-1]
 
 
 def test_build_audit_block_without_on_progress_still_works():

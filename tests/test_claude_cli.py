@@ -68,6 +68,36 @@ def test_run_claude_adds_model_flag_when_given(mock_which, mock_popen):
 
 @patch("ai.claude_cli.subprocess.Popen")
 @patch("ai.claude_cli.shutil.which", return_value=r"C:\fake\claude.CMD")
+def test_run_claude_adds_session_id_flag_when_given(mock_which, mock_popen):
+    mock_popen.return_value = _mock_process()
+    run_claude("some prompt", session_id="abc-123")
+    called_args = mock_popen.call_args.args[0]
+    assert called_args == [r"C:\fake\claude.CMD", "-p", "--session-id", "abc-123"]
+
+
+@patch("ai.claude_cli.subprocess.Popen")
+@patch("ai.claude_cli.shutil.which", return_value=r"C:\fake\claude.CMD")
+def test_run_claude_adds_resume_flag_when_given(mock_which, mock_popen):
+    mock_popen.return_value = _mock_process()
+    run_claude("some prompt", resume_session_id="abc-123")
+    called_args = mock_popen.call_args.args[0]
+    assert called_args == [r"C:\fake\claude.CMD", "-p", "--resume", "abc-123"]
+
+
+@patch("ai.claude_cli.subprocess.Popen")
+@patch("ai.claude_cli.shutil.which", return_value=r"C:\fake\claude.CMD")
+def test_run_claude_prefers_resume_over_session_id_when_both_given(mock_which, mock_popen):
+    # A call is either starting a session or continuing one, not both —
+    # resume takes priority if a caller somehow passes both.
+    mock_popen.return_value = _mock_process()
+    run_claude("some prompt", session_id="new-id", resume_session_id="existing-id")
+    called_args = mock_popen.call_args.args[0]
+    assert called_args == [r"C:\fake\claude.CMD", "-p", "--resume", "existing-id"]
+    assert "new-id" not in called_args
+
+
+@patch("ai.claude_cli.subprocess.Popen")
+@patch("ai.claude_cli.shutil.which", return_value=r"C:\fake\claude.CMD")
 def test_run_claude_falls_back_on_nonzero_exit_with_stderr_detail(mock_which, mock_popen):
     process = _mock_process(returncode=1, stdout="")
     process.communicate.return_value = ("", "Error: rate limit exceeded")

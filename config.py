@@ -61,6 +61,18 @@ OPENROUTER_TIMEOUT_SECONDS = int(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "90"))
 AUDIT_RETRY_INTERVAL_SECONDS = int(os.getenv("AUDIT_RETRY_INTERVAL_SECONDS", "60"))
 AUDIT_RETRY_TIMEOUT_SECONDS = int(os.getenv("AUDIT_RETRY_TIMEOUT_SECONDS", "600"))
 
+# GitHub Copilot CLI runs one extra audit-pool voice alongside the 10
+# OpenRouter models — the only one with real live web access, used to
+# independently fact-check the draft's own "External Research Notes"
+# list (see ai/copilot_cli.py, build_copilot_verification). Live-verified
+# it has no dedicated search-engine tool (only web_fetch/curl), so a
+# bounded few-claim check can take a couple of minutes of trial-and-error
+# fetching — no retry loop here (unlike AUDIT_RETRY_*): this runs against
+# the user's own authenticated account, not OpenRouter's shared free-tier
+# pool, so a failure is more likely a genuine timeout than transient
+# contention worth retrying.
+COPILOT_VERIFICATION_TIMEOUT_SECONDS = int(os.getenv("COPILOT_VERIFICATION_TIMEOUT_SECONDS", "240"))
+
 # Local folder where each Portfolio Suggestion run's full transcript (input
 # data, Claude's draft, the audit reports, Claude's final answer) gets
 # saved as a Markdown file, like minutes of a meeting, for future reference.
@@ -113,3 +125,61 @@ MAX_PSX_ENRICHED_ASSETS = int(os.getenv("MAX_PSX_ENRICHED_ASSETS", "20"))
 # markets' failure modes (roll yield/margin vs. dividend/circuit-breaker/
 # free-float risk) don't meaningfully transfer between each other.
 PSX_RECORDS_DIR = os.getenv("PSX_RECORDS_DIR", "records/psx")
+
+# --- FTMO (prop-firm 1-Stage Challenge, demo account) ---
+# A second real MT5 account, added inside the SAME terminal application as
+# the original PMEX account (confirmed with the user) — so it reuses
+# MT5_PATH (same terminal.exe) but needs its own login/password/server,
+# since the MetaTrader5 Python package supports only one active connection
+# per process at a time (see data/mt5_source.py::connect's own docstring
+# for the live-verified detail). Deliberately unprefixed MT5_PATH/prefixed
+# FTMO_MT5_LOGIN etc. mirrors this codebase's existing convention: PMEX is
+# the implicit original unprefixed account, PSX/FTMO are the parallel
+# `{NAME}_`-prefixed additions.
+FTMO_MT5_LOGIN = os.getenv("FTMO_MT5_LOGIN")
+FTMO_MT5_PASSWORD = os.getenv("FTMO_MT5_PASSWORD")
+FTMO_MT5_SERVER = os.getenv("FTMO_MT5_SERVER")
+
+# Separate from PORTFOLIO_RECORDS_DIR/PSX_RECORDS_DIR for the same reason
+# PSX has its own — FTMO's failure modes (prop-firm daily-loss/trailing-
+# max-loss/Best-Day-Rule compliance) don't meaningfully transfer to either
+# PMEX or PSX's own past-audit lessons.
+FTMO_RECORDS_DIR = os.getenv("FTMO_RECORDS_DIR", "records/ftmo")
+
+# Real, round-turn commission rates by asset category — MT5's API has no
+# commission field at all (confirmed live: neither symbol_info() nor
+# account_info() exposes one), so unlike everything else in
+# data/mt5_source.py::get_trade_economics, this can't be fetched live and
+# has to be entered here from what's actually visible in the terminal's
+# own Symbol Specification window. FX and metals/commodities rates are
+# independently confirmed against FTMO's own official trading-update
+# blog post (both quoted PER SIDE there, doubled below to round-turn);
+# crypto is the user's own terminal reading only, ASSUMED per-side like
+# the rest of FTMO's schedule (not independently confirmed — flag this
+# if it turns out to be wrong). Indices carry zero commission per FTMO's
+# own "Zero Commissions on Indices" post — handled directly in
+# ai/ftmo_suggest.py's category lookup, not as a config value here, since
+# it's a structural fact of the fee schedule rather than a rate that
+# might need per-deployment tuning.
+FTMO_COMMISSION_FX_USD_PER_LOT_ROUND_TURN = float(
+    os.getenv("FTMO_COMMISSION_FX_USD_PER_LOT_ROUND_TURN", "5.00")
+)
+FTMO_COMMISSION_METALS_COMMODITIES_PCT_ROUND_TURN = float(
+    os.getenv("FTMO_COMMISSION_METALS_COMMODITIES_PCT_ROUND_TURN", "0.0014")
+)
+FTMO_COMMISSION_CRYPTO_PCT_ROUND_TURN = float(
+    os.getenv("FTMO_COMMISSION_CRYPTO_PCT_ROUND_TURN", "0.0650")
+)
+
+# Overrides for risk/rebalance.py's generic MAX_POSITION_COUNT/
+# MAX_SYMBOL_EXPOSURE_PCT, specific to FTMO (by explicit user request):
+# unlike PMEX's single-market futures book, FTMO's account is meant to
+# genuinely diversify across several distinct asset categories (forex,
+# metals, commodities/agriculturals, indices, crypto where offered) at
+# roughly 1-2 instruments each — that alone can reach 8-10 positions,
+# above PMEX's own MAX_POSITION_COUNT=6 default. The per-symbol exposure
+# cap is tightened rather than reused as-is, since a wider, more-diversified
+# book should also mean no single name dominates it as much as PMEX's
+# narrower one might reasonably allow.
+FTMO_MAX_POSITION_COUNT = int(os.getenv("FTMO_MAX_POSITION_COUNT", "10"))
+FTMO_MAX_SYMBOL_EXPOSURE_PCT = float(os.getenv("FTMO_MAX_SYMBOL_EXPOSURE_PCT", "20"))

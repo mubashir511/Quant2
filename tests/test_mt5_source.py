@@ -1,10 +1,22 @@
 import logging
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
 import pytest
 
 import config
-from data.mt5_source import _ensure_symbol_selected, get_contract_spec, get_market_watch
+from data.mt5_source import (
+    MT5ConnectionError,
+    _ensure_symbol_selected,
+    connect,
+    fetch_mt5_price_history,
+    get_contract_spec,
+    get_history_deals,
+    get_market_watch,
+    get_trade_economics,
+    is_trading_permitted,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -203,6 +215,218 @@ def test_get_contract_spec_csv_fallback_logs_and_returns_none_when_file_missing(
     assert "does_not_exist.csv" in caplog.text
 
 
+@patch("MetaTrader5.order_calc_margin", return_value=1156.95)
+@patch("MetaTrader5.symbol_info_tick")
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info")
+def test_get_contract_spec_falls_back_to_order_calc_margin_when_margin_initial_is_zero(
+    mock_symbol_info, mock_select, mock_tick, mock_calc_margin
+):
+    # Confirmed live on a real FTMO account: FOREX-calc-mode symbols
+    # (e.g. EURUSD) always report margin_initial=0 via symbol_info() —
+    # that field only carries a real number for futures-style calc
+    # modes. Without this fallback, compute_rebalance_plan treats
+    # margin_initial<=0 as "no spec available" and marks the symbol
+    # infeasible, silently breaking Apply Suggestion for every forex/
+    # CFD instrument.
+    mock_info = MagicMock()
+    mock_info.volume_min = 0.01
+    mock_info.volume_step = 0.01
+    mock_info.volume_max = 500.0
+    mock_info.trade_contract_size = 100000.0
+    mock_info.currency_margin = "USD"
+    mock_info.margin_initial = 0.0
+    mock_symbol_info.return_value = mock_info
+    mock_tick.return_value = _make_tick(1.15689, 1.15695)
+
+    spec = get_contract_spec("EURUSD")
+
+    assert spec is not None
+    assert spec.margin_initial == pytest.approx(1156.95)
+    mock_calc_margin.assert_called_once()
+    # Buy-side margin, 1.0 lot, at the live ask (not bid) — matches
+    # "margin required for 1.0 lot" ContractSpec's own docstring meaning.
+    args, kwargs = mock_calc_margin.call_args
+    assert args[1] == "EURUSD"
+    assert args[2] == 1.0
+    assert args[3] == pytest.approx(1.15695)
+
+
+@patch("MetaTrader5.symbol_info_tick", return_value=None)
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info")
+def test_get_contract_spec_margin_zero_when_order_calc_margin_has_no_tick(
+    mock_symbol_info, mock_select, mock_tick
+):
+    mock_info = MagicMock()
+    mock_info.volume_min = 0.01
+    mock_info.volume_step = 0.01
+    mock_info.volume_max = 500.0
+    mock_info.trade_contract_size = 100000.0
+    mock_info.currency_margin = "USD"
+    mock_info.margin_initial = 0.0
+    mock_symbol_info.return_value = mock_info
+
+    spec = get_contract_spec("EURUSD")
+
+    assert spec is not None
+    assert spec.margin_initial == 0.0
+
+
+@patch("MetaTrader5.order_calc_margin", return_value=None)
+@patch("MetaTrader5.last_error", return_value=(-2, "calc failed"))
+@patch("MetaTrader5.symbol_info_tick")
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info")
+def test_get_contract_spec_margin_zero_when_order_calc_margin_returns_none(
+    mock_symbol_info, mock_select, mock_tick, mock_last_error, mock_calc_margin, caplog
+):
+    mock_info = MagicMock()
+    mock_info.volume_min = 0.01
+    mock_info.volume_step = 0.01
+    mock_info.volume_max = 500.0
+    mock_info.trade_contract_size = 100000.0
+    mock_info.currency_margin = "USD"
+    mock_info.margin_initial = 0.0
+    mock_symbol_info.return_value = mock_info
+    mock_tick.return_value = _make_tick(1.15689, 1.15695)
+
+    with caplog.at_level(logging.WARNING):
+        spec = get_contract_spec("EURUSD")
+
+    assert spec is not None
+    assert spec.margin_initial == 0.0
+    assert "calc failed" in caplog.text
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info")
+def test_get_contract_spec_does_not_call_order_calc_margin_when_margin_initial_is_nonzero(
+    mock_symbol_info, mock_select,
+):
+    # PMEX's own futures contracts already report a real margin_initial —
+    # the fallback must not fire (and must not need a tick) when the
+    # direct field is already usable.
+    mock_info = MagicMock()
+    mock_info.volume_min = 1.0
+    mock_info.volume_step = 1.0
+    mock_info.volume_max = 1.0
+    mock_info.trade_contract_size = 100.0
+    mock_info.currency_margin = "PKR"
+    mock_info.margin_initial = 140500.0
+    mock_symbol_info.return_value = mock_info
+
+    with patch("MetaTrader5.order_calc_margin") as mock_calc_margin:
+        spec = get_contract_spec("SP500-SE26")
+
+    assert spec.margin_initial == 140500.0
+    mock_calc_margin.assert_not_called()
+
+
+def _make_forex_info(**overrides):
+    # Real values confirmed live against FTMO's own EURUSD.
+    info = MagicMock()
+    info.point = 1e-05
+    info.trade_tick_size = 1e-05
+    info.trade_tick_value = 1.0
+    info.trade_contract_size = 100000.0
+    info.swap_long = -8.74
+    info.swap_short = 0.37
+    info.swap_mode = 1  # SYMBOL_SWAP_MODE_POINTS
+    info.path = "Forex\\Majors\\EURUSD"
+    for k, v in overrides.items():
+        setattr(info, k, v)
+    return info
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info_tick")
+@patch("MetaTrader5.symbol_info")
+def test_get_trade_economics_points_swap_mode_matches_real_ftmo_eurusd(
+    mock_symbol_info, mock_tick, mock_select
+):
+    mock_symbol_info.return_value = _make_forex_info()
+    mock_tick.return_value = _make_tick(1.15689, 1.15695)
+
+    cost = get_trade_economics("EURUSD")
+
+    assert cost is not None
+    assert cost.category == "Forex"
+    assert cost.spread_pct_of_price == pytest.approx((1.15695 - 1.15689) / 1.15695 * 100)
+    # -8.74 points * $1.00/point / (100000 * 1.15695 notional) * 100
+    assert cost.swap_long_pct_per_day == pytest.approx(-8.74 / 115695.0 * 100, rel=1e-6)
+    assert cost.swap_short_pct_per_day == pytest.approx(0.37 / 115695.0 * 100, rel=1e-6)
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info_tick")
+@patch("MetaTrader5.symbol_info")
+def test_get_trade_economics_interest_swap_mode_matches_real_ftmo_btcusd(
+    mock_symbol_info, mock_tick, mock_select
+):
+    # Real values confirmed live against FTMO's own BTCUSD — a DIFFERENT
+    # swap_mode than EURUSD's on the very same account, the whole reason
+    # _compute_swap_pct_per_day can't apply one formula to everything.
+    info = _make_forex_info(
+        swap_long=-30.0, swap_short=-30.0, swap_mode=5, path="Crypto I CFD\\BTCUSD"  # INTEREST_CURRENT
+    )
+    mock_symbol_info.return_value = info
+    mock_tick.return_value = _make_tick(63067.26, 63068.26)
+
+    cost = get_trade_economics("BTCUSD")
+
+    assert cost is not None
+    assert cost.category == "Crypto I CFD"
+    # Annual % rate accrued daily on the standard 360-day basis.
+    assert cost.swap_long_pct_per_day == pytest.approx(-30.0 / 360, rel=1e-6)
+    assert cost.swap_short_pct_per_day == pytest.approx(-30.0 / 360, rel=1e-6)
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info_tick")
+@patch("MetaTrader5.symbol_info")
+def test_get_trade_economics_unsupported_swap_mode_returns_none_swap_not_fabricated(
+    mock_symbol_info, mock_tick, mock_select
+):
+    info = _make_forex_info(swap_mode=2)  # SYMBOL_SWAP_MODE_CURRENCY_SYMBOL — not implemented
+    mock_symbol_info.return_value = info
+    mock_tick.return_value = _make_tick(1.15689, 1.15695)
+
+    cost = get_trade_economics("EURUSD")
+
+    assert cost is not None  # spread is still real and usable
+    assert cost.swap_long_pct_per_day is None
+    assert cost.swap_short_pct_per_day is None
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info_tick")
+@patch("MetaTrader5.symbol_info")
+def test_get_trade_economics_uncategorized_when_path_missing(mock_symbol_info, mock_tick, mock_select):
+    mock_symbol_info.return_value = _make_forex_info(path="")
+    mock_tick.return_value = _make_tick(1.15689, 1.15695)
+
+    cost = get_trade_economics("EURUSD")
+
+    assert cost.category == "Uncategorized"
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info_tick", return_value=None)
+@patch("MetaTrader5.symbol_info")
+def test_get_trade_economics_none_when_no_tick(mock_symbol_info, mock_tick, mock_select):
+    mock_symbol_info.return_value = _make_forex_info()
+    assert get_trade_economics("EURUSD") is None
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info_tick")
+@patch("MetaTrader5.symbol_info", return_value=None)
+def test_get_trade_economics_none_when_no_symbol_info(mock_symbol_info, mock_tick, mock_select):
+    mock_tick.return_value = _make_tick(1.0, 1.0)
+    assert get_trade_economics("UNKNOWN") is None
+
+
 def _make_symbol(name, description="desc", visible=True):
     s = MagicMock()
     s.name = name
@@ -301,3 +525,219 @@ def test_get_market_watch_logs_when_select_fails_but_still_tries_the_tick(
     assert len(assets) == 1  # select failing (even after retries) doesn't block a working tick
     assert "SP500-SE26" in caplog.text
     assert "select failed" in caplog.text
+
+
+def _make_account_info(login, server):
+    info = MagicMock()
+    info.login = login
+    info.server = server
+    return info
+
+
+@patch("MetaTrader5.account_info")
+@patch("MetaTrader5.initialize", return_value=True)
+def test_connect_uses_config_defaults_when_no_args(mock_initialize, mock_account_info):
+    mock_account_info.return_value = _make_account_info(12345, "Broker-Demo")
+    with patch.object(config, "MT5_LOGIN", "12345"), patch.object(config, "MT5_SERVER", "Broker-Demo"):
+        connect()
+    assert mock_initialize.call_args.kwargs.get("login") == 12345
+    assert mock_initialize.call_args.kwargs.get("server") == "Broker-Demo"
+
+
+@patch("MetaTrader5.account_info")
+@patch("MetaTrader5.initialize", return_value=True)
+def test_connect_overrides_config_with_explicit_args(mock_initialize, mock_account_info):
+    mock_account_info.return_value = _make_account_info(999, "FTMO-Demo")
+
+    connect(login=999, password="pw", server="FTMO-Demo", path="C:/ftmo/terminal64.exe")
+
+    assert mock_initialize.call_args.kwargs == {
+        "path": "C:/ftmo/terminal64.exe",
+        "login": 999,
+        "password": "pw",
+        "server": "FTMO-Demo",
+    }
+
+
+@patch("MetaTrader5.last_error", return_value=(-1, "terminal not found"))
+@patch("MetaTrader5.initialize", return_value=False)
+def test_connect_raises_when_initialize_fails(mock_initialize, mock_last_error):
+    with pytest.raises(MT5ConnectionError, match="terminal not found"):
+        connect(login=999, password="pw", server="FTMO-Demo")
+
+
+@patch("MetaTrader5.account_info", return_value=None)
+@patch("MetaTrader5.initialize", return_value=True)
+def test_connect_raises_when_account_info_missing_after_login(mock_initialize, mock_account_info):
+    with pytest.raises(MT5ConnectionError, match="could not verify"):
+        connect(login=999, password="pw", server="FTMO-Demo")
+
+
+@patch("MetaTrader5.account_info")
+@patch("MetaTrader5.initialize", return_value=True)
+def test_connect_raises_on_stale_login_mismatch(mock_initialize, mock_account_info):
+    # This is the real failure mode the research flagged: mt5.initialize()
+    # can "succeed" while still leaving the *previous* account connected.
+    mock_account_info.return_value = _make_account_info(111, "PMEX-Live")
+
+    with pytest.raises(MT5ConnectionError, match="DIFFERENT account"):
+        connect(login=999, password="pw", server="FTMO-Demo")
+
+
+@patch("MetaTrader5.account_info")
+@patch("MetaTrader5.initialize", return_value=True)
+def test_connect_raises_on_server_mismatch(mock_initialize, mock_account_info):
+    mock_account_info.return_value = _make_account_info(999, "SomeOtherServer")
+
+    with pytest.raises(MT5ConnectionError, match="mismatched account"):
+        connect(login=999, password="pw", server="FTMO-Demo")
+
+
+@patch("MetaTrader5.account_info")
+@patch("MetaTrader5.initialize", return_value=True)
+def test_connect_skips_verification_when_no_login_given(mock_initialize, mock_account_info):
+    with patch.object(config, "MT5_LOGIN", None), patch.object(config, "MT5_SERVER", None):
+        connect()
+    mock_account_info.assert_not_called()
+
+
+def _make_deal(ticket, time, symbol, profit, swap, commission, volume):
+    d = MagicMock()
+    d.ticket = ticket
+    d.time = time
+    d.symbol = symbol
+    d.profit = profit
+    d.swap = swap
+    d.commission = commission
+    d.volume = volume
+    return d
+
+
+@patch("MetaTrader5.history_deals_get")
+def test_get_history_deals_sums_profit_swap_and_commission(mock_history):
+    ts = int(datetime(2026, 8, 10, 12, 0, 0).timestamp())
+    mock_history.return_value = [_make_deal(1, ts, "EURUSD", 50.0, -1.5, -2.0, 0.5)]
+
+    deals = get_history_deals(datetime(2026, 8, 1), datetime(2026, 8, 15))
+
+    assert len(deals) == 1
+    assert deals[0].symbol == "EURUSD"
+    assert deals[0].profit == pytest.approx(46.5)  # 50.0 - 1.5 - 2.0
+    assert deals[0].volume == 0.5
+
+
+@patch("MetaTrader5.last_error", return_value=(-2, "not connected"))
+@patch("MetaTrader5.history_deals_get", return_value=None)
+def test_get_history_deals_empty_on_failure(mock_history, mock_last_error, caplog):
+    with caplog.at_level(logging.WARNING):
+        deals = get_history_deals(datetime(2026, 8, 1))
+    assert deals == []
+    assert "not connected" in caplog.text
+
+
+@patch("MetaTrader5.history_deals_get", return_value=[])
+def test_get_history_deals_empty_for_fresh_account(mock_history):
+    # A brand-new account (e.g. a fresh FTMO Challenge) with zero trade
+    # history is a normal, expected case, not a failure.
+    assert get_history_deals(datetime(2026, 8, 1)) == []
+
+
+def _make_rate(t, o, h, l, c, tick_volume):
+    return (t, o, h, l, c, tick_volume, 0, 0)
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.copy_rates_from_pos")
+def test_fetch_mt5_price_history_shapes_dataframe(mock_copy_rates, mock_select):
+    import numpy as np
+
+    dtype = np.dtype(
+        [
+            ("time", "i8"), ("open", "f8"), ("high", "f8"), ("low", "f8"),
+            ("close", "f8"), ("tick_volume", "i8"), ("spread", "i4"), ("real_volume", "i8"),
+        ]
+    )
+    ts = int(datetime(2026, 8, 10, 12, 0, 0).timestamp())
+    rates = np.array([_make_rate(ts, 1.1, 1.2, 1.05, 1.15, 1000)], dtype=dtype)
+    mock_copy_rates.return_value = rates
+
+    df = fetch_mt5_price_history("EURUSD", "H1", count=1)
+
+    assert list(df.columns) == ["Open", "High", "Low", "Close", "Volume"]
+    assert df.iloc[0]["Open"] == pytest.approx(1.1)
+    assert df.iloc[0]["Close"] == pytest.approx(1.15)
+    assert df.iloc[0]["Volume"] == pytest.approx(1000.0)
+    assert isinstance(df.index, pd.DatetimeIndex)
+    mock_select.assert_called_once_with("EURUSD", True)
+
+
+@patch("MetaTrader5.last_error", return_value=(-2, "no history"))
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.copy_rates_from_pos", return_value=None)
+def test_fetch_mt5_price_history_empty_on_no_data(mock_copy_rates, mock_select, mock_last_error, caplog):
+    with caplog.at_level(logging.WARNING):
+        df = fetch_mt5_price_history("UNKNOWN", "D1")
+    assert df.empty
+    assert list(df.columns) == ["Open", "High", "Low", "Close", "Volume"]
+    assert "UNKNOWN" in caplog.text
+    assert "no history" in caplog.text
+
+
+def test_fetch_mt5_price_history_rejects_unsupported_timeframe():
+    with pytest.raises(ValueError, match="Unsupported timeframe"):
+        fetch_mt5_price_history("EURUSD", "M15")
+
+
+def _make_terminal_info(trade_allowed=True):
+    info = MagicMock()
+    info.trade_allowed = trade_allowed
+    return info
+
+
+def _make_account_info_for_trading(trade_allowed=True):
+    info = MagicMock()
+    info.trade_allowed = trade_allowed
+    return info
+
+
+@patch("MetaTrader5.account_info")
+@patch("MetaTrader5.terminal_info")
+def test_is_trading_permitted_true_when_both_flags_allow_it(mock_terminal, mock_account):
+    mock_terminal.return_value = _make_terminal_info(trade_allowed=True)
+    mock_account.return_value = _make_account_info_for_trading(trade_allowed=True)
+    permitted, reason = is_trading_permitted()
+    assert permitted is True
+    assert reason == ""
+
+
+@patch("MetaTrader5.account_info")
+@patch("MetaTrader5.terminal_info")
+def test_is_trading_permitted_false_when_terminal_autotrading_is_off(mock_terminal, mock_account):
+    # Confirmed live: this exact condition (terminal_info().trade_allowed
+    # False) silently caused every real order_send() to fail — the
+    # actual root cause behind an "Apply Suggestion doesn't work" report
+    # that turned out to have nothing to do with the plan's own math.
+    mock_terminal.return_value = _make_terminal_info(trade_allowed=False)
+    mock_account.return_value = _make_account_info_for_trading(trade_allowed=True)
+    permitted, reason = is_trading_permitted()
+    assert permitted is False
+    assert "AutoTrading" in reason
+
+
+@patch("MetaTrader5.account_info")
+@patch("MetaTrader5.terminal_info")
+def test_is_trading_permitted_false_when_account_itself_not_permitted(mock_terminal, mock_account):
+    mock_terminal.return_value = _make_terminal_info(trade_allowed=True)
+    mock_account.return_value = _make_account_info_for_trading(trade_allowed=False)
+    permitted, reason = is_trading_permitted()
+    assert permitted is False
+    assert "not currently permitted" in reason
+
+
+@patch("MetaTrader5.account_info", return_value=None)
+@patch("MetaTrader5.terminal_info")
+def test_is_trading_permitted_false_when_info_unavailable(mock_terminal, mock_account):
+    mock_terminal.return_value = _make_terminal_info(trade_allowed=True)
+    permitted, reason = is_trading_permitted()
+    assert permitted is False
+    assert reason != ""

@@ -33,6 +33,16 @@ def get_account_summary() -> AccountSummary:
     return AccountSummary(balance=10000.0, equity=9903.0, free_margin=8500.0, currency="USD")
 
 
+def get_history_deals(date_from: datetime, date_to: datetime | None = None) -> list:
+    """No synthetic trade history is modeled here — an empty list is
+    exactly data/mt5_source.py's own real "no history" contract too (a
+    fresh account with zero trades is a normal, expected case there), so
+    FTMO's compliance-status reconstruction (risk/ftmo_rules.py) degrades
+    cleanly to its documented zero-history case under mock data instead
+    of crashing for lack of a mock implementation."""
+    return []
+
+
 def get_market_watch() -> list[MarketAsset]:
     """Synthetic Market Watch instruments for offline dev/testing."""
     return [
