@@ -2,7 +2,7 @@ import csv
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 
@@ -68,6 +68,17 @@ class Position:
     @property
     def notional(self) -> float:
         return self.volume * self.price_current
+
+
+@dataclass
+class PendingOrder:
+    symbol: str
+    volume: float
+    order_type: str  # e.g. "buy limit", "sell stop"
+    price_open: float  # the trigger price (limit/stop level)
+    sl: float | None
+    tp: float | None
+    ticket: int = 0
 
 
 @dataclass
@@ -232,6 +243,108 @@ def get_open_positions() -> list[Position]:
             )
         )
     return positions
+
+
+_ORDER_TYPE_LABELS = {
+    2: "buy limit",
+    3: "sell limit",
+    4: "buy stop",
+    5: "sell stop",
+    6: "buy stop limit",
+    7: "sell stop limit",
+}
+
+
+def get_pending_orders() -> list[PendingOrder]:
+    """Working orders not yet filled (limit/stop orders) — distinct from
+    get_open_positions(), which only returns already-filled positions.
+    MT5 keeps these as two separate concepts; a symbol can have a real,
+    live pending order sitting on the account with zero effect on
+    positions_get() until price actually reaches it."""
+    import MetaTrader5 as mt5
+
+    raw = mt5.orders_get()
+    if raw is None:
+        error = mt5.last_error()
+        raise MT5ConnectionError(f"Failed to fetch pending orders ({error}).")
+
+    orders = []
+    for o in raw:
+        orders.append(
+            PendingOrder(
+                symbol=o.symbol,
+                volume=o.volume_current,
+                order_type=_ORDER_TYPE_LABELS.get(o.type, f"type {o.type}"),
+                price_open=o.price_open,
+                sl=o.sl if o.sl else None,
+                tp=o.tp if o.tp else None,
+                ticket=o.ticket,
+            )
+        )
+    return orders
+
+
+def get_current_price(symbol: str) -> float | None:
+    """Live mid price for a single symbol — used to show a pending
+    order's current market price alongside its trigger price, without
+    the cost of fetching the entire Market Watch for just one symbol.
+    Calls symbol_select() first, same reasoning as every other
+    symbol-keyed read in this file (see the update #18 lesson in this
+    project's own history: a symbol can show visible=True yet still fail
+    symbol_info_tick() until explicitly selected for this API session).
+    Returns None on any failure rather than raising — this is best-effort
+    display data, not core account/position data."""
+    import MetaTrader5 as mt5
+
+    _ensure_symbol_selected(mt5, symbol)
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None or (tick.bid == 0 and tick.ask == 0):
+        return None
+    return (tick.bid + tick.ask) / 2
+
+
+def get_current_bid_ask(symbol: str) -> tuple[float, float] | None:
+    """Live (bid, ask) for a single symbol — get_current_price's sibling
+    for a caller that needs the two sides separately (e.g. a spread
+    figure), same "one cheap tick fetch, not the whole Market Watch"
+    reasoning. Built for the watchlist's per-asset detail popup, which
+    was re-fetching all ~17-21 Market Watch symbols on every auto-
+    refresh tick just to find the one it needed — confirmed live as a
+    real, meaningful contributor to that popup's reported update lag."""
+    import MetaTrader5 as mt5
+
+    _ensure_symbol_selected(mt5, symbol)
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None or (tick.bid == 0 and tick.ask == 0):
+        return None
+    return tick.bid, tick.ask
+
+
+def get_server_time_offset(symbol: str = "EURUSD") -> timedelta | None:
+    """How far ahead of (or behind) this machine's true UTC clock the
+    connected MT5 broker's own server clock currently is — computed
+    fresh from a live tick's own timestamp every call, never hardcoded,
+    since this is confirmed live to run several hours off local time and
+    to shift with the broker's own DST rules, independent of this
+    machine's (see get_history_deals' own docstring for the original
+    live-verified finding). `time.time()` (this machine's epoch seconds,
+    always UTC regardless of local timezone/DST display settings) is
+    subtracted from the tick's own epoch seconds to get the real offset.
+
+    Purely informational/display — nothing in this project schedules
+    against this value, since a broker's server-time DST transition can
+    itself be a source of drift; scheduling stays anchored to plain UTC
+    (see config.MEGA_ANALYSIS_TRIGGER_HOUR_UTC). Returns None if `symbol`
+    has no live tick on this account (e.g. not present in Market Watch)
+    rather than raising — callers should treat that as "broker time
+    unknown," not a hard failure."""
+    import MetaTrader5 as mt5
+
+    _ensure_symbol_selected(mt5, symbol)
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None or tick.time <= 0:
+        return None
+    return timedelta(seconds=tick.time - time.time())
 
 
 def get_account_summary() -> AccountSummary:
@@ -438,6 +551,9 @@ class HistoricalDeal:
     symbol: str
     profit: float  # total realized effect on balance: profit + swap + commission
     volume: float
+    position_id: int = 0  # groups a position's open/close legs into one round-trip trade
+    price: float = 0.0
+    side: str = ""  # "buy"/"sell" for a real trade leg, "" for a non-trade balance deal
 
 
 def get_history_deals(date_from: datetime, date_to: datetime | None = None) -> list[HistoricalDeal]:
@@ -455,10 +571,22 @@ def get_history_deals(date_from: datetime, date_to: datetime | None = None) -> l
     normal empty result" contract as every other read-only fetch in this
     file — a genuinely fresh account with zero trade history is a real,
     expected case (e.g. a brand-new FTMO Challenge before its first
-    trade), not an error."""
+    trade), not an error.
+
+    Deal timestamps come from MT5.history_deals_get() in the broker's own
+    SERVER clock, not this machine's local clock — confirmed live against
+    the real FTMO account that the server clock can run meaningfully
+    ahead of local time (~2 hours observed). A default `date_to=datetime.
+    now()` (local) silently excluded deals that had already happened in
+    server time but whose timestamp still looked "in the future" next to
+    the too-early local bound — a real trade's closing deal went missing
+    from every FTMO compliance computation until this was found. Default
+    now pushes `date_to` a full day into local-future to comfortably
+    absorb any such clock skew; `date_from` already uses the same
+    "far enough to not matter" approach at its own call site."""
     import MetaTrader5 as mt5
 
-    date_to = date_to if date_to is not None else datetime.now()
+    date_to = date_to if date_to is not None else datetime.now() + timedelta(days=1)
     raw = mt5.history_deals_get(date_from, date_to)
     if raw is None:
         error = mt5.last_error()
@@ -472,16 +600,88 @@ def get_history_deals(date_from: datetime, date_to: datetime | None = None) -> l
             symbol=d.symbol,
             profit=d.profit + d.swap + d.commission,
             volume=d.volume,
+            position_id=d.position_id,
+            price=d.price,
+            side=(
+                ("buy" if d.type == mt5.DEAL_TYPE_BUY else "sell")
+                if d.symbol and d.type in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL)
+                else ""
+            ),
         )
         for d in raw
     ]
 
 
-_MT5_TIMEFRAMES = ("H1", "H4", "D1")
+@dataclass
+class ClosedTrade:
+    position_id: int
+    symbol: str
+    side: str  # "buy"/"sell", from the position's own opening leg
+    volume: float
+    opened_at: datetime
+    closed_at: datetime
+    open_price: float
+    close_price: float
+    profit: float  # net realized P&L across every leg of this position
+
+    @property
+    def duration(self) -> timedelta:
+        return self.closed_at - self.opened_at
+
+
+def group_closed_trades(deals: list[HistoricalDeal]) -> list[ClosedTrade]:
+    """Groups a flat deal list (open + close legs, commission-only rows,
+    and non-trade balance operations all mixed together, exactly what
+    get_history_deals() returns) into one row per position that has
+    actually finished — real win/loss trade history, not raw deal rows.
+
+    Sums every leg's already-fully-loaded profit (profit+swap+commission)
+    onto its position_id — confirmed live this is the only way to get
+    the true net result: a real closed XAUUSD trade's balance impact
+    only matched exactly when both the opening leg's commission and the
+    closing leg's profit+swap+commission were summed together, not
+    either alone. A position with only one deal on record is still
+    open (or, rarely, a non-trade balance adjustment) and is excluded —
+    this list is specifically "trades that finished." side/open_price
+    come from the earliest deal (the position's own opening leg) and
+    close_price from the latest (its closing leg) — a position can have
+    more than 2 deals (partial closes), so this always takes the FIRST
+    and LAST by time rather than assuming exactly two. Newest first."""
+    by_position: dict[int, list[HistoricalDeal]] = {}
+    for d in deals:
+        if not d.symbol or not d.position_id:
+            continue
+        by_position.setdefault(d.position_id, []).append(d)
+
+    trades = []
+    for position_id, position_deals in by_position.items():
+        if len(position_deals) < 2:
+            continue
+        position_deals.sort(key=lambda d: d.time)
+        opening_leg = position_deals[0]
+        closing_leg = position_deals[-1]
+        trades.append(
+            ClosedTrade(
+                position_id=position_id,
+                symbol=closing_leg.symbol,
+                side=opening_leg.side,
+                volume=closing_leg.volume,
+                opened_at=opening_leg.time,
+                closed_at=closing_leg.time,
+                open_price=opening_leg.price,
+                close_price=closing_leg.price,
+                profit=sum(d.profit for d in position_deals),
+            )
+        )
+    trades.sort(key=lambda t: t.closed_at, reverse=True)
+    return trades
+
+
+_MT5_TIMEFRAMES = ("H1", "H4", "D1", "MN1")
 
 
 def fetch_mt5_price_history(symbol: str, timeframe: str, count: int = 300) -> pd.DataFrame:
-    """Real OHLCV bars for `symbol` at `timeframe` ("H1"/"H4"/"D1"),
+    """Real OHLCV bars for `symbol` at `timeframe` ("H1"/"H4"/"D1"/"MN1"),
     fetched directly from the currently-connected MT5 terminal's own
     price feed — the broker's real data for the exact symbol, not a
     best-effort external ticker match the way PMEX's Yahoo-based
@@ -511,6 +711,7 @@ def fetch_mt5_price_history(symbol: str, timeframe: str, count: int = 300) -> pd
         "H1": mt5.TIMEFRAME_H1,
         "H4": mt5.TIMEFRAME_H4,
         "D1": mt5.TIMEFRAME_D1,
+        "MN1": mt5.TIMEFRAME_MN1,
     }[timeframe]
 
     _ensure_symbol_selected(mt5, symbol)
@@ -558,6 +759,15 @@ class TradeCost:
     spread_pct_of_price: float  # round-trip cost from crossing the spread once, as a % of price
     swap_long_pct_per_day: float | None  # holding a BUY overnight, %-of-notional/day (negative = a cost)
     swap_short_pct_per_day: float | None  # same, for a SELL
+    # Real broker-enforced minimum stop/target distance from the current
+    # price (MT5's own SYMBOL_TRADE_STOPS_LEVEL, converted from points to
+    # a %-of-price figure) — 0.0 (not None) means this broker/symbol has
+    # no such restriction, a real and common value, not a missing one.
+    # Added 2026-08-22 for analysis/backtest.py's trade-simulation engine
+    # to respect: an ATR-based stop tighter than this floor could never
+    # actually have been placed as a real order, so a backtest that
+    # ignores it is quietly more favorable than reality.
+    min_stop_distance_pct: float = 0.0
 
 
 # MT5's own swap-calculation-mode constants this project has verified a
@@ -609,6 +819,29 @@ def _compute_swap_pct_per_day(info, price: float) -> tuple[float | None, float |
     return None, None
 
 
+def get_symbol_category(symbol: str) -> str:
+    """The broker's own top-level symbol-path category (e.g. "Forex",
+    "Metals CFD", "Crypto", "Agriculture", "Cash CFD") — pulled out of
+    get_trade_economics as its own cheap call (symbol_info() only, no
+    tick fetch, no spread/swap math) since a symbol's category never
+    changes mid-session, so a caller that just wants to group/label
+    symbols (e.g. the watchlist grid) shouldn't pay for a live tick +
+    swap computation it doesn't need, repeated every fast refresh tick.
+    "Uncategorized" if symbol_info() fails or has no path — never
+    fabricated, matching every other real-data fetch in this file."""
+    try:
+        import MetaTrader5 as mt5
+
+        _ensure_symbol_selected(mt5, symbol)
+        info = mt5.symbol_info(symbol)
+    except Exception as e:
+        logger.warning("get_symbol_category raised for %s: %s: %s", symbol, type(e).__name__, e)
+        return "Uncategorized"
+    if info is None or not getattr(info, "path", ""):
+        return "Uncategorized"
+    return info.path.split("\\")[0]
+
+
 def get_trade_economics(symbol: str) -> TradeCost | None:
     """Real spread + swap cost for `symbol`, straight from the live MT5
     feed — the deterministic, "don't make the model guess a number
@@ -635,9 +868,19 @@ def get_trade_economics(symbol: str) -> TradeCost | None:
     swap_long_pct, swap_short_pct = _compute_swap_pct_per_day(info, tick.ask)
     category = info.path.split("\\")[0] if getattr(info, "path", "") else "Uncategorized"
 
+    # trade_stops_level is a POINT count (0 = broker imposes no minimum
+    # distance at all, a common real value on ECN-style accounts — not
+    # every symbol/broker enforces one). Guarded with `getattr`/`or 0`
+    # since a stubbed or unusually old symbol_info() might not carry
+    # this field at all — degrades to "no known restriction" rather than
+    # raising, same convention as every other optional field here.
+    stops_level_points = getattr(info, "trade_stops_level", 0) or 0
+    min_stop_distance_pct = stops_level_points * info.point / tick.ask * 100 if stops_level_points > 0 else 0.0
+
     return TradeCost(
-        category=category,
+        category=category,  # kept inline (not get_symbol_category) — info is already fetched here
         spread_pct_of_price=spread_pct,
         swap_long_pct_per_day=swap_long_pct,
         swap_short_pct_per_day=swap_short_pct,
+        min_stop_distance_pct=min_stop_distance_pct,
     )

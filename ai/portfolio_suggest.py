@@ -96,11 +96,22 @@ _INSTRUCTION_HEAD = (
     "reserve' cash-reserve default (Murphy) — that's a reasonable "
     "starting anchor for a generic account, but following it reflexively "
     "is exactly the over-conservative outcome this paragraph is "
-    "correcting. Absent a specific, genuinely elevated near-term risk "
-    "you've identified in your own research (not a generic 'markets can "
-    "always fall'), a cash reserve in roughly the 10-25% range is a more "
-    "appropriate default here; if you keep more in cash than that, say "
-    "explicitly why the specific evidence in front of you warrants it."
+    "correcting. IMPORTANT — this no longer reads as a raw notional-"
+    "capital split: \"pct\" (see the JSON schema below) is the % of "
+    "equity actually at risk if a position's stop is hit, not how much "
+    "capital is committed to it, so CASH being very high (85%+ is normal) "
+    "is NOT itself evidence of over-conservatism the way it would be "
+    "under a notional-allocation reading — real lot sizes for even a 1-3% "
+    "risk figure can represent meaningful, genuinely-invested exposure "
+    "once leverage is accounted for. Judge conviction by whether the "
+    "real, necessarily-small risk budget (see the aggregate-heat cap "
+    "below) is actually being spent on genuinely good setups from your "
+    "own research, not by how large CASH looks in this accounting. "
+    "Absent a specific, genuinely elevated near-term risk you've "
+    "identified in your own research (not a generic 'markets can always "
+    "fall'), avoid leaving the aggregate-heat budget meaningfully "
+    "underused; if you do, say explicitly why the specific evidence in "
+    "front of you warrants it."
     "\n\n"
     "If a 'Current Open Positions' section appears below, the account is "
     "not starting from empty — treat those as real, already-committed "
@@ -122,10 +133,15 @@ _INSTRUCTION_HEAD = (
     "average — note this reflects the broader global market this data "
     "comes from, not PMEX's own order flow specifically), AND a "
     "medium-term (~3-month, daily-resolution) pattern read: a support/"
-    "resistance range and a market-type classification "
-    "('trending_up'/'trending_down' when price has moved fairly directly "
-    "in one direction over that window, 'sideways' when it's mostly "
-    "chopped in a range, 'mixed' in between). These price/support/"
+    "resistance range and a market-type classification: 'sideways' when "
+    "the window's own price level genuinely hasn't shifted (scaled "
+    "against its own volatility, not a flat percentage); otherwise there "
+    "IS a real net directional move, and 'trending_up'/'trending_down' "
+    "vs. 'choppy_up'/'choppy_down' further distinguishes whether that "
+    "move was reached cleanly or via a lot of back-and-forth churn along "
+    "the way — a choppy read is still real, actionable directional "
+    "evidence, not a weaker cousin of sideways; treat it as a genuine "
+    "(if noisier) directional signal, not as an absence of one. These price/support/"
     "resistance levels come from a third-party market-data source and may "
     "use a different quote convention than this account's own instrument "
     "(e.g. US grain futures like corn are commonly quoted in cents per "
@@ -454,11 +470,15 @@ _INSTRUCTION_TAIL = (
     "further during off-peak/lower-liquidity trading hours, so factor "
     "that into your order-type and timing guidance rather than treating "
     "the shown number as a ceiling.\n"
-    "   e. Idle cash — per the risk-calibration objective above, treat "
-    "any cash reserve beyond roughly 10-25% of equity as needing its own "
-    "explicit justification (a specific, genuinely elevated near-term "
-    "risk you identified, not generic caution), the same as an unusually "
-    "large single-position bet would need justifying. Whatever reserve "
+    "   e. Idle cash — per the risk-calibration objective above, CASH now "
+    "means equity not currently placed at risk (not unused notional "
+    "capital), so it will typically sit very high, 85%+ is normal here "
+    "and is not itself evidence of excessive conservatism. Judge this by "
+    "whether the aggregate-heat risk budget (item g) is being meaningfully "
+    "used on genuinely good setups, not by CASH's raw size — leaving that "
+    "risk budget substantially unused without a specific, genuinely "
+    "elevated near-term risk you identified (not generic caution) needs "
+    "its own explicit justification. Whatever reserve "
     "you do leave, define specific conditional triggers for deploying it, "
     "tied to the support/resistance levels already given per instrument "
     "above (e.g. 'deploy X% if [instrument] pulls back to its support "
@@ -478,22 +498,28 @@ _INSTRUCTION_TAIL = (
     "alternative instrument that's actually listed among the Market Watch "
     "instruments below — don't suggest options, ETFs, or any other "
     "product that isn't shown as tradable on this account.\n"
-    "   g. Aggregate heat — for every position in the mix, multiply its "
-    "% allocation by its stop-loss distance (%) to get that position's "
-    "contribution to capital at risk, then sum these across the whole "
-    "mix. State this total explicitly (e.g. 'aggregate heat: 5.2% of "
-    "equity') and check it against a ~10-15% cap (raised from this "
-    "tool's earlier, more conservative 6-8% cap, per the calculated-risk "
-    "objective above): if a simultaneous worst-case stop-out across "
-    "every position would erase more than that, resize down until it "
-    "doesn't, rather than sizing positions independently of each other.\n"
+    "   g. Aggregate heat — every position's \"pct\" already directly "
+    "equals its own contribution to capital at risk (real lot size is "
+    "computed downstream from this risk% and your stop distance, not "
+    "from pct as notional capital to commit) — simply sum the pct values "
+    "across the whole mix. State this total explicitly (e.g. 'aggregate "
+    "heat: 5.2% of equity') and check it against a ~10-15% cap (raised "
+    "from this tool's earlier, more conservative 6-8% cap, per the "
+    "calculated-risk objective above): if a simultaneous worst-case "
+    "stop-out across every position would erase more than that, resize "
+    "down until it doesn't, rather than sizing positions independently "
+    "of each other.\n"
     "   h. Sector/group concentration — group the mix's positions by "
     "correlated market/sector (e.g. precious metals, energy, grains, "
-    "equity indices) and sum the % allocation within each group. State "
-    "each group's total explicitly (e.g. 'metals + energy: 48% of "
-    "equity') rather than leaving it implicit in the per-instrument "
-    "numbers. If any group exceeds roughly 30-40% of equity, you may "
-    "still keep it that way, but you must explicitly justify why the "
+    "equity indices) and sum the % allocation (i.e. risk%) within each "
+    "group. Since total risk is already capped around 10-15% by item g, "
+    "judge concentration as a SHARE of that risk budget, not of raw "
+    "equity. State "
+    "each group's total risk% explicitly (e.g. 'metals + energy: 4.8% of "
+    "equity at risk') rather than leaving it implicit in the per-"
+    "instrument numbers. If any group eats more than roughly a third to "
+    "half of the mix's total aggregate heat, you may still keep it that "
+    "way, but you must explicitly justify why the "
     "concentration is warranted here (not just note that it exists) or "
     "resize it down.\n"
     "   i. Asset-class exclusion — if an entire asset class is present "
@@ -599,8 +625,29 @@ _INSTRUCTION_TAIL = (
     "example values with your actual final numbers, one key per "
     "instrument symbol traded above plus one \"CASH\" key, pct values "
     "summing to 100, no comments or extra text inside the block). Every "
-    "non-CASH key must be an object with four numbers: \"pct\" (the "
-    "target allocation), \"price\" (a specific limit-order entry price — "
+    "non-CASH key must be an object with five fields: \"side\" (\"buy\" "
+    "for a long or \"sell\" for a short — this pipeline can now execute "
+    "REAL short positions on this account, not just longs, and a short "
+    "idea should be held to the exact same evidence bar as a long: real "
+    "backtest support for that direction, aligned multi-timeframe "
+    "signals, a genuine setup — not proposed as an afterthought just "
+    "because one is now technically possible. A short-biased finding "
+    "your own analysis already sometimes surfaces in prose — a negative "
+    "momentum-persistence correlation, a range_fade_candidate setup "
+    "sitting at resistance, a resistance-rejection backtest — is "
+    "exactly the kind of evidence that can now justify \"side\": \"sell\" "
+    "directly instead of being discarded for lack of a schema slot), "
+    "\"pct\" (the % of "
+    "equity you are willing to LOSE if this position's stop-loss is hit "
+    "— NOT notional capital or margin to commit. Real lot size is "
+    "computed automatically downstream from this risk% and your actual "
+    "stop distance: a wider stop needs fewer lots to risk the same %, a "
+    "tighter stop needs more — so this should be a small number, "
+    "typically similar to a single-trade risk cap [e.g. 1-3%], not a "
+    "large \"how much of my capital goes here\" figure. CASH is what's "
+    "left after every position's risk%, i.e. equity not currently placed "
+    "at risk — expect it to typically be very high, 85%+ is normal and "
+    "not itself a sign of excessive conservatism), \"price\" (a specific limit-order entry price — "
     "it must be realistic and achievable given the instrument's current "
     "bid/ask shown above, not a distant support/resistance level or an "
     "arbitrary round number; also weigh missed-fill risk against price "
@@ -609,15 +656,17 @@ _INSTRUCTION_TAIL = (
     "entered if the instrument instead runs, which is a real cost for "
     "your highest-conviction ideas specifically, not a free option), "
     "\"stop_loss\" (a specific stop price), and \"take_profit\" (a "
-    "specific target price on the CORRECT side of your entry — above it "
-    "for a long — matching the exact target level your own reward:risk "
+    "specific target price on the CORRECT side of your entry FOR THE "
+    "DIRECTION YOU CHOSE — above entry for a long, below entry for a "
+    "short — matching the exact target level your own reward:risk "
     "reasoning above already derives; this is the field that actually "
     "gets sent to the broker as the position's real take-profit order, "
     "not just prose, so it must be the same real number your analysis "
     "used, not a rounded-off or re-guessed one). "
     "When a real ATR figure is shown for that instrument above, derive "
     "the stop distance from it (e.g. price minus roughly 1.5x ATR for a "
-    "long, per Bulkowski's principle above) rather than an assumed flat "
+    "long, or price PLUS roughly 1.5x ATR for a short, per Bulkowski's "
+    "principle above) rather than an assumed flat "
     "percentage — a stop distance that ignores an instrument's own actual "
     "daily volatility risks being either needlessly tight or far looser "
     "than intended. Only fall back to a flat-percentage stop when ATR is "
@@ -629,7 +678,9 @@ _INSTRUCTION_TAIL = (
     "distinguished from an oversight, and this pipeline treats an "
     "omitted held instrument as being closed:\n"
     "```json\n"
-    '{"EXAMPLE_SYMBOL": {"pct": 15, "price": 82.50, "stop_loss": 78.00, "take_profit": 94.00}, "CASH": 25}\n'
+    '{"EXAMPLE_LONG": {"side": "buy", "pct": 1.5, "price": 82.50, "stop_loss": 78.00, "take_profit": 94.00}, '
+    '"EXAMPLE_SHORT": {"side": "sell", "pct": 1.5, "price": 145.00, "stop_loss": 149.50, "take_profit": 133.00}, '
+    '"CASH": 97.0}\n'
     "```"
 )
 
@@ -673,6 +724,14 @@ class AssetAnalysis:
     momentum_persistence_backtest: MomentumPersistenceBacktest | None = None
     volatility_regime_backtest: VolatilityRegimeBacktest | None = None
     support_resistance_backtest: SupportResistanceBacktest | None = None
+    # "yahoo" (default — PMEX/PSX always, FTMO where a Yahoo mapping
+    # exists) or "mt5" (FTMO's own native-D1 backfill — see
+    # ai/ftmo_suggest.py::_enrich_with_native_d1). Placed last, and
+    # always passed by keyword at every real call site, specifically so
+    # adding it here can't silently shift any existing positional
+    # AssetAnalysis(...) call's arguments — see format_enriched_asset_
+    # context's volume-caveat branch for the one place this is read.
+    data_source: str = "yahoo"
 
 
 def analyze_assets(
@@ -717,7 +776,7 @@ def analyze_assets(
         prices = history["Close"]
         stats = compute_technical_stats(prices, history=history)
         headlines = fetch_recent_headlines(yahoo_ticker, limit=config.NEWS_HEADLINES_PER_ASSET)
-        rsi_overbought_bt, rsi_oversold_bt = backtest_rsi_reaction(prices)
+        rsi_overbought_bt, rsi_oversold_bt = backtest_rsi_reaction(history)
 
         results.append(
             AssetAnalysis(
@@ -727,7 +786,7 @@ def analyze_assets(
                 rsi_oversold_backtest=rsi_oversold_bt,
                 momentum_persistence_backtest=backtest_momentum_persistence(prices),
                 volatility_regime_backtest=backtest_volatility_regime(prices),
-                support_resistance_backtest=backtest_support_resistance_reaction(prices),
+                support_resistance_backtest=backtest_support_resistance_reaction(history),
             )
         )
 
@@ -781,27 +840,87 @@ def _feasibility_line(r: AssetAnalysis, account_equity: float | None) -> str | N
 
 
 def _format_rsi_backtest(bt: RSIReactionBacktest | None, condition: str) -> str:
+    """Real trade-simulation result, not a raw forward-return average (see
+    analysis/backtest.py's own top-of-file note) — reports what actually
+    simulating the textbook reversal trade (short on overbought, long on
+    oversold) with a real ATR-based stop/target would have won or lost,
+    bar by bar, against this instrument's own history."""
     if bt is None:
         return (
             f"  historical {condition} RSI reaction: not enough real historical episodes "
-            "in this instrument's own history to compute — treat any RSI-reversal claim "
-            "for it as unverified assumption, not evidence."
+            "(or no High/Low data to derive a real stop/target from) in this instrument's "
+            "own history to compute — treat any RSI-reversal claim for it as unverified "
+            "assumption, not evidence."
         )
+    side = "short" if condition == "overbought" else "long"
+    win_rate = f"{bt.win_rate_pct:.0f}%" if bt.win_rate_pct is not None else "n/a (none resolved yet)"
     return (
-        f"  historical {condition} RSI reaction (real, this instrument's own past): "
-        f"{bt.occurrences} distinct past episodes where RSI reached {bt.threshold:.0f}, "
-        f"average {bt.forward_days}-trading-day return afterward = "
-        f"{bt.avg_forward_return_pct:+.2f}%, reversed as the textbook convention would "
-        f"predict {bt.reversal_rate_pct:.0f}% of the time"
+        f"  historical {condition} RSI reaction (real trade simulation, this instrument's "
+        f"own past): {bt.trades} distinct past episodes where RSI reached {bt.threshold:.0f}, "
+        f"simulating the textbook {side} reversal trade with a {bt.stop_atr_multiple:g}x-ATR "
+        f"stop / {bt.target_atr_multiple:g}x-ATR target (max {bt.max_holding_bars} bars held) "
+        f"-> {bt.wins} wins, {bt.losses} losses, {bt.timeouts} timed out; win rate {win_rate} "
+        f"of resolved trades, average realized {bt.avg_r_multiple:+.2f}R across all of them"
+        f"{_real_execution_note(bt.round_trip_cost_pct, bt.swap_pct_per_day_used, bt.min_stop_distance_pct)}"
     )
 
 
-def _format_backtests(r: AssetAnalysis) -> list[str]:
+def _real_execution_note(round_trip_cost_pct: float, swap_pct_per_day: float, min_stop_distance_pct: float) -> str:
+    """Discloses whenever a trade-simulation backtest (RSIReactionBacktest
+    or one side of SupportResistanceBacktest) was actually netted against
+    real broker cost/guard-rail data — added 2026-08-22, direct user
+    request to make these results "more realistic and dependable" by
+    accounting for real trade cost and broker execution constraints, not
+    just an idealized ATR stop/target. Empty string (no note at all) when
+    every one of these stayed at the engine's own zero-cost/zero-
+    restriction default — true for PMEX/PSX today, since neither has this
+    real data wired in yet (see analysis/backtest.py's own top-of-file
+    note) — so the base sentence above reads as a pure idealized
+    simulation for them, honestly, rather than implying a cost check that
+    didn't happen.
+
+    Cost/swap and the guard-rail note are joined with "; ", not folded
+    into one "net of real X, Y, Z" list — "net of real" only fits the
+    cost/swap numbers grammatically; the guard-rail clause describes a
+    structural change to the stop, not something "netted" (a real
+    wording bug caught live: the joined-list version literally read
+    "net of real ... stop widened to...", broken grammar, not just
+    redundant "real real" phrasing)."""
+    cost_parts = []
+    if round_trip_cost_pct > 0:
+        cost_parts.append(f"{round_trip_cost_pct:.4f}% round-trip cost")
+    if swap_pct_per_day:
+        cost_parts.append(f"{swap_pct_per_day:+.4f}%/day swap")
+    clauses = []
+    if cost_parts:
+        clauses.append("net of real " + " and ".join(cost_parts))
+    if min_stop_distance_pct > 0:
+        # Widening OVERRIDES the stated ATR multiple for any trade whose
+        # ATR-based stop would've sat tighter than this floor — the "Xx-
+        # ATR stop" figure quoted alongside this note is what trades NOT
+        # hitting the floor used, not a guarantee every trade did.
+        clauses.append(
+            f"stop widened to the broker's own {min_stop_distance_pct:.3f}% minimum on any trade "
+            "where the ATR-based stop would've been tighter than that"
+        )
+    if not clauses:
+        return ""
+    return " [" + "; ".join(clauses) + "]"
+
+
+def format_backtests(r: AssetAnalysis) -> list[str]:
     """Real multi-year backtests of this specific instrument's own price
     history (see analysis/backtest.py) — mirrors ai/psx_suggest.py's own
     `_format_backtests` in spirit and wording, kept as an independent
     copy rather than a shared import since the two files' report
-    templates are each maintained standalone. Deliberately does NOT
+    templates are each maintained standalone. Public (unlike its PSX
+    counterpart) since it's shared by both PMEX's own prompt and FTMO's
+    (via format_enriched_asset_context, which ai/ftmo_suggest.py's own
+    format_ftmo_asset_context calls per-instrument) — same reasoning as
+    ai/ftmo_suggest.py::fetch_ftmo_status's own promotion to public. Not
+    currently used by app.py's own watchlist popup, which renders the
+    same underlying dataclasses directly as charts/metrics instead (see
+    app.py::_render_backtest_metrics). Deliberately does NOT
     include a beta-stability backtest the way the PSX version does: that
     needs a per-instrument benchmark index, and PMEX spans metals,
     energy, grains, currencies, and equity indices with no single
@@ -847,21 +966,34 @@ def _format_backtests(r: AssetAnalysis) -> list[str]:
 
     sr = r.support_resistance_backtest
     if sr is not None:
+        support_rate = f"{sr.support_win_rate_pct:.0f}%" if sr.support_win_rate_pct is not None else "n/a"
+        resistance_rate = (
+            f"{sr.resistance_win_rate_pct:.0f}%" if sr.resistance_win_rate_pct is not None else "n/a"
+        )
+        support_note = _real_execution_note(
+            sr.round_trip_cost_pct, sr.support_swap_pct_per_day_used, sr.min_stop_distance_pct
+        )
+        resistance_note = _real_execution_note(
+            sr.round_trip_cost_pct, sr.resistance_swap_pct_per_day_used, sr.min_stop_distance_pct
+        )
         lines.append(
-            f"  historical support/resistance reliability (this instrument's own past, "
-            f"{sr.forward_days}-trading-day forward check): support held (price higher "
-            f"afterward) {sr.support_hold_rate_pct:.0f}% of {sr.support_tests} real past "
-            f"tests; resistance rejected (price lower afterward) "
-            f"{sr.resistance_reject_rate_pct:.0f}% of {sr.resistance_tests} real past "
-            "tests — use this to judge how much weight the support/resistance range shown "
-            "above deserves for THIS instrument specifically, rather than assuming "
-            "support/resistance lines are reliable just because they're a well-known "
-            "charting concept."
+            f"  historical support/resistance reliability (real trade simulation, this "
+            f"instrument's own past, {sr.stop_atr_multiple:g}x-ATR stop / "
+            f"{sr.target_atr_multiple:g}x-ATR target, max {sr.max_holding_bars} bars held): "
+            f"buying off support -> {sr.support_wins}W/{sr.support_losses}L/{sr.support_timeouts} "
+            f"timed out across {sr.support_tests} real tests, win rate {support_rate}, avg "
+            f"{sr.support_avg_r_multiple:+.2f}R{support_note}; shorting off resistance -> "
+            f"{sr.resistance_wins}W/{sr.resistance_losses}L/{sr.resistance_timeouts} timed out "
+            f"across {sr.resistance_tests} real tests, win rate {resistance_rate}, avg "
+            f"{sr.resistance_avg_r_multiple:+.2f}R{resistance_note} — use this to judge how much "
+            "weight the support/resistance range shown above deserves for THIS instrument "
+            "specifically, rather than assuming support/resistance lines are reliable just "
+            "because they're a well-known charting concept."
         )
     else:
         lines.append(
-            "  historical support/resistance reliability: not enough real historical "
-            "tests of these levels to compute"
+            "  historical support/resistance reliability: not enough real historical tests "
+            "of these levels (or no High/Low data to derive a real stop/target from) to compute"
         )
     return lines
 
@@ -931,9 +1063,21 @@ def format_enriched_asset_context(
             else:
                 stat_bits.append("RSI not available (insufficient price history)")
             if stats.volume_trend_pct is not None:
+                # Yahoo-sourced volume is a broader-market proxy (this
+                # data provider's own feed, not this specific broker's
+                # order flow); MT5-native volume (FTMO's own D1 backfill
+                # for symbols with no Yahoo mapping — see ai/
+                # ftmo_suggest.py::_enrich_with_native_d1) genuinely IS
+                # this account's own broker feed, so the caveat only
+                # applies to the Yahoo case.
+                volume_note = (
+                    "global market volume, not this account's own order flow"
+                    if r.data_source == "yahoo"
+                    else "this account's own MT5 feed"
+                )
                 stat_bits.append(
                     f"volume {stats.volume_trend_pct:+.0f}% vs its own 20-day average "
-                    "(global market volume, not PMEX-specific)"
+                    f"({volume_note})"
                 )
             else:
                 stat_bits.append("volume trend not available (no volume data for this source)")
@@ -950,7 +1094,7 @@ def format_enriched_asset_context(
                 pattern_bits.append(f"market type: {stats.market_regime}")
             if pattern_bits:
                 lines.append(f"  pattern: {', '.join(pattern_bits)}")
-            lines += _format_backtests(r)
+            lines += format_backtests(r)
         else:
             lines.append(
                 "  technical: not available (price-history fetch failed) — do not "
@@ -1242,20 +1386,39 @@ class AllocationEntry:
     price: float | None = None
     stop_loss: float | None = None
     take_profit: float | None = None
+    side: str = "buy"  # "buy" or "sell" — see risk/apply_suggestion.py::compute_rebalance_plan
 
 
-def parse_final_allocation(response_text: str) -> dict[str, AllocationEntry] | None:
+def parse_final_allocation(
+    response_text: str, require_side: bool = False
+) -> dict[str, AllocationEntry] | None:
     """Extract the trailing ```json {...}``` allocation block the prompt
     asks for (see build_stage1_instruction/build_stage2_instruction).
-    Each non-CASH value is an object with pct/price/stop_loss (see the
-    JSON-block spec in _INSTRUCTION_TAIL); CASH is a bare number. Also
+    Each non-CASH value is an object with pct/price/stop_loss/side (see
+    the JSON-block spec in _INSTRUCTION_TAIL); CASH is a bare number. Also
     tolerates a bare number for a non-CASH key (price/stop_loss come back
     None) in case the model reverts to the old shape — a missing price is
     a real limitation for execution, not a parse failure, so this still
-    parses rather than dropping the whole allocation. Returns None on
-    anything unexpected — missing block, malformed JSON, wrong shape —
-    rather than raising; the text response still displays fine even if
-    this fails, it just means no allocation chart/execution plan."""
+    parses rather than dropping the whole allocation. `side` defaults to
+    "buy" when absent from an object-shape entry, UNLESS `require_side`
+    is True (pass this for FTMO/PMEX, whose schema always includes
+    `side`) — there, an object-shape entry silently missing `side` fails
+    the whole parse instead, the same as an invalid value, because for
+    those two exchanges an absent side on a symbol currently held SHORT
+    would otherwise default to "buy" and get treated as a genuine
+    direction flip: a real position force-closed and reversed on a
+    silently-guessed field. PSX (never emits `side` at all) and the old
+    bare-number shape are unaffected by `require_side` — bare numbers
+    still default to "buy" regardless, since PSX has no execution path
+    for this default to ever mislead. An explicit but INVALID side
+    (anything other than "buy"/"sell", case-insensitive) always fails the
+    whole parse — a malformed direction is a structural schema violation,
+    not a "missing, tolerate it" case, and silently guessing a direction
+    here is exactly the kind of substitution this pipeline's execution
+    path has already been burned by once. Returns None on anything
+    unexpected — missing block, malformed JSON, wrong shape — rather than
+    raising; the text response still displays fine even if this fails, it
+    just means no allocation chart/execution plan."""
     match = _last_allocation_match(response_text)
     if match is None:
         return None
@@ -1284,11 +1447,21 @@ def parse_final_allocation(response_text: str) -> dict[str, AllocationEntry] | N
             return None
         if take_profit is not None and not isinstance(take_profit, (int, float)):
             return None
+        side = value.get("side")
+        if side is None:
+            if require_side:
+                return None
+            side_norm = "buy"
+        elif isinstance(side, str) and side.lower() in ("buy", "sell"):
+            side_norm = side.lower()
+        else:
+            return None
         result[key] = AllocationEntry(
             pct=float(value["pct"]),
             price=float(price) if price is not None else None,
             stop_loss=float(stop_loss) if stop_loss is not None else None,
             take_profit=float(take_profit) if take_profit is not None else None,
+            side=side_norm,
         )
     return result
 
@@ -1380,12 +1553,14 @@ AUDIT_INSTRUCTION = (
     "continuing, a reversal being likely, a volatility-contraction "
     "'coiled spring' setup, a support/resistance level holding).\n"
     "2. Cross-check EACH such claim against that exact instrument's own "
-    "historical backtest evidence given below (its real past RSI-"
-    "reaction rate and average forward return, whether its own history "
-    "shows real momentum persistence or mean-reversion, whether its own "
-    "low-volatility episodes have historically been followed by bigger "
-    "or smaller moves, and how often its shown support/resistance levels "
-    "have actually held or been rejected) — this is genuine historical "
+    "historical backtest evidence given below (its real simulated RSI-"
+    "reversal and support/resistance-bounce trade win rates and average "
+    "realized R-multiple — an actual ATR-based stop/target walked "
+    "forward bar by bar to a genuine win/loss, not a bare average return "
+    "N bars later — plus whether its own history shows real momentum "
+    "persistence or mean-reversion, and whether its own low-volatility "
+    "episodes have historically been followed by bigger or smaller "
+    "moves) — this is genuine historical "
     "evidence for THIS instrument specifically, not a generic textbook "
     "assumption. Note: there is no beta-vs-benchmark backtest here (PMEX "
     "spans too many uncorrelated asset classes for one natural "

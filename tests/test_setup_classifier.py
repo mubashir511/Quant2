@@ -228,3 +228,106 @@ def test_range_fade_ignores_a_weakly_touched_level():
     )
     names = [s.name for s in classify_setups(_stats(market_regime="sideways"), _empty_structure(sr_levels=weak_level))]
     assert "range_fade_candidate" not in names
+
+
+def test_grind_continuation_fires_on_choppy_regime_with_room_left_in_momentum():
+    signals = classify_setups(_stats(market_regime="choppy_up", rsi=55.0), _empty_structure())
+    names = [s.name for s in signals]
+    assert "grind_continuation" in names
+    assert "no_clear_setup" not in names
+
+    signals_down = classify_setups(_stats(market_regime="choppy_down", rsi=45.0), _empty_structure())
+    assert "grind_continuation" in [s.name for s in signals_down]
+
+
+def test_grind_continuation_does_not_fire_when_momentum_already_extreme_in_same_direction():
+    # Choppy uptrend but RSI already overbought — the move may already be
+    # stretched, so this should NOT be offered as a fresh continuation.
+    signals = classify_setups(_stats(market_regime="choppy_up", rsi=75.0), _empty_structure())
+    assert "grind_continuation" not in [s.name for s in signals]
+
+    signals_down = classify_setups(_stats(market_regime="choppy_down", rsi=25.0), _empty_structure())
+    assert "grind_continuation" not in [s.name for s in signals_down]
+
+
+def test_grind_continuation_does_not_fire_for_sideways_or_clean_trending_regimes():
+    assert "grind_continuation" not in [
+        s.name for s in classify_setups(_stats(market_regime="sideways"), _empty_structure())
+    ]
+    assert "grind_continuation" not in [
+        s.name for s in classify_setups(_stats(market_regime="trending_up", rsi=55.0), _empty_structure())
+    ]
+
+
+def test_trend_intact_fires_on_clean_trending_regime_with_no_other_signal():
+    # Real gap found live 2026-08-22 against real BTCUSD H4 data: a clean
+    # trending_up regime with no more specific trigger was falling all
+    # the way through to no_clear_setup, reading identically to genuinely
+    # no evidence at all despite the trend/regime badges agreeing on a
+    # clean uptrend right next to it.
+    signals = classify_setups(_stats(market_regime="trending_up", rsi=55.0), _empty_structure())
+    names = [s.name for s in signals]
+    assert "trend_intact" in names
+    assert "no_clear_setup" not in names
+
+    signals_down = classify_setups(_stats(market_regime="trending_down", rsi=45.0), _empty_structure())
+    assert "trend_intact" in [s.name for s in signals_down]
+
+
+def test_trend_intact_does_not_fire_when_momentum_already_extreme_in_same_direction():
+    signals = classify_setups(_stats(market_regime="trending_up", rsi=75.0), _empty_structure())
+    assert "trend_intact" not in [s.name for s in signals]
+
+    signals_down = classify_setups(_stats(market_regime="trending_down", rsi=25.0), _empty_structure())
+    assert "trend_intact" not in [s.name for s in signals_down]
+
+
+def test_trend_intact_does_not_fire_for_sideways_or_choppy_regimes():
+    # choppy_up/choppy_down get grind_continuation instead (its own,
+    # more specific archetype for a noisy-but-real direction) — not
+    # trend_intact, which is reserved for a CLEAN trending_up/down read.
+    assert "trend_intact" not in [
+        s.name for s in classify_setups(_stats(market_regime="sideways"), _empty_structure())
+    ]
+    assert "trend_intact" not in [
+        s.name for s in classify_setups(_stats(market_regime="choppy_up", rsi=55.0), _empty_structure())
+    ]
+
+
+def test_trend_intact_suppressed_when_trend_following_already_fired():
+    # trend_following (a fresh trendline retest) is a stronger, more
+    # specific version of the exact same situation — trend_intact should
+    # stay quiet rather than restate it.
+    structure = _empty_structure(
+        patterns=[ChartPattern(name="uptrend_structure", detail="higher highs and higher lows")],
+        trendlines=TrendlineAnalysis(
+            resistance_trendline=None,
+            support_trendline=_trendline(
+                slope_per_bar=0.5, direction="rising", current_price_on_line=100.2,
+                price_vs_line="above", distance_pct=0.1,
+            ),
+        ),
+    )
+    names = [s.name for s in classify_setups(_stats(last_price=100.3, market_regime="trending_up"), structure)]
+    assert "trend_following" in names
+    assert "trend_intact" not in names
+
+
+def test_trend_intact_suppressed_when_pullback_continuation_already_fired():
+    span = 150.0 - 110.0
+    price_in_golden_zone = 150.0 - 0.5 * span
+    structure = _empty_structure(
+        patterns=[ChartPattern(name="uptrend_structure", detail="higher highs and higher lows")],
+        fibonacci=_fib(
+            swing_high=150.0, swing_low=110.0, high_is_more_recent=True,
+            current_price=price_in_golden_zone, nearest_level_name="50%",
+        ),
+    )
+    names = [
+        s.name
+        for s in classify_setups(
+            _stats(last_price=price_in_golden_zone, market_regime="trending_up"), structure
+        )
+    ]
+    assert "pullback_continuation" in names
+    assert "trend_intact" not in names

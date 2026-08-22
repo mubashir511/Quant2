@@ -800,14 +800,18 @@ AUDIT_INSTRUCTION = (
     "continuing, a reversal being likely, beta implying a certain risk "
     "level, etc.).\n"
     "2. Cross-check EACH such claim against that exact instrument's own "
-    "historical backtest evidence given below (its real past RSI-"
-    "reaction rate and average forward return, whether its beta has been "
-    "stable or has swung across different historical windows, whether its "
-    "own history shows real momentum persistence or mean-reversion, "
-    "whether its own low-volatility episodes have historically been "
-    "followed by bigger or smaller moves — the 'coiled spring' question — "
-    "and how often price has actually held at support or been rejected at "
-    "resistance historically) — this is genuine historical evidence for "
+    "historical backtest evidence given below (its real simulated RSI-"
+    "reversal and support/resistance-bounce trade win rates and average "
+    "realized R-multiple — an actual ATR-based stop/target walked "
+    "forward bar by bar to a genuine win/loss, not a bare average return "
+    "N bars later, though genuinely often unavailable here specifically "
+    "since PSX's own feed has no High/Low to derive a real stop/target "
+    "from — plus whether its beta has been stable or has swung across "
+    "different historical windows, whether its own history shows real "
+    "momentum persistence or mean-reversion, and whether its own low-"
+    "volatility episodes have historically been followed by bigger or "
+    "smaller moves — the 'coiled spring' question) — this is genuine "
+    "historical evidence for "
     "THIS instrument specifically, not a generic textbook assumption. If "
     "the draft leans on an EPS growth story for a holding, cross-check it "
     "against the real reported EPS growth trend given below too (the "
@@ -937,7 +941,7 @@ def analyze_psx_assets(
         fundamentals = company_data.fundamentals
         week52_low = fundamentals.week52_low if fundamentals else None
         week52_high = fundamentals.week52_high if fundamentals else None
-        rsi_overbought_bt, rsi_oversold_bt = backtest_rsi_reaction(prices)
+        rsi_overbought_bt, rsi_oversold_bt = backtest_rsi_reaction(history)
         analyses.append(
             PSXAssetAnalysis(
                 symbol=asset.symbol,
@@ -967,7 +971,7 @@ def analyze_psx_assets(
                 beta_stability_backtest=backtest_beta_stability(prices, index_prices),
                 momentum_persistence_backtest=backtest_momentum_persistence(prices),
                 volatility_regime_backtest=backtest_volatility_regime(prices),
-                support_resistance_backtest=backtest_support_resistance_reaction(prices),
+                support_resistance_backtest=backtest_support_resistance_reaction(history),
                 eps_growth_trend=compute_eps_growth_trend(company_data.financials),
             )
         )
@@ -1005,19 +1009,62 @@ def _format_financials(financials: PSXFinancials) -> list[str]:
 
 
 def _format_rsi_backtest(bt: RSIReactionBacktest | None, condition: str) -> str:
+    """Real trade-simulation result (see analysis/backtest.py's own top-
+    of-file note and ai/portfolio_suggest.py's identical copy of this
+    function) — normally None for PSX specifically, since its own EOD
+    feed (data/psx_source.py) has no High/Low to derive a real ATR-based
+    stop/target from; disclosed explicitly below rather than silently
+    omitted, same "explain the real gap" convention as everywhere else
+    High/Low-dependent stats show up in this project."""
     if bt is None:
         return (
-            f"  historical {condition} RSI reaction: not enough real historical episodes "
-            "in this instrument's own history to compute — treat any RSI-reversal claim "
-            "for it as unverified assumption, not evidence."
+            f"  historical {condition} RSI reaction: not enough real historical episodes, "
+            "or no High/Low data in this feed to derive a real stop/target from — treat "
+            "any RSI-reversal claim for it as unverified assumption, not evidence."
         )
+    side = "short" if condition == "overbought" else "long"
+    win_rate = f"{bt.win_rate_pct:.0f}%" if bt.win_rate_pct is not None else "n/a (none resolved yet)"
     return (
-        f"  historical {condition} RSI reaction (real, this instrument's own past): "
-        f"{bt.occurrences} distinct past episodes where RSI reached {bt.threshold:.0f}, "
-        f"average {bt.forward_days}-trading-day return afterward = "
-        f"{bt.avg_forward_return_pct:+.2f}%, reversed as the textbook convention would "
-        f"predict {bt.reversal_rate_pct:.0f}% of the time"
+        f"  historical {condition} RSI reaction (real trade simulation, this instrument's "
+        f"own past): {bt.trades} distinct past episodes where RSI reached {bt.threshold:.0f}, "
+        f"simulating the textbook {side} reversal trade with a {bt.stop_atr_multiple:g}x-ATR "
+        f"stop / {bt.target_atr_multiple:g}x-ATR target (max {bt.max_holding_bars} bars held) "
+        f"-> {bt.wins} wins, {bt.losses} losses, {bt.timeouts} timed out; win rate {win_rate} "
+        f"of resolved trades, average realized {bt.avg_r_multiple:+.2f}R across all of them"
+        f"{_real_execution_note(bt.round_trip_cost_pct, bt.swap_pct_per_day_used, bt.min_stop_distance_pct)}"
     )
+
+
+def _real_execution_note(round_trip_cost_pct: float, swap_pct_per_day: float, min_stop_distance_pct: float) -> str:
+    """Identical copy of ai/portfolio_suggest.py's own helper of the same
+    name — in practice always a no-op for PSX today (its own feed has no
+    High/Low, so these backtests are always None here — see
+    _format_rsi_backtest's own docstring), kept for structural
+    consistency and so this formatter is already correct if PSX ever
+    gains a real cost/broker-constraint data source. Cost/swap and the
+    guard-rail note are joined with "; ", not folded into one "net of
+    real X, Y, Z" list — see ai/portfolio_suggest.py's own identical
+    copy of this docstring for why that grammar breaks for the
+    guard-rail clause specifically."""
+    cost_parts = []
+    if round_trip_cost_pct > 0:
+        cost_parts.append(f"{round_trip_cost_pct:.4f}% round-trip cost")
+    if swap_pct_per_day:
+        cost_parts.append(f"{swap_pct_per_day:+.4f}%/day swap")
+    clauses = []
+    if cost_parts:
+        clauses.append("net of real " + " and ".join(cost_parts))
+    if min_stop_distance_pct > 0:
+        # Widening OVERRIDES the stated ATR multiple for any trade whose
+        # ATR-based stop would've sat tighter than this floor — see
+        # ai/portfolio_suggest.py's own identical copy of this note.
+        clauses.append(
+            f"stop widened to the broker's own {min_stop_distance_pct:.3f}% minimum on any trade "
+            "where the ATR-based stop would've been tighter than that"
+        )
+    if not clauses:
+        return ""
+    return " [" + "; ".join(clauses) + "]"
 
 
 def _format_backtests(a: PSXAssetAnalysis) -> list[str]:
@@ -1081,21 +1128,35 @@ def _format_backtests(a: PSXAssetAnalysis) -> list[str]:
 
     sr = a.support_resistance_backtest
     if sr is not None:
+        support_rate = f"{sr.support_win_rate_pct:.0f}%" if sr.support_win_rate_pct is not None else "n/a"
+        resistance_rate = (
+            f"{sr.resistance_win_rate_pct:.0f}%" if sr.resistance_win_rate_pct is not None else "n/a"
+        )
+        support_note = _real_execution_note(
+            sr.round_trip_cost_pct, sr.support_swap_pct_per_day_used, sr.min_stop_distance_pct
+        )
+        resistance_note = _real_execution_note(
+            sr.round_trip_cost_pct, sr.resistance_swap_pct_per_day_used, sr.min_stop_distance_pct
+        )
         lines.append(
-            f"  historical support/resistance reliability (this instrument's own past, "
-            f"{sr.forward_days}-trading-day forward check): support held (price higher "
-            f"afterward) {sr.support_hold_rate_pct:.0f}% of {sr.support_tests} real past "
-            f"tests; resistance rejected (price lower afterward) "
-            f"{sr.resistance_reject_rate_pct:.0f}% of {sr.resistance_tests} real past "
-            "tests — use this to judge how much weight the support/resistance range shown "
-            "above deserves for THIS instrument specifically, rather than assuming "
-            "support/resistance lines are reliable just because they're a well-known "
-            "charting concept."
+            f"  historical support/resistance reliability (real trade simulation, this "
+            f"instrument's own past, {sr.stop_atr_multiple:g}x-ATR stop / "
+            f"{sr.target_atr_multiple:g}x-ATR target, max {sr.max_holding_bars} bars held): "
+            f"buying off support -> {sr.support_wins}W/{sr.support_losses}L/{sr.support_timeouts} "
+            f"timed out across {sr.support_tests} real tests, win rate {support_rate}, avg "
+            f"{sr.support_avg_r_multiple:+.2f}R{support_note}; shorting off resistance -> "
+            f"{sr.resistance_wins}W/{sr.resistance_losses}L/{sr.resistance_timeouts} timed out "
+            f"across {sr.resistance_tests} real tests, win rate {resistance_rate}, avg "
+            f"{sr.resistance_avg_r_multiple:+.2f}R{resistance_note} — use this to judge how much "
+            "weight the support/resistance range shown above deserves for THIS instrument "
+            "specifically, rather than assuming support/resistance lines are reliable just "
+            "because they're a well-known charting concept."
         )
     else:
         lines.append(
-            "  historical support/resistance reliability: not enough real historical "
-            "tests of these levels to compute"
+            "  historical support/resistance reliability: not enough real historical tests "
+            "of these levels, or no High/Low data in this feed to derive a real stop/target "
+            "from, to compute"
         )
 
     eg = a.eps_growth_trend

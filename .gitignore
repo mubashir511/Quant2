@@ -5,4 +5,8 @@ __pycache__/
 .pytest_cache/
 .claude/
 streamlit_debug.log
+streamlit_log.txt
+mega_analysis_log.txt
+mega_analysis_bat_output.txt
+mega_analysis_state.json
 records/

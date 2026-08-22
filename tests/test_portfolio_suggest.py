@@ -288,14 +288,14 @@ def test_analyze_assets_wires_backtests_onto_the_analysis(
 ):
     mock_resolve.return_value = ("Gold", "GC=F")
     mock_history.return_value = _ohlc([100.0 + i for i in range(30)])
-    overbought = RSIReactionBacktest("overbought", 70.0, 6, -5.0, 100.0, 10)
-    oversold = RSIReactionBacktest("oversold", 30.0, 5, 6.0, 80.0, 10)
+    overbought = RSIReactionBacktest("overbought", 70.0, 6, 1, 5, 0, 16.7, -0.4, 1.5, 3.0, 10)
+    oversold = RSIReactionBacktest("oversold", 30.0, 5, 4, 1, 0, 80.0, 1.4, 1.5, 3.0, 10)
     mock_rsi_bt.return_value = (overbought, oversold)
     momentum_bt = MomentumPersistenceBacktest(0.4, 20, "persistent")
     mock_momentum_bt.return_value = momentum_bt
     vol_bt = VolatilityRegimeBacktest(5.0, 15, 10.0, 20, 10)
     mock_vol_bt.return_value = vol_bt
-    sr_bt = SupportResistanceBacktest(10, 70.0, 8, 60.0, 10)
+    sr_bt = SupportResistanceBacktest(10, 7, 3, 0, 70.0, 0.8, 8, 5, 3, 0, 62.5, 0.5, 1.5, 3.0, 10)
     mock_sr_bt.return_value = sr_bt
 
     assets = [MarketAsset("GO10OZ", "Gold 10oz", bid=2000.0, ask=2000.5)]
@@ -345,18 +345,50 @@ def _analysis_with_stats(symbol="GOLD-DE26"):
 
 def test_format_enriched_asset_context_includes_backtest_evidence():
     analysis = _analysis_with_stats()
-    analysis.rsi_overbought_backtest = RSIReactionBacktest("overbought", 70.0, 6, -4.5, 83.0, 10)
-    analysis.rsi_oversold_backtest = RSIReactionBacktest("oversold", 30.0, 5, 3.2, 60.0, 10)
+    analysis.rsi_overbought_backtest = RSIReactionBacktest("overbought", 70.0, 6, 5, 1, 0, 83.3, 1.5, 1.5, 3.0, 10)
+    analysis.rsi_oversold_backtest = RSIReactionBacktest("oversold", 30.0, 5, 3, 2, 0, 60.0, 0.4, 1.5, 3.0, 10)
     analysis.momentum_persistence_backtest = MomentumPersistenceBacktest(0.42, 25, "persistent")
     analysis.volatility_regime_backtest = VolatilityRegimeBacktest(8.0, 15, 4.0, 20, 10)
-    analysis.support_resistance_backtest = SupportResistanceBacktest(10, 70.0, 8, 60.0, 10)
+    analysis.support_resistance_backtest = SupportResistanceBacktest(
+        10, 7, 3, 0, 70.0, 0.8, 8, 6, 2, 0, 75.0, 0.9, 1.5, 3.0, 10
+    )
 
     text = format_enriched_asset_context([analysis])
     assert "6 distinct past episodes" in text
-    assert "reversed as the textbook convention would predict 83%" in text
+    assert "5 wins, 1 losses" in text
+    assert "win rate 83%" in text
     assert "0.42" in text and "persistent" in text
     assert "supports the 'coiled spring' reading" in text
-    assert "support held" in text and "resistance rejected" in text
+    assert "buying off support" in text and "shorting off resistance" in text
+
+
+def test_format_enriched_asset_context_discloses_real_execution_cost_when_present():
+    # Direct user request 2026-08-22: backtest results should be "more
+    # realistic and dependable" by accounting for real trade cost and
+    # broker guard rails — this locks in that the prose formatter
+    # actually surfaces it when a backtest carries real, nonzero cost/
+    # guard-rail data (e.g. FTMO's own live TradeCost, threaded in via
+    # ai/ftmo_suggest.py::_real_backtest_execution_kwargs), and stays
+    # silent about it when there's nothing real to disclose (the
+    # existing test above, using the all-default-zero fixtures, already
+    # covers that silent case).
+    analysis = _analysis_with_stats()
+    analysis.rsi_overbought_backtest = RSIReactionBacktest(
+        "overbought", 70.0, 6, 5, 1, 0, 83.3, 1.5, 1.5, 3.0, 10,
+        min_stop_distance_pct=0.15, round_trip_cost_pct=0.045, swap_pct_per_day_used=0.0006,
+    )
+    analysis.support_resistance_backtest = SupportResistanceBacktest(
+        10, 7, 3, 0, 70.0, 0.8, 8, 6, 2, 0, 75.0, 0.9, 1.5, 3.0, 10,
+        min_stop_distance_pct=0.15, round_trip_cost_pct=0.045,
+        support_swap_pct_per_day_used=-0.0075, resistance_swap_pct_per_day_used=0.0003,
+    )
+
+    text = format_enriched_asset_context([analysis])
+    assert "net of real 0.0450% round-trip cost" in text
+    assert "stop widened to the broker's own 0.150% minimum" in text
+    assert "+0.0006%/day swap" in text  # RSI oversold's own swap side
+    assert "-0.0075%/day swap" in text  # support's own swap side
+    assert "+0.0003%/day swap" in text  # resistance's own swap side
 
 
 def test_format_enriched_asset_context_flags_volatility_regime_contradiction():
@@ -371,7 +403,29 @@ def test_format_enriched_asset_context_discloses_missing_backtest_evidence():
     text = format_enriched_asset_context([analysis])
     assert "not enough real historical episodes" in text
     assert "not enough history to compute" in text
-    assert "not enough real historical tests of these levels to compute" in text
+    assert "not enough real historical tests of these levels" in text
+
+
+def test_volume_caveat_is_broader_market_for_yahoo_sourced_data():
+    # data_source defaults to "yahoo" — every PMEX/PSX entry, and FTMO's
+    # own Yahoo-mapped ones (e.g. XAUUSD -> GC=F).
+    analysis = _analysis_with_stats()
+    assert analysis.data_source == "yahoo"
+    text = format_enriched_asset_context([analysis])
+    assert "not this account's own order flow" in text
+
+
+def test_volume_caveat_is_this_accounts_own_feed_for_mt5_sourced_data():
+    # FTMO's native-D1 backfill (ai/ftmo_suggest.py::_enrich_with_native_d1)
+    # for symbols with no Yahoo mapping — real gap confirmed live: 16 of
+    # 17 real FTMO Market Watch symbols. Volume there genuinely IS this
+    # account's own MT5 feed, not a Yahoo broader-market proxy, so the
+    # caveat must say something different from the yahoo case.
+    analysis = _analysis_with_stats()
+    analysis.data_source = "mt5"
+    text = format_enriched_asset_context([analysis])
+    assert "this account's own MT5 feed" in text
+    assert "not this account's own order flow" not in text
 
 
 _NO_AUDIT = AuditResult(block="", audit_available=False)
@@ -777,6 +831,13 @@ def test_system_instruction_requires_trailing_json_allocation_block():
     assert "CASH" in instruction
 
 
+def test_system_instruction_mentions_short_side_support():
+    instruction = build_stage1_instruction()
+    assert '"side"' in instruction
+    assert '"buy"' in instruction
+    assert '"sell"' in instruction
+
+
 @patch("ai.portfolio_suggest.fetch_recent_headlines", return_value=["Gold rallies on rate cut bets"])
 @patch("ai.portfolio_suggest.fetch_price_history_ohlcv")
 @patch("ai.portfolio_suggest.resolve_yahoo_ticker")
@@ -830,6 +891,76 @@ def test_parse_final_allocation_object_shape_tolerates_missing_price_and_stop():
     text = '```json\n{"GO10OZ": {"pct": 15}, "CASH": 85}\n```'
     allocation = parse_final_allocation(text)
     assert allocation["GO10OZ"] == AllocationEntry(pct=15.0, price=None, stop_loss=None)
+
+
+def test_parse_final_allocation_extracts_side_buy_and_sell():
+    text = (
+        '```json\n{"GO10OZ": {"pct": 15, "price": 2005.5, "stop_loss": 1950.0, "side": "sell"}, '
+        '"CASH": 85}\n```'
+    )
+    allocation = parse_final_allocation(text)
+    assert allocation["GO10OZ"] == AllocationEntry(
+        pct=15.0, price=2005.5, stop_loss=1950.0, side="sell"
+    )
+
+
+def test_parse_final_allocation_defaults_side_to_buy_when_absent():
+    # Old-shape responses (and PSX's own prompt, which never emits this
+    # field) must keep working exactly as before.
+    text = '```json\n{"GO10OZ": {"pct": 15, "price": 2000.0}, "CASH": 85}\n```'
+    allocation = parse_final_allocation(text)
+    assert allocation["GO10OZ"].side == "buy"
+
+
+def test_parse_final_allocation_side_is_case_insensitive():
+    text = '```json\n{"GO10OZ": {"pct": 15, "price": 2000.0, "side": "SELL"}, "CASH": 85}\n```'
+    allocation = parse_final_allocation(text)
+    assert allocation["GO10OZ"].side == "sell"
+
+
+def test_parse_final_allocation_none_when_side_is_invalid():
+    # An invalid direction is a structural schema violation, not a
+    # "missing, tolerate it" case — fails the whole parse rather than
+    # silently guessing a direction.
+    text = '```json\n{"GO10OZ": {"pct": 15, "price": 2000.0, "side": "long"}, "CASH": 85}\n```'
+    assert parse_final_allocation(text) is None
+
+
+def test_parse_final_allocation_require_side_true_fails_whole_parse_when_absent():
+    # For FTMO/PMEX (require_side=True), an object-shape entry silently
+    # missing "side" must fail the whole parse rather than default to
+    # "buy" — a missing side on a symbol currently held SHORT would
+    # otherwise silently look like a target to flip to long, closing a
+    # real short and opening a real long on a silently-guessed field.
+    text = '```json\n{"GO10OZ": {"pct": 15, "price": 2000.0, "stop_loss": 1950.0}, "CASH": 85}\n```'
+    assert parse_final_allocation(text, require_side=True) is None
+
+
+def test_parse_final_allocation_require_side_true_still_parses_when_present():
+    text = (
+        '```json\n{"GO10OZ": {"pct": 15, "price": 2000.0, "stop_loss": 1950.0, "side": "sell"}, '
+        '"CASH": 85}\n```'
+    )
+    allocation = parse_final_allocation(text, require_side=True)
+    assert allocation["GO10OZ"].side == "sell"
+
+
+def test_parse_final_allocation_require_side_false_still_defaults_to_buy():
+    # Default behavior (PSX, and the cold-start session-resume loader)
+    # must stay exactly as before.
+    text = '```json\n{"GO10OZ": {"pct": 15, "price": 2000.0}, "CASH": 85}\n```'
+    allocation = parse_final_allocation(text, require_side=False)
+    assert allocation["GO10OZ"].side == "buy"
+
+
+def test_parse_final_allocation_require_side_true_bare_number_still_defaults_to_buy():
+    # The old bare-number fallback shape (no object at all) is a
+    # different tolerance than an object silently missing "side" — it
+    # stays exempt from require_side since a bare number never carries
+    # enough information to express a direction in the first place.
+    text = '```json\n{"GO10OZ": 15, "CASH": 85}\n```'
+    allocation = parse_final_allocation(text, require_side=True)
+    assert allocation["GO10OZ"].side == "buy"
 
 
 def test_parse_final_allocation_none_when_object_missing_pct():

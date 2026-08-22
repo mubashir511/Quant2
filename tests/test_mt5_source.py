@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -8,13 +8,17 @@ import pytest
 import config
 from data.mt5_source import (
     MT5ConnectionError,
+    HistoricalDeal,
     _ensure_symbol_selected,
     connect,
     fetch_mt5_price_history,
     get_contract_spec,
+    get_current_bid_ask,
     get_history_deals,
     get_market_watch,
+    get_symbol_category,
     get_trade_economics,
+    group_closed_trades,
     is_trading_permitted,
 )
 
@@ -334,6 +338,7 @@ def _make_forex_info(**overrides):
     info.swap_short = 0.37
     info.swap_mode = 1  # SYMBOL_SWAP_MODE_POINTS
     info.path = "Forex\\Majors\\EURUSD"
+    info.trade_stops_level = 0  # no broker-imposed minimum stop distance by default
     for k, v in overrides.items():
         setattr(info, k, v)
     return info
@@ -356,6 +361,27 @@ def test_get_trade_economics_points_swap_mode_matches_real_ftmo_eurusd(
     # -8.74 points * $1.00/point / (100000 * 1.15695 notional) * 100
     assert cost.swap_long_pct_per_day == pytest.approx(-8.74 / 115695.0 * 100, rel=1e-6)
     assert cost.swap_short_pct_per_day == pytest.approx(0.37 / 115695.0 * 100, rel=1e-6)
+    assert cost.min_stop_distance_pct == 0.0
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info_tick")
+@patch("MetaTrader5.symbol_info")
+def test_get_trade_economics_computes_real_min_stop_distance_when_broker_enforces_one(
+    mock_symbol_info, mock_tick, mock_select
+):
+    # A real, if less common, broker constraint: MT5's own
+    # SYMBOL_TRADE_STOPS_LEVEL, a minimum stop/target distance in points
+    # from the current price — 100 points here (0.00100 at 5-digit
+    # EURUSD pricing), confirmed convertible to a %-of-price figure.
+    info = _make_forex_info(trade_stops_level=100)
+    mock_symbol_info.return_value = info
+    mock_tick.return_value = _make_tick(1.15689, 1.15695)
+
+    cost = get_trade_economics("EURUSD")
+
+    assert cost is not None
+    assert cost.min_stop_distance_pct == pytest.approx(100 * 1e-05 / 1.15695 * 100, rel=1e-6)
 
 
 @patch("MetaTrader5.symbol_select", return_value=True)
@@ -409,6 +435,39 @@ def test_get_trade_economics_uncategorized_when_path_missing(mock_symbol_info, m
     cost = get_trade_economics("EURUSD")
 
     assert cost.category == "Uncategorized"
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info")
+def test_get_symbol_category_reads_top_level_path_segment(mock_symbol_info, mock_select):
+    mock_symbol_info.return_value = _make_forex_info(path="Metals CFD\\XAUUSD")
+    assert get_symbol_category("XAUUSD") == "Metals CFD"
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info")
+def test_get_symbol_category_uncategorized_when_path_missing(mock_symbol_info, mock_select):
+    mock_symbol_info.return_value = _make_forex_info(path="")
+    assert get_symbol_category("EURUSD") == "Uncategorized"
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info", return_value=None)
+def test_get_symbol_category_uncategorized_when_no_symbol_info(mock_symbol_info, mock_select):
+    assert get_symbol_category("UNKNOWN") == "Uncategorized"
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info_tick")
+def test_get_current_bid_ask_returns_both_sides(mock_tick, mock_select):
+    mock_tick.return_value = _make_tick(1.1000, 1.1005)
+    assert get_current_bid_ask("EURUSD") == (1.1000, 1.1005)
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info_tick", return_value=None)
+def test_get_current_bid_ask_none_when_no_tick(mock_tick, mock_select):
+    assert get_current_bid_ask("EURUSD") is None
 
 
 @patch("MetaTrader5.symbol_select", return_value=True)
@@ -640,6 +699,73 @@ def test_get_history_deals_empty_for_fresh_account(mock_history):
     # A brand-new account (e.g. a fresh FTMO Challenge) with zero trade
     # history is a normal, expected case, not a failure.
     assert get_history_deals(datetime(2026, 8, 1)) == []
+
+
+def test_group_closed_trades_sums_every_leg_onto_the_position():
+    # Real shape confirmed live: opening leg carries only commission,
+    # closing leg carries the real profit+swap+commission — the true net
+    # result only matched the account's real balance change when both
+    # legs were summed together.
+    deals = [
+        HistoricalDeal(
+            1, datetime(2026, 8, 18, 9, 47, 28), "XAUUSD", -1.51, 0.49,
+            position_id=100, price=4407.58, side="buy",
+        ),
+        HistoricalDeal(
+            2, datetime(2026, 8, 18, 10, 2, 56), "XAUUSD", -333.24, 0.49,
+            position_id=100, price=4400.81, side="sell",
+        ),
+    ]
+    trades = group_closed_trades(deals)
+    assert len(trades) == 1
+    assert trades[0].symbol == "XAUUSD"
+    assert trades[0].profit == pytest.approx(-334.75)
+    assert trades[0].closed_at == datetime(2026, 8, 18, 10, 2, 56)
+    # side/open_price come from the opening leg, close_price from the
+    # closing leg — confirmed live these match the real account exactly.
+    assert trades[0].side == "buy"
+    assert trades[0].opened_at == datetime(2026, 8, 18, 9, 47, 28)
+    assert trades[0].open_price == pytest.approx(4407.58)
+    assert trades[0].close_price == pytest.approx(4400.81)
+    assert trades[0].duration == timedelta(minutes=15, seconds=28)
+
+
+def test_group_closed_trades_excludes_still_open_positions():
+    # Only one deal on record for this position — it hasn't closed yet.
+    deals = [HistoricalDeal(1, datetime(2026, 8, 18), "EURUSD", 0.0, 1.0, position_id=200)]
+    assert group_closed_trades(deals) == []
+
+
+def test_group_closed_trades_excludes_non_trade_balance_deals():
+    # A deposit/withdrawal deal has no symbol and no position_id — must
+    # never show up as a "closed trade."
+    deals = [HistoricalDeal(1, datetime(2026, 8, 18), "", 10000.0, 0.0, position_id=0)]
+    assert group_closed_trades(deals) == []
+
+
+def test_group_closed_trades_sorts_newest_first():
+    deals = [
+        HistoricalDeal(1, datetime(2026, 8, 1), "EURUSD", -1.0, 1.0, position_id=1),
+        HistoricalDeal(2, datetime(2026, 8, 2), "EURUSD", 5.0, 1.0, position_id=1),
+        HistoricalDeal(3, datetime(2026, 8, 10), "GBPUSD", -1.0, 1.0, position_id=2),
+        HistoricalDeal(4, datetime(2026, 8, 11), "GBPUSD", 20.0, 1.0, position_id=2),
+    ]
+    trades = group_closed_trades(deals)
+    assert [t.position_id for t in trades] == [2, 1]
+
+
+@patch("MetaTrader5.history_deals_get", return_value=[])
+def test_get_history_deals_default_date_to_extends_a_day_into_the_future(mock_history):
+    # Real bug, confirmed live: MT5 deal timestamps are in the broker's
+    # SERVER clock, which can run meaningfully ahead of this machine's
+    # local clock (~2 hours observed against the real FTMO account) — a
+    # default date_to=datetime.now() (local) silently excluded a deal
+    # that had already happened in server time. The default must clear
+    # local "now" by a real margin, not sit exactly on it.
+    before_call = datetime.now()
+    get_history_deals(datetime(2026, 8, 1))
+    used_date_to = mock_history.call_args.args[1]
+    assert used_date_to > before_call + timedelta(hours=12)
 
 
 def _make_rate(t, o, h, l, c, tick_volume):

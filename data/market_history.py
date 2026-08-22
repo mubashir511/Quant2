@@ -1,5 +1,15 @@
 import pandas as pd
 
+from utils import run_with_timeout
+
+# Hard wall-clock ceiling for the whole call, on top of (not instead of)
+# yfinance's own internal per-request timeouts — see utils.run_with_
+# timeout's own docstring for why this is needed: yfinance's internal
+# cookie/crumb negotiation has been confirmed live to hang well past its
+# own 10-30s per-request caps under some process contexts, and this
+# function otherwise has no ceiling on that at all.
+_YAHOO_HISTORY_TIMEOUT_SECONDS = 20.0
+
 
 def fetch_price_history_ohlcv(yahoo_ticker: str, period: str = "5y") -> pd.DataFrame:
     """High/Low/Close/Volume daily history for a Yahoo ticker, oldest
@@ -25,9 +35,14 @@ def fetch_price_history_ohlcv(yahoo_ticker: str, period: str = "5y") -> pd.DataF
     of those existing values — they only make analysis/backtest.py's
     multi-year backtests (which need real historical episodes, not just
     a recent window) usable against PMEX instruments too."""
-    import yfinance as yf
+    empty = pd.DataFrame({col: pd.Series(dtype=float) for col in ["High", "Low", "Close", "Volume"]})
 
-    history = yf.Ticker(yahoo_ticker).history(period=period)
+    def _fetch() -> pd.DataFrame:
+        import yfinance as yf
+
+        return yf.Ticker(yahoo_ticker).history(period=period)
+
+    history = run_with_timeout(_fetch, _YAHOO_HISTORY_TIMEOUT_SECONDS, default=empty)
     if history.empty:
-        return pd.DataFrame({col: pd.Series(dtype=float) for col in ["High", "Low", "Close", "Volume"]})
+        return empty
     return history[["High", "Low", "Close", "Volume"]]

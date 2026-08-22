@@ -8,7 +8,23 @@ TRADING_DAYS_1M = 21
 TRADING_DAYS_3M = 63
 TRADING_DAYS_6M = 126
 TRADING_DAYS_PER_YEAR = 252
-TREND_BAND_PCT = 1.0
+
+# Short-term trend (vs the 20-bar SMA) is now gated on how many standard
+# deviations of the SAME 20-bar window's own prices the last price sits
+# from that window's mean, not a flat percentage. Real bug found live
+# 2026-08-21/22: a flat TREND_BAND_PCT=1.0% applied unscaled to H4/H1 bars
+# (fed the same SMA_WINDOW=20 by ai/ftmo_suggest.py) made FX read "flat"
+# almost everywhere — a real saved session showed EURUSD/GBPUSD H4 reads
+# of "+0.1% vs 20-bar SMA" labeled flat, when that's actually a normal
+# H4 move for FX, not a genuinely quiet one. A z-score band scales
+# automatically with each instrument's OWN recent volatility and with
+# timeframe (H1 bars have smaller absolute swings but proportionally
+# similar relative behavior to D1), fixing the bias without needing a
+# separate hardcoded band per timeframe. 0.5 standard deviations is a
+# real, if modest, divergence from the window's own recent average — not
+# an extreme outlier threshold, since "trend" here is meant to be a
+# sensitive short-term read, not a rare-event flag.
+TREND_BAND_Z = 0.5
 
 # Medium-term "market pattern" window (~3 months of trading days) used for
 # support/resistance and market-regime classification — deliberately
@@ -16,8 +32,47 @@ TREND_BAND_PCT = 1.0
 # complementary short- vs medium-term views rather than duplicating one
 # another.
 RANGE_WINDOW = 60
-TRENDING_EFFICIENCY_RATIO = 0.5
-SIDEWAYS_EFFICIENCY_RATIO = 0.25
+
+# market_regime is built from TWO genuinely different, complementary
+# questions about the RANGE_WINDOW price path, not one:
+#   (1) DIRECTION — has price made a real net move over the window at
+#       all, scaled by the window's own volatility (same z-score idea as
+#       TREND_BAND_Z above, just over the longer window)?
+#   (2) EFFICIENCY — how directly did it get there (Kaufman's Efficiency
+#       Ratio: net move / total path length; close to 1 = a clean,
+#       straight-line move, close to 0 = a lot of back-and-forth churn
+#       along the way)?
+# Real bug found live 2026-08-21/22, found by testing against fresh MT5
+# data rather than by reasoning about the thresholds alone: using
+# efficiency ratio ALONE to answer BOTH questions at once labeled real,
+# live FTMO instruments "sideways" even when they'd made a genuine net
+# directional move over the window — e.g. AUDUSD's real D1 data showed
+# efficiency_ratio=0.007 (i.e. almost pure back-and-forth noise by that
+# measure alone) despite a real net move over the same 60 bars that a
+# DIFFERENT, independently-computed detector in this codebase
+# (chart_structure.py's swing-based higher-highs/higher-lows structure)
+# also confirmed as a genuine uptrend on the identical bars. A "sideways"
+# label was actively hiding that real direction rather than describing
+# a genuine lack of one — a materially worse read for anyone deciding
+# whether there's a trade here than a HONEST "yes it's moved, but
+# choppily" would be. Raising the threshold instead of fixing the design
+# (tried and empirically checked first, against this same real data)
+# barely moved the mislabeling rate at all, confirming the two-question
+# conflation was the actual defect, not just a mistuned number.
+RANGE_DIRECTION_Z = 0.5
+# Calibrated against real, live FTMO Market Watch D1 data (18 real
+# instruments, fetched fresh) rather than picked from theory alone: since
+# efficiency here is measured off the SAME half-window mean_shift as the
+# direction check above (see that computation's own comment for why),
+# its real achievable range on actual market data is much smaller than
+# Kaufman's classic raw-endpoint-to-endpoint version — the live sample's
+# own values topped out around 0.15, with most real "has genuine
+# direction" instruments landing well under 0.10. 0.08 sits at roughly
+# that live sample's own 75th percentile: the top quarter of genuinely-
+# directional real instruments (the cleanest-moving ones) read as
+# "trending", the rest as "choppy" — both are DIRECTIONAL calls now
+# (see RANGE_DIRECTION_Z above), this threshold only decides how cleanly.
+TRENDING_EFFICIENCY_RATIO = 0.08
 
 # Average True Range window — the standard 14-period convention (Wilder's
 # original), used here as a simple rolling mean rather than Wilder's
@@ -50,7 +105,7 @@ class TechnicalStats:
     support: float | None  # rolling low over RANGE_WINDOW
     resistance: float | None  # rolling high over RANGE_WINDOW
     range_width_pct: float | None  # (resistance - support) / last_price
-    market_regime: str | None  # "trending_up" / "trending_down" / "sideways" / "mixed"
+    market_regime: str | None  # "trending_up" / "trending_down" / "choppy_up" / "choppy_down" / "sideways" — see the market_regime computation's own comment for what each means
     atr: float | None  # Average True Range over ATR_WINDOW, in price units
     atr_pct: float | None  # atr / last_price * 100 — comparable across instruments
     rsi: float | None  # 0-100, momentum — conventionally overbought >70, oversold <30
@@ -134,9 +189,14 @@ def compute_technical_stats(
 
     `periods_per_year` defaults to TRADING_DAYS_PER_YEAR (252) — correct
     for every existing caller, which all feed daily bars. It ONLY scales
-    volatility_annualized_pct (every other stat here — SMA/trend, the
-    Kaufman efficiency ratio, RSI, ATR — is a pure bar-count window, not
-    tied to a calendar-time assumption, so timeframe doesn't distort it).
+    volatility_annualized_pct — the Kaufman efficiency ratio, RSI, and ATR
+    are pure bar-count windows, not tied to a calendar-time assumption, so
+    timeframe doesn't distort them. `trend` is NOT bar-count-only the same
+    way: it's gated on a volatility-normalized z-score (TREND_BAND_Z), not
+    a flat percentage, specifically because a flat percentage WAS
+    distorted by timeframe (confirmed live: FTMO's own H4 reads showed
+    ordinary ~0.1% moves labeled "flat" against a 1%-flat band sized for
+    daily bars) — see TREND_BAND_Z's own module-level comment.
     A caller feeding a DIFFERENT bar frequency (confirmed live: FTMO's
     own H4/H1 reads, previously always scaled by sqrt(252) regardless of
     being fed 4-hour or 1-hour bars, understated real annualized
@@ -151,13 +211,21 @@ def compute_technical_stats(
 
     sma20 = pct_vs_sma20 = trend = None
     if len(prices) >= SMA_WINDOW:
-        sma20 = float(prices.tail(SMA_WINDOW).mean())
+        window = prices.tail(SMA_WINDOW)
+        sma20 = float(window.mean())
         pct_vs_sma20 = (last_price - sma20) / sma20 * 100
-        if pct_vs_sma20 > TREND_BAND_PCT:
-            trend = "uptrend"
-        elif pct_vs_sma20 < -TREND_BAND_PCT:
-            trend = "downtrend"
+        window_std = float(window.std())
+        if window_std > 0:
+            trend_z = (last_price - sma20) / window_std
+            if trend_z > TREND_BAND_Z:
+                trend = "uptrend"
+            elif trend_z < -TREND_BAND_Z:
+                trend = "downtrend"
+            else:
+                trend = "flat"
         else:
+            # A window with zero variance (every price identical) is
+            # genuinely flat, not an undefined z-score.
             trend = "flat"
 
     def change_over(n_trading_days: int) -> float | None:
@@ -188,21 +256,56 @@ def compute_technical_stats(
         if last_price != 0:
             range_width_pct = (resistance - support) / last_price * 100
 
-        # Kaufman's Efficiency Ratio: net directional move over the window
-        # divided by the total path length (sum of absolute day-to-day
-        # moves). Close to 1 = strongly directional ("trending"); close to
-        # 0 = choppy back-and-forth with little net progress ("sideways").
-        net_change = last_price - float(window.iloc[0])
-        daily_moves = window.diff().dropna().abs()
-        total_path = float(daily_moves.sum())
-        if total_path > 0:
-            efficiency_ratio = abs(net_change) / total_path
-            if efficiency_ratio >= TRENDING_EFFICIENCY_RATIO:
-                market_regime = "trending_up" if net_change > 0 else "trending_down"
-            elif efficiency_ratio < SIDEWAYS_EFFICIENCY_RATIO:
-                market_regime = "sideways"
+        # DIRECTION first: has this window's average LEVEL genuinely
+        # shifted, relative to the window's own volatility? Compares the
+        # first-half mean against the second-half mean rather than the two
+        # raw endpoint prices — a pure back-and-forth oscillation between
+        # two fixed levels can, by pure chance of exactly which day a
+        # window happens to start/end on, have its two single endpoints
+        # land on opposite extremes with no real underlying shift at all
+        # (confirmed while fixing this: a hand-built pure +5/-5 alternation
+        # with zero real trend read as "choppy_down" under a raw endpoint-
+        # to-endpoint z-score, purely from which of the two phases the
+        # window's first and last samples happened to land on). Averaging
+        # 30 days on each side smooths that sampling-boundary luck out far
+        # better than comparing two single days ever could — the same
+        # reason `trend` above compares against a mean, not a lone
+        # earlier price. Below RANGE_DIRECTION_Z, there's genuinely no
+        # real level shift to characterize further — "sideways" —
+        # regardless of how the path in between looked. See this
+        # section's own module-level comment (above RANGE_DIRECTION_Z)
+        # for the real bug this two-step design fixes.
+        half = RANGE_WINDOW // 2
+        first_half_mean = float(window.iloc[:half].mean())
+        second_half_mean = float(window.iloc[half:].mean())
+        mean_shift = second_half_mean - first_half_mean
+        window_std = float(window.std())
+        direction_z = mean_shift / window_std if window_std > 0 else 0.0
+
+        if abs(direction_z) < RANGE_DIRECTION_Z:
+            market_regime = "sideways"
+        else:
+            # There IS a real direction — EFFICIENCY now decides whether
+            # it's been a clean, direct move ("trending") or a genuine net
+            # move reached via a lot of back-and-forth churn ("choppy").
+            # A Kaufman's-Efficiency-Ratio-style measure: net move / total
+            # path length — close to 1 means the path length is barely
+            # more than the net move itself (clean); close to 0 means a
+            # lot of the path was retraced along the way. Uses the SAME
+            # mean_shift as the direction check above (rather than
+            # Kaufman's own raw endpoint-to-endpoint delta) so both
+            # questions are answered off one consistent, sampling-
+            # boundary-robust measure of "how far did this window's level
+            # really move" instead of two different deltas that could, in
+            # principle, even disagree on sign at the edges.
+            daily_moves = window.diff().dropna().abs()
+            total_path = float(daily_moves.sum())
+            efficiency_ratio = abs(mean_shift) / total_path if total_path > 0 else 0.0
+            is_efficient = efficiency_ratio >= TRENDING_EFFICIENCY_RATIO
+            if mean_shift > 0:
+                market_regime = "trending_up" if is_efficient else "choppy_up"
             else:
-                market_regime = "mixed"
+                market_regime = "trending_down" if is_efficient else "choppy_down"
 
     atr = atr_pct = None
     if history is not None and not history.empty:

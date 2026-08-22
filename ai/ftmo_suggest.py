@@ -1,15 +1,17 @@
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
+
+import pandas as pd
 
 import config
 from ai.claude_cli import CLI_FAILED_PREFIX, CLI_MISSING_MESSAGE, run_claude
 from ai.portfolio_suggest import (
     AUDIT_MODELS,
     AssetAnalysis,
-    analyze_assets,
     build_audit_block,
     build_fx_context,
     build_macro_snapshot,
@@ -18,19 +20,29 @@ from ai.portfolio_suggest import (
     format_enriched_asset_context,
 )
 from ai.session_record import SessionRecord, save_portfolio_session
+from analysis.backtest import (
+    backtest_momentum_persistence,
+    backtest_rsi_reaction,
+    backtest_support_resistance_reaction,
+    backtest_volatility_regime,
+)
 from analysis.chart_structure import ChartStructureSnapshot, compute_chart_structure, find_mtf_confluence
 from analysis.setup_classifier import SetupSignal, classify_setups
 from analysis.technical import TRADING_DAYS_PER_YEAR, TechnicalStats, compute_technical_stats
 from data.book_wisdom import format_book_wisdom
 from data.mt5_source import (
     AccountSummary,
+    ContractSpec,
+    HistoricalDeal,
     MarketAsset,
     Position,
     TradeCost,
     fetch_mt5_price_history,
+    get_contract_spec,
+    get_history_deals,
     get_trade_economics,
 )
-from risk.ftmo_rules import FtmoStatus
+from risk.ftmo_rules import FtmoStatus, compute_ftmo_status
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +63,7 @@ logger = logging.getLogger(__name__)
 # secondary distinction.
 _H4_PERIODS_PER_YEAR = 6 * TRADING_DAYS_PER_YEAR  # 6 four-hour bars/day
 _H1_PERIODS_PER_YEAR = 24 * TRADING_DAYS_PER_YEAR  # 24 one-hour bars/day
+_MN1_PERIODS_PER_YEAR = 12  # 12 monthly bars/year
 
 # app.py imports parse_final_allocation/strip_allocation_block/
 # AllocationEntry/AUDIT_MODELS from ai.portfolio_suggest directly for
@@ -105,6 +118,37 @@ _FTMO_RISK_CALIBRATION = (
     "before you size anything."
 )
 
+_FTMO_ANTI_OVER_CONSERVATISM = (
+    "WITHIN the hard aggregate-heat ceiling (unchanged, non-negotiable — "
+    "at most 50% of the real daily-loss headroom, ~1.5% aggregate heat "
+    "on a fresh day; the FTMO COMPLIANCE HEADROOM checklist item below "
+    "spells out the exact mechanics), a separate failure mode is worth "
+    "actively resisting: "
+    "concluding there's nothing tradeable just because many instruments' "
+    "technical setup reads 'no_clear_setup' or their market-type reads "
+    "'sideways'/'choppy_up'/'choppy_down' rather than a clean trending "
+    "read. That pattern is genuinely common on this instrument pool and "
+    "is NOT itself evidence the small remaining risk budget should sit "
+    "unused — see the FUNDAMENTAL-BASED INCLUSION paragraph below for "
+    "the additional, equally legitimate path to conviction this opens "
+    "up, and actually use WebSearch/WebFetch to look for it before "
+    "concluding an instrument has nothing going for it. This is NOT "
+    "permission to stretch or invent evidence — an instrument with "
+    "genuinely no supporting technical OR fundamental case, or one "
+    "whose technical read directly CONTRADICTS the fundamental story, "
+    "still belongs at 0% or left out; the ask is to look for real "
+    "evidence harder before defaulting to cash, not to lower the bar "
+    "for what counts as evidence once found. If, after that genuine "
+    "search, the mix still ends up concentrated in very few positions "
+    "or heavily cash, that's a legitimate, evidence-backed outcome some "
+    "days — say so plainly rather than manufacturing a weak case just "
+    "to fill out the mix. But if every run defaults to the same "
+    "near-all-cash result regardless of what the actual data and "
+    "research show, that itself is worth noticing and naming explicitly "
+    "in the Executive Summary, since it would mean the fundamental path "
+    "to conviction isn't actually being exercised in practice."
+)
+
 _FTMO_STATUS_NOTE = (
     "A 'FTMO Compliance Status' section below gives this account's REAL, "
     "currently computed standing against all three rules above (today's "
@@ -152,6 +196,8 @@ _INSTRUCTION_HEAD = (
     "\n\n"
     f"{_FTMO_RISK_CALIBRATION}"
     "\n\n"
+    f"{_FTMO_ANTI_OVER_CONSERVATISM}"
+    "\n\n"
     "If a 'Current Open Positions' section appears below, the account is "
     "not starting from empty — treat those as real, already-committed "
     "capital, not a hypothetical. Your final mix must explicitly "
@@ -162,15 +208,24 @@ _INSTRUCTION_HEAD = (
     "\n\n"
     "You're also given: a macro snapshot (US Treasury yield curve, "
     "dollar index, VIX, and GDP growth/inflation/unemployment for 10 "
-    "major economies), and per-instrument technical context on THREE "
-    "timeframes — a daily (D1) read where a Yahoo-comparable public price "
-    "series exists for the symbol (short-term trend vs. 20-day moving "
-    "average, annualized volatility, Average True Range, 14-day RSI, a "
-    "volume trend, and a medium-term ~3-month support/resistance range "
-    "with a market-type classification), PLUS real H4 and H1 reads "
-    "fetched directly from THIS account's own live MT5 price feed for "
-    "every symbol regardless of Yahoo availability (the same kind of "
-    "stats, computed fresh on each shorter window)."
+    "major economies), and per-instrument technical context on FOUR "
+    "timeframes — real monthly (MN1, up to 10 years where the broker's "
+    "own history goes back that far), daily (D1), H4, and H1 reads, all "
+    "fetched directly from THIS account's own live MT5 price feed (D1 "
+    "instead comes from a Yahoo-comparable public series where one "
+    "exists, e.g. gold's own continuous futures series — either way it's "
+    "real multi-year price history, not a gap). Each read carries a "
+    "short-term trend vs. 20-day/-bar moving average, annualized "
+    "volatility, Average True Range, 14-period RSI, a volume trend, and "
+    "a medium-term ~60-bar support/resistance range with a market-type "
+    "classification — 'sideways' (no real net move over that window), "
+    "'trending_up'/'trending_down' (a real move, reached cleanly), or "
+    "'choppy_up'/'choppy_down' (a real move, but via a noisy "
+    "back-and-forth path — still genuine directional evidence, not a "
+    "weaker cousin of sideways) — computed identically on every "
+    "timeframe, so a 60-bar window means ~5 years of structural context "
+    "on the monthly read, ~3 months on daily, and the equivalent short-"
+    "term window on H4/H1."
     "\n\n"
     "HOLDING HORIZON — this account trades INTRADAY TO AT MOST ONE "
     "TRADING DAY: the default expectation for every position is a few "
@@ -178,11 +233,32 @@ _INSTRUCTION_HEAD = (
     "exception, not the default (never a multi-day swing, never weeks or "
     "months). The H4 and H1 reads are the PRIMARY basis for the actual "
     "thesis, entry, and stop — not just timing layered on top of a "
-    "longer daily story. Use the daily (D1) read, where available, only "
-    "as broader regime/bias context (e.g. is the multi-week trend a "
-    "tailwind or headwind for a short entry) — never as the source of a "
-    "multi-day price target, and never as a reason to hold a position "
-    "past its own session by default."
+    "longer daily story. Use the daily (D1) and monthly (MN1) reads, "
+    "where available, only as broader regime/bias context (e.g. is the "
+    "multi-week or multi-year trend a tailwind or headwind for a short "
+    "entry) — never as the source of a multi-day price target, and never "
+    "as a reason to hold a position past its own session by default."
+    "\n\n"
+    "REAL, NOT A FAKE, TREND — user's own explicit concern, and the "
+    "reason the monthly/daily context above exists at all: a real "
+    "'Long-term alignment' line is computed per instrument (see below), "
+    "comparing the H4 move actually being considered against the real "
+    "daily/monthly backdrop. A STRUCTURALLY BACKED read (the H4 move "
+    "agrees with the real longer-term direction) is genuine additional "
+    "confirmation — weigh it as such. A COUNTER-TREND SPIKE read (the H4 "
+    "move runs against the real longer-term direction) is explicitly NOT "
+    "a reason to skip the instrument — short, fast counter-trend moves "
+    "with no longer-term backing are real, tradeable opportunities when "
+    "correctly recognized as exactly that, not mistaken for the start of "
+    "a durable trend. What it DOES require: state plainly in that "
+    "position's own thesis that it's a counter-trend/spike trade, use a "
+    "tighter stop (per DEBATE THE STOP AND TARGET below) since these "
+    "moves reverse faster than a structurally-backed one, commit to a "
+    "firm, short holding window rather than leaving it open-ended, and "
+    "size it reflecting lower conviction that the move itself will last "
+    "— getting in and back out on the move's own terms is the whole "
+    "point of trading one, not a consolation next to a 'better' aligned "
+    "trade."
     "\n\n"
     "DEBATE THE HOLDING PERIOD PER INSTRUMENT, don't apply one horizon "
     "uniformly — you're not fighting this broker's real fee/spread/swap "
@@ -223,9 +299,8 @@ _INSTRUCTION_HEAD = (
     "equity indices with no single natural per-instrument benchmark, so "
     "fabricating one would be closer to noise than evidence."
     "\n\n"
-    "REAL CHART STRUCTURE is also given per instrument on BOTH H4 and "
-    "H1 (deliberately not on the daily read, which is regime/bias "
-    "context only per HOLDING HORIZON above) — computed directly in "
+    "REAL CHART STRUCTURE is also given per instrument on ALL FOUR "
+    "timeframes — monthly, D1, H4, and H1 — computed directly in "
     "Python from the actual price series, not estimated or eyeballed: a "
     "Fibonacci retracement between the most recent real swing high and "
     "swing low, with the level price currently sits nearest; multi-"
@@ -240,32 +315,60 @@ _INSTRUCTION_HEAD = (
     "lower-highs/lower-lows, and triangle/wedge from converging "
     "trendlines) — 'not enough confirmed swing points yet' or no "
     "patterns listed is a normal, common result, not a gap to explain "
-    "away. Use the touch-count-ranked S/R levels and the Fibonacci "
-    "levels as your PRIMARY candidate stop/target anchors (per the "
-    "DEBATE THE STOP AND TARGET instruction below) ahead of an arbitrary "
+    "away. The H4/H1 touch-count-ranked S/R levels and Fibonacci levels "
+    "remain your PRIMARY candidate stop/target anchors (per the DEBATE "
+    "THE STOP AND TARGET instruction below), consistent with HOLDING "
+    "HORIZON above — H4/H1 stay the surface the actual entry/stop/target "
+    "gets placed on, this didn't change; use them ahead of an arbitrary "
     "round number or a bare ATR multiple with no structural backing — a "
     "stop or target that lines up with a real, multiply-touched level "
     "or a real Fibonacci level is genuinely better-supported than one "
-    "that doesn't. A detected chart pattern is real, computed structure "
-    "worth reasoning about, but not an automatic signal to trade — say "
-    "explicitly what it implies for this specific instrument's setup, "
-    "the same way you'd reason about any other single data point, not "
-    "as a standalone reason to include or exclude it."
+    "that doesn't. The D1 and monthly structure serve a DIFFERENT "
+    "purpose — real context for the broader thesis and the Long-term "
+    "alignment read below, not a literal stop/target anchor for a "
+    "same-session trade — but a genuinely major daily/monthly level "
+    "(a heavily-touched one, or one a real chart pattern points at) "
+    "sitting near where H4/H1 would already place a stop or target is "
+    "still worth naming explicitly: it's additional real evidence for "
+    "that specific price, the same logic MULTI-TIMEFRAME CONFLUENCE "
+    "below already applies across H4/H1. A detected chart pattern on "
+    "ANY timeframe is real, computed structure worth reasoning about, "
+    "but not an automatic signal to trade — say explicitly what it "
+    "implies for this specific instrument's setup, the same way you'd "
+    "reason about any other single data point, not as a standalone "
+    "reason to include or exclude it."
     "\n\n"
-    "A SETUP READ is also computed per instrument, per timeframe (H4 "
-    "and H1 separately) — a small set of real, rule-based trade "
-    "archetypes (reversal_candidate, pullback_continuation, "
-    "range_fade_candidate, breakout_watch, trend_following, or "
-    "no_clear_setup) synthesized from everything above: trend "
-    "structure, RSI, market regime, chart patterns, and proximity to "
-    "the real touch-count-ranked S/R and Fibonacci levels. Each comes "
-    "with the specific real numbers behind the call, and more than one "
-    "can legitimately apply at once (e.g. a pullback happening inside a "
-    "converging triangle). Use this as a genuine STARTING characterization "
+    "A SETUP READ is also computed per instrument, per timeframe — "
+    "monthly, D1, H4, and H1 separately — a small set of real, "
+    "rule-based trade archetypes (reversal_candidate, pullback_continuation, "
+    "range_fade_candidate, breakout_watch, trend_following, trend_intact, "
+    "grind_continuation, or no_clear_setup) synthesized from everything "
+    "above: trend structure, RSI, market regime, chart patterns, and "
+    "proximity to the real touch-count-ranked S/R and Fibonacci levels. "
+    "grind_continuation specifically means the instrument HAS made a "
+    "real net directional move over the medium-term window, just via a "
+    "noisy/choppy path rather than a clean trend — genuine directional "
+    "evidence, not a weaker or lesser read than trend_following; don't "
+    "discount it just because the underlying market-type reads 'choppy_up'/"
+    "'choppy_down' rather than a clean 'trending_up'/'trending_down'. "
+    "trend_intact is the clean-trend counterpart: a real 'trending_up'/"
+    "'trending_down' regime with no more specific trigger (a fresh "
+    "reversal/pullback/breakout/trendline-retest) active right now — "
+    "still genuine directional evidence to lean with, not a weaker read "
+    "than trend_following just because there's no fresh entry trigger "
+    "this exact moment; a clean trend spends most of its own life exactly "
+    "here, between retest moments. Each "
+    "comes with the specific real numbers behind the call, and more than "
+    "one can legitimately apply at once (e.g. a pullback happening inside "
+    "a converging triangle). Use this as a genuine STARTING characterization "
     "of what kind of trade this instrument actually offers right now — "
     "then reason about it with the rest of the data, don't just restate "
     "it; 'no_clear_setup' on a timeframe is a real, common result that "
-    "argues against forcing an entry there, not a gap to explain away."
+    "argues against forcing an entry there, not a gap to explain away. "
+    "The monthly and D1 setup reads are context for the broader thesis "
+    "and the Long-term alignment read below — per HOLDING HORIZON above, "
+    "the H4 and H1 setup reads stay the ones that actually govern this "
+    "trade's entry/stop/target."
     "\n\n"
     "A MULTI-TIMEFRAME (H4 vs H1) read is also given per instrument: how "
     "the two timeframes' own trend directions relate (ALIGNED — both "
@@ -290,8 +393,8 @@ _INSTRUCTION_HEAD = (
     "TRADING COST line is also given per instrument — the actual round-"
     "trip cost (spread plus this account's own confirmed commission "
     "schedule, as a % of price) and the actual overnight swap rate (%/"
-    "day, long side), both read directly from this account's own live "
-    "MT5 feed, not estimated. This is not optional context: a target "
+    "day, both long and short sides), both read directly from this "
+    "account's own live MT5 feed, not estimated. This is not optional context: a target "
     "that clears 2:1 on paper can still be a poor or even losing trade "
     "after real costs, especially at this account's short holding "
     "horizon where costs are a larger fraction of the total expected "
@@ -301,14 +404,57 @@ _INSTRUCTION_HEAD = (
     "\n\n"
     f"{_FTMO_STATUS_NOTE}"
     "\n\n"
-    "You're also given a set of investing-literature principles (position "
-    "sizing, portfolio heat, group-exposure limits, stop/profit "
-    "discipline), each attributed to the named author who argues for it. "
-    "These are advisory, not enforced rules. For each one that's "
-    "genuinely relevant here, briefly explain *why* that author argues "
-    "for it and use that reasoning — not just the bare rule — to inform "
-    "your sizing. You may reason your way to a different conclusion than "
-    "a principle would suggest, but say so and explain why."
+    "You're also given a set of investing-literature principles — most "
+    "cover position sizing, portfolio heat, group-exposure limits, and "
+    "stop/profit discipline, but several are genuinely about reading "
+    "cross-asset/macro conditions (Murphy's dollar-commodities-bonds-"
+    "equities intermarket chain, Murphy's DXY-vs-large-cap-equities "
+    "relationship, Pring's bond-stocks-commodities business-cycle "
+    "rotation, Pring's equity-participation filter off the S&P 500 and "
+    "10-year yield, and Pring's 'coiled spring' read on a narrow, "
+    "low-volatility range) — each attributed to the named author who "
+    "argues for it. These are advisory, not enforced rules. For each "
+    "one that's genuinely relevant here, briefly explain *why* that "
+    "author argues for it and use that reasoning — not just the bare "
+    "rule. The sizing/heat/stop-discipline ones should inform your "
+    "sizing, as before; the cross-asset/macro ones above are just as "
+    "relevant to whether an instrument earns a place in the mix at "
+    "all — see the FUNDAMENTAL-BASED INCLUSION paragraph below for how "
+    "that works alongside the technical setup read. You may reason your "
+    "way to a different conclusion than a principle would suggest, but "
+    "say so and explain why."
+    "\n\n"
+    "FUNDAMENTAL-BASED INCLUSION — a real, common pattern on this "
+    "account's actual instrument pool: the technical setup read on a "
+    "timeframe often comes back 'no_clear_setup', or the underlying "
+    "market-type reads 'sideways' or 'choppy_up'/'choppy_down' rather "
+    "than a clean trending read (see the SETUP READ and market-type "
+    "paragraphs above) — that is genuinely common and honest, not a "
+    "defect to explain away. It does NOT, by itself, mean there's "
+    "nothing tradeable here. When the macro snapshot, the cross-asset "
+    "book-wisdom principles above, or your own genuine WebSearch "
+    "research together build a SPECIFIC, one-directional case for an "
+    "instrument (e.g. real yield-curve/DXY/VIX levels via Murphy's "
+    "intermarket chain pointing the same way as a currency's own carry "
+    "story; a real, dated, sourced policy or supply/demand development "
+    "you found; a specific fundamental catalyst rather than a generic "
+    "'markets can move' observation), that case CAN justify including "
+    "the instrument even without a clean technical setup — provided the "
+    "technical read doesn't directly CONTRADICT it (a genuinely "
+    "CONFLICTING multi-timeframe read, or a backtest showing this "
+    "instrument's own history rejects the move you're proposing, is a "
+    "real reason to size down or leave it out regardless of how good "
+    "the fundamental case sounds). A fundamental-led inclusion still "
+    "needs everything else every other inclusion needs: a real stop "
+    "derived from H1/H4 ATR, a real target, sizing per the DEBATE THE "
+    "POSITION SIZE paragraph below, and it must be named explicitly as "
+    "fundamentally-led in that position's own thesis (see 'Investment "
+    "Thesis by Position' in the report format below) rather than dressed "
+    "up as a technical call it isn't. The reverse also holds: a clean "
+    "technical setup with no fundamental support is still a legitimate, "
+    "sufficient basis for inclusion on its own, exactly as before — "
+    "fundamentals are an ADDITIONAL path to conviction, not a new "
+    "requirement layered on top of the technical one."
     "\n\n"
     "On the reward:risk principles specifically (2:1 Bulkowski/"
     "Rockefeller, 3:1 Murphy): the ratio must be an HONEST OUTPUT of a "
@@ -361,18 +507,37 @@ _INSTRUCTION_HEAD = (
     "the anchor when one exists near where you'd otherwise place the "
     "stop or target anyway. Separately, judge how much to trust support/"
     "resistance as a CONCEPT for this instrument at all using the "
-    "support/resistance RELIABILITY backtest above (the real % of that "
-    "instrument's own past tests where a level actually held or was "
-    "rejected) — a target sitting at a level with a weak historical "
-    "hold/reject rate for THIS instrument is a genuinely weaker target "
-    "than the same distance sitting at a level with a strong one, even "
-    "though the two look identical on a raw price chart.\n\n"
+    "support/resistance RELIABILITY backtest above — a REAL trade "
+    "simulation (buy off support, short off resistance, an actual ATR-"
+    "based stop/target walked forward bar by bar to a genuine win/loss, "
+    "net of this instrument's own real spread/commission/swap and its "
+    "broker's own minimum stop distance where that live data is "
+    "available — the stop/target sizing itself uses the REAL historical "
+    "ATR at each past entry, but the cost/swap figure is TODAY's live "
+    "rate applied uniformly across that history, a disclosed proxy since "
+    "no historical spread/swap record exists, not a claim it was "
+    "literally that rate years ago) rather than a bare historical "
+    "percentage — a target sitting at a level with a weak historical "
+    "win rate for THIS instrument is a genuinely weaker target than "
+    "the same distance "
+    "sitting at a level with a strong one, even "
+    "though the two look identical on a raw price chart. A COUNTER-TREND "
+    "SPIKE read (per REAL, NOT A FAKE, TREND above) needs a genuinely "
+    "TIGHTER stop than the same instrument would otherwise get — these "
+    "moves lack longer-term backing and reverse faster, so the wider, "
+    "give-it-room stop that's appropriate for a structurally-backed trend "
+    "would just absorb a bigger loss before the read on it changes.\n\n"
     "DEBATE THE POSITION SIZE PER INSTRUMENT, don't spread capital "
     "evenly or apply one flat % across the mix. Weigh, explicitly, per "
     "instrument: (1) conviction strength — how well-supported is this "
     "instrument's thesis by real backtest evidence and genuine research, "
-    "not a hunch; a higher-conviction, well-evidenced case earns a "
-    "meaningfully larger size than a marginal one; (2) real volatility "
+    "not a hunch, INCLUDING the Long-term alignment read: a STRUCTURALLY "
+    "BACKED instrument earns a genuinely larger size than one that's the "
+    "same in every other respect but reads COUNTER-TREND SPIKE — the "
+    "spike is still worth taking (see REAL, NOT A FAKE, TREND above), "
+    "just not sized as if it had the same staying power; a higher-"
+    "conviction, well-evidenced case earns a meaningfully larger size "
+    "than a marginal one; (2) real volatility "
     "(the H1/H4 ATR%/annualized volatility% given above) — a more "
     "volatile instrument needs a SMALLER size than a calmer one for the "
     "same $ risk, not the same size; (3) the REAL feasibility ceiling — "
@@ -386,9 +551,10 @@ _INSTRUCTION_HEAD = (
     "worse cost-to-risk trade than the same cost against a wider stop, "
     "and argues for a smaller size or exclusion rather than sizing as if "
     "cost weren't a factor; (5) this position's own contribution to the "
-    "account's REAL remaining compliance headroom (its % allocation "
-    "times its stop distance, against the daily-loss and trailing max-"
-    "loss headroom given above) — a hard ceiling that applies regardless "
+    "account's REAL remaining compliance headroom (its \"pct\" IS "
+    "directly its risk contribution — see the JSON schema below — so "
+    "weigh it directly against the daily-loss and trailing max-loss "
+    "headroom given above) — a hard ceiling that applies regardless "
     "of how strong the other four inputs look. State the resulting % "
     "and the reasoning behind it explicitly per position — a uniform "
     "size across every instrument regardless of these five real inputs "
@@ -553,11 +719,16 @@ _INSTRUCTION_TAIL = (
     "reward:risk ratio in the mix was actually netted against this real "
     "cost (per the reward:risk instruction above) rather than quoted "
     "gross.\n"
-    "   e. Idle cash — treat any cash reserve beyond roughly 10-25% of "
-    "equity as needing its own explicit justification. Whatever reserve "
-    "you do leave, define specific conditional triggers for deploying "
-    "it (tied to the support/resistance levels given per instrument), "
-    "each with an explicit time-based fallback.\n"
+    "   e. Idle cash — CASH now means equity NOT currently placed at "
+    "risk (see item g's aggregate-heat cap), not unused notional capital "
+    "— since real position size is computed from risk% against the stop "
+    "(not from pct as a chunk of capital to deploy), expect CASH to "
+    "typically sit very high, 85%+ is normal and not itself a sign of "
+    "being overly conservative. The real question is whether the small "
+    "remaining risk budget is pointed at genuinely good setups. Whatever "
+    "reserve you do leave, define specific conditional triggers for "
+    "deploying more of it (tied to the support/resistance levels given "
+    "per instrument), each with an explicit time-based fallback.\n"
     "   f. Position sizing and stop/target — confirm every position's "
     "size and stop/target actually came from the DEBATE THE POSITION "
     "SIZE and DEBATE THE STOP AND TARGET paragraphs above (conviction, "
@@ -567,16 +738,24 @@ _INSTRUCTION_TAIL = (
     "target) rather than a uniform size or a flat ATR multiple applied "
     "across the mix regardless of these differences.\n"
     "   g. FTMO COMPLIANCE HEADROOM — the single most important check "
-    "for this account. For every position in the mix, multiply its % "
-    "allocation by its stop-loss distance (%) to get that position's "
-    "contribution to capital at risk, sum these across the whole mix "
-    "(the same 'aggregate heat' figure other markets use), then "
-    "explicitly compare that total against BOTH the real daily-loss "
+    "for this account. Every position's \"pct\" already directly equals "
+    "its own contribution to capital at risk (real lot size is computed "
+    "downstream from this risk% against your stop distance, not from pct "
+    "as notional capital to commit — so simply sum the pct values across "
+    "the whole mix to get aggregate heat, no multiplying by stop-distance "
+    "needed), then explicitly compare that total against BOTH the real daily-loss "
     "headroom % AND the real trailing max-loss headroom % given in the "
-    "FTMO Compliance Status section above — a worst-case simultaneous "
-    "stop-out must leave REAL headroom under both, not just avoid "
-    "crossing zero exactly, since a breach of either is instant "
-    "termination with zero grace period. Separately, reason explicitly "
+    "FTMO Compliance Status section above. THE REAL, HARD, NON-NEGOTIABLE "
+    "CEILING: total aggregate heat across the whole mix must stay AT OR "
+    "UNDER 50% of the real daily-loss headroom % shown above — this is a "
+    "hard pre-execution gate this pipeline enforces in code (not just a "
+    "guideline), and a mix that exceeds it gets refused outright at "
+    "execution, wasting this entire research pass. On a fresh day with "
+    "the full 3% daily-loss limit untouched, that means **at most 1.5% "
+    "total aggregate heat across every position combined** — size "
+    "accordingly from the start rather than producing a mix this "
+    "account cannot actually execute. \"Leave headroom under the limit\" "
+    "is not sufficient; the real bar is half of it. Separately, reason explicitly "
     "about the Best Day Rule: if the current Best Day Rule % shown above "
     "is already elevated, or if this mix concentrates most of its "
     "expected profit into one dominant position, that is a real "
@@ -589,9 +768,12 @@ _INSTRUCTION_TAIL = (
     "tradable in the Market Watch instruments below (typically: forex "
     "majors/crosses, metals, energies/agricultural commodities, indices, "
     "and crypto where offered). Group the mix's positions by category "
-    "and state each category's total % explicitly; if any one category "
-    "exceeds roughly 30-40% of equity, justify why explicitly or resize "
-    "it down. WITHIN each represented category, prefer 1-2 instruments "
+    "and state each category's total % explicitly; since pct is now risk "
+    "(not notional) and total risk is already capped around 10-15% by "
+    "item g, judge concentration as a SHARE of that risk budget, not of "
+    "raw equity — if any one category eats more than roughly a third to "
+    "half of the mix's total aggregate heat, justify why explicitly or "
+    "resize it down. WITHIN each represented category, prefer 1-2 instruments "
     "over 3+ — more names per category dilutes conviction-sizing without "
     "reducing the correlated-stress risk item (c) above already covers, "
     "and this account's tight daily-loss ceiling rewards fewer, "
@@ -646,8 +828,13 @@ _INSTRUCTION_TAIL = (
     "## Investment Thesis by Position\n"
     "One short subsection per included instrument — lead each with the "
     "symbol in bold — covering why it earns its place now (technical + "
-    "fundamental + research-based catalyst, across the D1/H4/H1 reads), "
-    "AND three explicit, brief debate outputs (checklist items a, d, f "
+    "fundamental + research-based catalyst, across the monthly/D1/H4/H1 "
+    "reads, including the Long-term alignment read), "
+    "and state explicitly whether this position's inclusion is "
+    "technical-led, fundamental-led (per FUNDAMENTAL-BASED INCLUSION "
+    "above), or both — this matters for the reader's own confidence in "
+    "the call, not just process bookkeeping. AND three explicit, brief "
+    "debate outputs (checklist items a, d, f "
     "belong here, applied per position): the SIZE chosen and why (which "
     "of the five sizing inputs actually drove it for this instrument), "
     "the STOP/TARGET chosen and why (the ATR multiple and the support/"
@@ -695,14 +882,39 @@ _INSTRUCTION_TAIL = (
     "example values with your actual final numbers, one key per "
     "instrument symbol traded above plus one \"CASH\" key, pct values "
     "summing to 100, no comments or extra text inside the block). Every "
-    "non-CASH key must be an object with four numbers: \"pct\" (the "
-    "target allocation), \"price\" (a specific limit-order entry price — "
+    "non-CASH key must be an object with five fields: \"side\" (\"buy\" "
+    "for a long or \"sell\" for a short — this pipeline can now execute "
+    "REAL short positions on this account, not just longs, and a short "
+    "idea should be held to the exact same evidence bar as a long: real "
+    "backtest support for that direction, aligned H4/H1 signals, a "
+    "genuine technical setup, OR a genuine fundamental-based case per "
+    "the FUNDAMENTAL-BASED INCLUSION paragraph above (not contradicted "
+    "by the technical read) — not proposed as an afterthought just "
+    "because one is now technically possible. A short-biased finding "
+    "your own H4/H1 reads already sometimes surface — a "
+    "range_fade_candidate sitting at resistance, a CONFLICTING/bearish "
+    "multi-timeframe read, a negative momentum-persistence correlation "
+    "— is exactly the kind of evidence that can now justify \"side\": "
+    "\"sell\" directly instead of being discarded for lack of a schema "
+    "slot), \"pct\" (the % of "
+    "equity you are willing to LOSE if this position's stop-loss is hit "
+    "— NOT notional capital or margin to commit. Real lot size is "
+    "computed automatically downstream from this risk% and your actual "
+    "stop distance: a wider stop needs fewer lots to risk the same %, a "
+    "tighter stop needs more — so this number should be small, typically "
+    "similarly-sized to a single-trade risk cap [e.g. 1-3%], NOT a large "
+    "\"how much of my capital goes here\" figure. CASH is what's left "
+    "after every position's risk%, i.e. equity not currently placed at "
+    "risk — it will typically be very high, usually 85%+, and that is "
+    "normal here, not overly conservative), \"price\" (a specific "
+    "limit-order entry price — "
     "realistic and achievable given the instrument's current bid/ask "
     "shown above, not a distant level or an arbitrary round number), "
     "\"stop_loss\" (a specific stop price, derived from the real H4/H1 "
     "ATR where available rather than an assumed flat percentage), and "
     "\"take_profit\" (a specific target price on the correct side of "
-    "your entry — above it for a long — matching the exact target level "
+    "your entry FOR THE DIRECTION YOU CHOSE — above entry for a long, "
+    "below entry for a short — matching the exact target level "
     "your own reward:risk reasoning above already derives; this is the "
     "field that actually gets sent to FTMO as the position's real take-"
     "profit order, not just prose, so it must be the same real, cost-"
@@ -712,7 +924,9 @@ _INSTRUCTION_TAIL = (
     "you're not including it in the final mix, it must still appear here "
     "with \"pct\": 0 — never omit a currently-held instrument:\n"
     "```json\n"
-    '{"EXAMPLE_SYMBOL": {"pct": 15, "price": 82.50, "stop_loss": 78.00, "take_profit": 94.00}, "CASH": 25}\n'
+    '{"EXAMPLE_LONG": {"side": "buy", "pct": 1.5, "price": 82.50, "stop_loss": 78.00, "take_profit": 94.00}, '
+    '"EXAMPLE_SHORT": {"side": "sell", "pct": 1.5, "price": 145.00, "stop_loss": 149.50, "take_profit": 133.00}, '
+    '"CASH": 97.0}\n'
     "```"
 )
 
@@ -795,17 +1009,57 @@ AUDIT_INSTRUCTION = (
     "number applied the same way across every position? Flag any "
     "position sized or stopped identically to its peers despite "
     "genuinely different volatility, conviction, or cost profiles.\n"
-    "- Check SETUP READ and MULTI-TIMEFRAME use: did the draft actually "
-    "engage with each position's computed setup read (reversal, "
-    "pullback, range-fade, breakout-watch, trend-following) rather than "
-    "ignore it, and does its stated thesis genuinely match that "
-    "characterization rather than contradict it (e.g. calling something "
-    "a trend-following entry when the setup read says range_fade_"
-    "candidate)? Did it use a real H4/H1 CONFLICTING trend read as a "
-    "reason for caution, or silently pick whichever timeframe agreed "
-    "with its own thesis? Flag any stop/target that ignored a real "
-    "multi-timeframe confluence level sitting right where a same-"
-    "timeframe level alone was used instead.\n"
+    "- Check SETUP READ and MULTI-TIMEFRAME use: setup reads are now "
+    "computed on all four timeframes (monthly, D1, H4, H1) — did the "
+    "draft actually engage with each position's computed setup read "
+    "(reversal, pullback, range-fade, breakout-watch, trend-following, "
+    "trend-intact, or grind-continuation — trend-intact means a real "
+    "'trending_up'/'trending_down' regime with no more specific trigger "
+    "active right now, grind-continuation means a real net directional "
+    "move over the medium-term window reached via a noisy/choppy path "
+    "rather than a clean trend; BOTH are genuine directional evidence, "
+    "treat a draft dismissing either as 'no real setup' as UNDER-"
+    "weighing real evidence, not a correct caution) rather than ignore it, and does "
+    "its stated thesis genuinely match that characterization rather "
+    "than contradict it (e.g. calling something a trend-following entry "
+    "when the H4/H1 setup read says range_fade_candidate)? The monthly/"
+    "D1 setup reads are context (feeding the thesis and the Long-term "
+    "alignment read below) — flag a draft that anchors its actual entry/"
+    "stop/target reasoning on a monthly or D1 setup read instead of H4/H1, "
+    "not a draft that merely mentions the longer-term read as supporting "
+    "context. Did it use a real H4/H1 CONFLICTING trend read as a reason "
+    "for caution, or silently pick whichever timeframe agreed with its "
+    "own thesis? Flag any stop/target that ignored a real multi-"
+    "timeframe confluence level sitting right where a same-timeframe "
+    "level alone was used instead.\n"
+    "- Check LONG-TERM ALIGNMENT use: each position also has a real "
+    "'Long-term alignment' read comparing its H4 move against the real "
+    "daily/monthly backdrop — STRUCTURALLY BACKED, COUNTER-TREND SPIKE, "
+    "MIXED, or no real backdrop available. A COUNTER-TREND SPIKE read is "
+    "NOT itself a flaw to raise — the pipeline explicitly treats a short, "
+    "fast counter-trend move as a real, legitimate trade when correctly "
+    "labeled and managed, not something to avoid; do NOT flag a position "
+    "as unsound merely for being counter-trend. DO flag: a draft that "
+    "calls something a durable/structural trend when its own Long-term "
+    "alignment read says COUNTER-TREND SPIKE (a real mischaracterization, "
+    "not a labeling nitpick); a COUNTER-TREND SPIKE position sized or "
+    "stopped identically to a STRUCTURALLY BACKED one, rather than with "
+    "the tighter stop and smaller size that read calls for; or a draft "
+    "that silently ignores this read entirely.\n"
+    "- Check FUNDAMENTAL-BASED INCLUSION use: this pipeline explicitly "
+    "allows a position to be included on a genuine, specific, sourced "
+    "macro/fundamental case (from the macro snapshot, the cross-asset "
+    "book-wisdom principles, or the draft's own web research) even when "
+    "its technical setup read is 'no_clear_setup' or its market-type "
+    "reads 'sideways'/'choppy_up'/'choppy_down' — do NOT flag a position "
+    "as lacking justification merely because it lacks a clean technical "
+    "setup; check instead whether the fundamental case actually given is "
+    "genuinely specific and sourced (real numbers/dates/sources, not a "
+    "vague macro platitude) and whether the technical read actually "
+    "CONTRADICTS it (a real CONFLICTING multi-timeframe read or a "
+    "backtest showing the instrument's own history rejects the proposed "
+    "direction) — THAT combination is the real flaw to flag, not the "
+    "absence of a technical setup by itself.\n"
     "- Identify anything it got wrong, missed, or reasoned poorly about, "
     "based on the data you both were given.\n"
     "- Note where you would weigh something differently, and why.\n"
@@ -818,12 +1072,23 @@ AUDIT_INSTRUCTION = (
     "1. For each holding, identify the specific technical/behavioral "
     "claim(s) the draft relies on to justify it.\n"
     "2. Cross-check EACH claim against that exact instrument's own "
-    "historical backtest evidence given below (its real past RSI-"
-    "reaction rate and average forward return, whether its own history "
-    "shows real momentum persistence or mean-reversion, whether its own "
-    "low-volatility episodes have historically been followed by bigger "
-    "or smaller moves, and how often its shown support/resistance "
-    "levels have actually held or been rejected). Note: there is no "
+    "historical backtest evidence given below (its real simulated RSI-"
+    "reversal and support/resistance-bounce trade win rates and average "
+    "realized R-multiple — an actual ATR-based stop/target walked "
+    "forward bar by bar to a genuine win/loss, not a bare average return "
+    "N bars later, and — wherever this instrument's own live spread/"
+    "commission/swap/broker-minimum-stop-distance data is available — "
+    "already netted against those real execution costs and constraints, "
+    "not an idealized zero-friction result (the stop/target sizing uses "
+    "the real historical ATR at each past entry; the cost/swap figure "
+    "netted in is today's live rate applied uniformly across that "
+    "history, a disclosed proxy, not a historical record — don't flag "
+    "this as a flaw, no historical spread/swap record exists to do "
+    "better) — plus whether its own "
+    "history shows real momentum "
+    "persistence or mean-reversion, and whether its own low-volatility "
+    "episodes have historically been followed by bigger or smaller "
+    "moves). Note: there is no "
     "beta-vs-benchmark backtest here (this account can span forex, "
     "metals, and equity indices with no single natural benchmark) — "
     "don't fault the draft for lacking one.\n"
@@ -853,23 +1118,61 @@ def build_ftmo_stage2_instruction(audit_available: bool) -> str:
 
 @dataclass
 class FtmoAssetAnalysis:
-    """Wraps a PMEX-shape AssetAnalysis (`base`, reused UNCHANGED from
-    ai.portfolio_suggest.analyze_assets — its contract-spec fetch is
-    already generic native-MT5, and its Yahoo-ticker daily technical/
-    backtest enrichment works exactly the same way for whatever's in
-    this FTMO account's own Market Watch) with the two extra intraday
-    reads that are genuinely unique to FTMO's own tighter, faster-paced
-    compliance timeline: real H4/H1 technical stats fetched directly
-    from this account's own live MT5 price feed via
+    """Wraps a PMEX-shape AssetAnalysis (`base`) with the two extra
+    intraday reads that are genuinely unique to FTMO's own tighter,
+    faster-paced compliance timeline: real H4/H1 technical stats fetched
+    directly from this account's own live MT5 price feed via
     data.mt5_source.fetch_mt5_price_history — a real broker-native fetch
-    that works for every FTMO symbol regardless of whether it also has a
-    Yahoo mapping (most won't, since PMEX's own keyword map targets
-    commodity-futures naming, not forex/CFD tickers). h4_structure/
-    h1_structure carry the real Fibonacci/support-resistance/trendline/
-    chart-pattern reads for those same two timeframes — deliberately NOT
-    computed for the daily (D1) read, since the HOLDING HORIZON debate
-    already demotes D1 to broader regime context rather than the
-    surface entry/stop/target decisions are actually made on."""
+    that works for every FTMO symbol. Unlike PMEX/PSX, `base` is built
+    entirely natively too (see _build_bare_base_analysis/_enrich_with_
+    native_d1) rather than via ai.portfolio_suggest.analyze_assets()'s
+    Yahoo-based enrichment — FTMO deliberately doesn't depend on Yahoo
+    for anything, not even for the one symbol (XAUUSD) that technically
+    has a Yahoo mapping; see _build_bare_base_analysis's own docstring
+    for the real incident that motivated this.
+
+    h4_structure/h1_structure/d1_structure/mn1_structure carry the real
+    Fibonacci/support-resistance/trendline/chart-pattern reads for all
+    FOUR timeframes — real feature added live 2026-08-22, user's own
+    direct request after the monthly-timeframe addition above only gave
+    D1/monthly a bare TechnicalStats read: "i want you to redesign the
+    charts and its decision with all H1, H4, D1 and monthly... same with
+    the sub section setup read" — chart structure and setup
+    classification (see classify_setups) previously stopped at H4/H1
+    only, on the theory that a monthly/daily S/R level or pattern isn't
+    actionable for an account holding intraday-to-1-day. That theory
+    held for what the AI uses to place an actual entry/stop/target (H4/H1
+    still are, and remain, the PRIMARY basis per HOLDING HORIZON below)
+    but not for what a human — or the model's own broader thesis-building
+    — benefits from SEEING: the same real net-direction-vs-noise question
+    market_regime already answers per timeframe has a structural/pattern
+    analogue too, and withholding it wasn't a considered tradeoff, just
+    an earlier, narrower reading of "not actionable." Computed via the
+    exact same compute_chart_structure() call as H4/H1, which itself
+    already caps its own swing-point scan to the last STRUCTURE_LOOKBACK
+    (90) bars regardless of input size — so a D1 read is a real ~3-month
+    structural window and a monthly read is a real ~7.5-year one (or
+    whatever's actually available for a newer listing), not an
+    unbounded, ever-growing scan.
+
+    `mn1_stats`/`d1_stats`-via-`base.stats` (real bug found live: this
+    account's own analysis never read a daily-or-longer timeframe
+    visibly, only H4/H1 — user's own words: "it can tend to throw us in
+    a fake trend unguarded" — a genuinely correct concern, since a real
+    short-term move with no longer-term backing IS meaningfully
+    different from one that has it) add real monthly (MN1) TechnicalStats
+    alongside D1's own (already on `base.stats`) as long-term structural
+    CONTEXT — H4/H1 remain the PRIMARY basis for entry/stop/target per
+    HOLDING HORIZON below regardless of how much structure D1/monthly now
+    also carry. Same "always a real TechnicalStats/ChartStructureSnapshot,
+    mostly-empty fields rather than a bare None" treatment as h4_stats/
+    h1_stats when a symbol genuinely lacks enough MT5 history (a newer
+    listing) — degrades the same way every other "not enough real
+    history" case in this codebase already does, not a crash. mn1_stats/
+    d1_structure/mn1_structure are defaulted (unlike h4_stats/h1_stats/
+    h4_structure/h1_structure) purely so existing test fixtures built
+    before these fields existed don't need updating just to keep
+    constructing this dataclass."""
 
     base: AssetAnalysis
     h4_stats: TechnicalStats
@@ -877,33 +1180,240 @@ class FtmoAssetAnalysis:
     h4_structure: ChartStructureSnapshot
     h1_structure: ChartStructureSnapshot
     trade_cost: TradeCost | None
+    mn1_stats: TechnicalStats = field(default_factory=lambda: TechnicalStats(*([None] * 16)))
+    d1_structure: ChartStructureSnapshot = field(
+        default_factory=lambda: ChartStructureSnapshot(fibonacci=None, sr_levels=None, trendlines=None, patterns=[])
+    )
+    mn1_structure: ChartStructureSnapshot = field(
+        default_factory=lambda: ChartStructureSnapshot(fibonacci=None, sr_levels=None, trendlines=None, patterns=[])
+    )
+
+
+# ~6 years of daily bars — enough real history for the backtest functions'
+# own episode-count thresholds to have real statistical power, without an
+# excessive per-symbol fetch. Confirmed live against the real FTMO
+# terminal: EURUSD/GBPUSD/MSFT go back to 2018, NVDA to 2020, BTCUSD to
+# 2021 — MT5's own native feed comfortably covers this depth for the
+# instruments this account actually trades.
+_D1_BACKTEST_BARS = 1500
+
+# 10 years of monthly bars — comfortably above RANGE_WINDOW=60 (the
+# minimum needed for market_regime/support-resistance to populate at
+# all on the monthly timeframe), with real margin for symbols with a
+# shorter broker-side history (crypto, newer CFDs) to still get whatever
+# depth genuinely exists rather than being truncated short of it.
+_MN1_BACKTEST_BARS = 120
+
+
+def _build_bare_base_analysis(a: MarketAsset) -> AssetAnalysis:
+    """FTMO's own base-analysis builder — deliberately does NOT call
+    ai.portfolio_suggest.analyze_assets()/resolve_yahoo_ticker() the way
+    PMEX/PSX do, not even for a symbol (XAUUSD, via its GC=F mapping)
+    that technically resolves. Real incident, not a hypothetical: the
+    unattended daily mega-analysis job hung for 24+ hours straight,
+    entirely because XAUUSD was the ONE FTMO symbol that ever touched
+    Yahoo at all, and a fresh cold-started process negotiating Yahoo's
+    session from scratch (unlike this project's own long-running
+    Streamlit server, which only ever does that negotiation once and
+    reuses it for the rest of its life) hit a real hang with no timeout
+    protecting it at the time. A hard timeout now guards every Yahoo
+    call project-wide regardless (see utils.run_with_timeout), but for
+    FTMO specifically there's a strictly better fix available: it simply
+    doesn't need Yahoo for ANYTHING price/technical, since MT5 already
+    holds real multi-year native history for every FTMO instrument
+    (confirmed live, see _enrich_with_native_d1's own docstring) — so
+    the whole exchange's analysis pipeline can be made to not depend on
+    an external, occasionally-flaky network service at all, not just
+    tolerate it timing out gracefully. The one real cost: XAUUSD loses
+    its own couple of real Yahoo headlines, since MT5 has no news feed
+    of its own — but every OTHER FTMO symbol already has that same gap
+    (headlines=[] is `_enrich_with_native_d1`'s own long-standing,
+    disclosed contract), so this just makes XAUUSD consistent with the
+    rest of the pool instead of a one-off exception."""
+    return AssetAnalysis(
+        symbol=a.symbol,
+        description=a.description,
+        bid=a.bid,
+        ask=a.ask,
+        display_name=None,
+        contract_spec=get_contract_spec(a.symbol),
+    )
+
+
+def _real_backtest_execution_kwargs(
+    trade_cost: TradeCost | None, contract_spec: ContractSpec | None, current_ask: float | None
+) -> dict:
+    """Combines this instrument's own REAL spread, FTMO commission, swap,
+    and broker-enforced minimum stop distance into the kwargs
+    analysis/backtest.py's trade-simulation engine uses to net real
+    execution cost/constraints into its win-rate/R-multiple results —
+    direct user request 2026-08-22: "review the allowed lot size, trade
+    cost, and other execution related features and broker's allowed
+    guard rails and then apply your backtest trade... such results are
+    more realistic and dependable." FTMO-specific for now (the one
+    exchange with both a live MT5 feed for real spread/swap/stop-level
+    data AND a published commission schedule to layer on top — PMEX
+    shares the MT5 feed but has no commission plumbing of its own yet;
+    PSX has no live broker connection at all) — returns an empty dict
+    (the engine's own existing zero-cost/zero-restriction default,
+    unchanged from before this feature existed) for any missing real
+    input rather than guessing or partially applying one.
+
+    Commission is added into round-trip cost as a %, converted from its
+    own $/lot or %-based schedule via `contract_spec`/`current_ask` (see
+    `_ftmo_commission_pct_round_turn`) — silently left out (not defaulted
+    to 0) when either is unavailable, since 0% commission would itself
+    be a fabricated number, not a genuine "confirmed zero" the way
+    Agriculture's real zero-commission rate is.
+
+    `current_ask` deliberately means the CURRENT live ask, not this
+    instrument's D1 close — must match format_ftmo_trade_cost's own
+    price source exactly (real inconsistency caught on a self-recheck:
+    an earlier version used the D1 series' last close here while
+    format_ftmo_trade_cost used the live ask, so the two could silently
+    disagree on Forex/Exotics' price-dependent commission % purely from
+    using different prices, not from any real difference in cost).
+
+    `trade_cost`/`contract_spec` are always TODAY's live figures (this
+    project has no historical spread/swap time series to draw from —
+    see analysis/backtest.py's own top-of-file/_simulate_trades note),
+    applied uniformly to every historical trade the simulation replays —
+    a reasonable, disclosed proxy for "what this instrument's own
+    round-trip friction has generally looked like," not a claim that
+    the spread/commission/swap were literally identical years ago."""
+    if trade_cost is None:
+        return {}
+    round_trip_cost_pct = trade_cost.spread_pct_of_price
+    if contract_spec is not None and current_ask:
+        commission_pct, _detail = _ftmo_commission_pct_round_turn(
+            trade_cost.category, contract_spec.trade_contract_size, current_ask
+        )
+        if commission_pct is not None:
+            round_trip_cost_pct += commission_pct
+    return dict(
+        round_trip_cost_pct=round_trip_cost_pct,
+        long_swap_pct_per_day=trade_cost.swap_long_pct_per_day or 0.0,
+        short_swap_pct_per_day=trade_cost.swap_short_pct_per_day or 0.0,
+        min_stop_distance_pct=trade_cost.min_stop_distance_pct,
+    )
+
+
+def _enrich_with_native_d1(
+    base: AssetAnalysis, d1_history: pd.DataFrame | None = None, trade_cost: TradeCost | None = None
+) -> AssetAnalysis:
+    """Backfills real D1 technical stats + backtests from MT5's own
+    native price feed for a bare (display_name is None) base analysis —
+    every FTMO symbol, always, since _build_bare_base_analysis above
+    never attempts Yahoo resolution in the first place (this project's
+    own history: FTMO used to only backfill whatever Yahoo left bare,
+    confirmed live at the time to be MOST of a real FTMO Market Watch —
+    16 of 17 real symbols on one account — since data/underlying.py's
+    keyword map targets PMEX's commodity-futures naming, not forex/CFD/
+    crypto symbols; the one Yahoo-covered exception, XAUUSD, has since
+    been made to skip Yahoo too, for reasons that function's own
+    docstring covers). Unlike PMEX (whose dated, expiring futures
+    contracts genuinely lack a long-running single MT5 history, which is
+    why IT still needs Yahoo's continuous underlying series), FTMO
+    trades non-expiring CFD/forex instruments that MT5 itself already
+    holds real multi-year daily history for — a strictly better,
+    broker-native source for this account specifically, needing no
+    keyword-map maintenance at all.
+
+    The `display_name is not None` early return is now a defensive no-op
+    for FTMO's own callers (always None going in) rather than the
+    load-bearing branch it used to be — kept rather than removed, since
+    it costs nothing and keeps this function honest/safe if anything
+    ever calls it with an already-enriched base again. `headlines` stays
+    empty for a native-D1 entry (no MT5-native news feed) — an honest,
+    disclosed gap, same treatment as any other missing-data field in
+    this pipeline, not a reason to withhold the real technical/backtest
+    data that IS available.
+
+    `d1_history`, if the caller already fetched it (analyze_ftmo_assets
+    now also needs the same D1 bars for chart-structure — see
+    FtmoAssetAnalysis's own docstring for why), skips this function's
+    own redundant fetch of the identical (symbol, "D1", count) call —
+    real, if cheap, waste avoided the same way this project already
+    avoids it elsewhere (compute_chart_structure's own shared-swing-scan
+    fix). None (the default) preserves the exact original fetch-it-
+    yourself behavior for every existing caller/test.
+
+    `trade_cost`, if the caller already fetched it (analyze_ftmo_assets/
+    analyze_ftmo_asset_live both need it anyway for their own "REAL
+    trading cost" line), is what lets the RSI/S-R backtests below
+    simulate with real spread/commission/swap/broker-stop-distance
+    instead of the engine's own zero-friction default — see
+    _real_backtest_execution_kwargs. None skips this entirely (same
+    zero-cost default as before this feature existed), not an error."""
+    if base.display_name is not None:
+        return base
+
+    if d1_history is None:
+        d1_history = fetch_mt5_price_history(base.symbol, "D1", count=_D1_BACKTEST_BARS)
+    if d1_history.empty:
+        return base
+
+    prices = d1_history["Close"]
+    # base.ask, not the D1 series' last close — matches EXACTLY what
+    # format_ftmo_trade_cost uses for its own commission conversion (see
+    # that function's own `price = analysis.base.ask`), so the "REAL
+    # trading cost" line and this backtest's own netted cost can never
+    # silently disagree on Forex/Exotics' price-dependent commission %
+    # just because they happened to compute it from two different prices
+    # (a real, if tiny, inconsistency caught on a self-recheck).
+    exec_kwargs = _real_backtest_execution_kwargs(trade_cost, base.contract_spec, base.ask)
+    rsi_overbought_bt, rsi_oversold_bt = backtest_rsi_reaction(d1_history, **exec_kwargs)
+    return AssetAnalysis(
+        symbol=base.symbol,
+        description=base.description,
+        bid=base.bid,
+        ask=base.ask,
+        display_name=base.description,
+        data_source="mt5",
+        prices=prices,
+        stats=compute_technical_stats(prices, history=d1_history),
+        headlines=[],
+        contract_spec=base.contract_spec,
+        rsi_overbought_backtest=rsi_overbought_bt,
+        rsi_oversold_backtest=rsi_oversold_bt,
+        momentum_persistence_backtest=backtest_momentum_persistence(prices),
+        volatility_regime_backtest=backtest_volatility_regime(prices),
+        support_resistance_backtest=backtest_support_resistance_reaction(d1_history, **exec_kwargs),
+    )
 
 
 def analyze_ftmo_assets(
     assets: list[MarketAsset], on_progress: Callable[[str], None] | None = None
 ) -> list[FtmoAssetAnalysis]:
-    """Reuses ai.portfolio_suggest.analyze_assets() directly for the base
-    (contract-spec + best-effort Yahoo daily) read, then extends it with
-    real H4/H1 reads per symbol — see FtmoAssetAnalysis's own docstring
-    for why this wrap-rather-than-duplicate shape was chosen.
-
-    `on_progress` (same single-updating-message contract as
-    analyze_assets' own param) covers BOTH passes — the base analyze_assets
-    call first, then this function's own extension loop (H4/H1 fetch,
-    chart structure ×2, real trading cost) — so a caller sees continuous
-    progress across the full, now genuinely multi-step analysis instead
-    of it going quiet again right as the FTMO-specific work starts."""
-    base_analyses = analyze_assets(assets, on_progress=on_progress)
+    """Builds each symbol's own bare base analysis (contract spec only —
+    see _build_bare_base_analysis's own docstring for why this
+    deliberately never touches Yahoo, not even for XAUUSD), backfills
+    real D1 technical/backtest coverage natively from MT5 (see
+    _enrich_with_native_d1), then extends it with real H4/H1 reads per
+    symbol — see FtmoAssetAnalysis's own docstring for why this
+    wrap-rather-than-duplicate shape was chosen. One single progress
+    pass now (previously two — a base Yahoo-resolution pass, then this
+    function's own extension pass — before FTMO stopped needing Yahoo
+    at all)."""
     results = []
-    total = len(base_analyses)
-    for i, base in enumerate(base_analyses, start=1):
+    total = len(assets)
+    for i, a in enumerate(assets, start=1):
         if on_progress is not None:
-            on_progress(
-                f"Multi-timeframe technical + chart structure + real trading cost: "
-                f"{i}/{total} — {base.symbol}"
-            )
+            on_progress(f"Analyzing {i}/{total} — {a.symbol} (D1/H4/H1/monthly + chart structure + trading cost)")
+        bare_base = _build_bare_base_analysis(a)
+        # Both fetched once, up front, and threaded into
+        # _enrich_with_native_d1 below (rather than letting it do its own
+        # identical fetches) so the SAME D1 bars also feed d1_structure's
+        # chart-structure scan, and the SAME trade_cost feeds the RSI/S-R
+        # backtests' real cost/guard-rail simulation AND the analysis'
+        # own "REAL trading cost" line below — without a second,
+        # redundant MT5 round-trip for either.
+        d1_history = fetch_mt5_price_history(bare_base.symbol, "D1", count=_D1_BACKTEST_BARS)
+        trade_cost = get_trade_economics(bare_base.symbol)
+        base = _enrich_with_native_d1(bare_base, d1_history, trade_cost)
         h4_history = fetch_mt5_price_history(base.symbol, "H4")
         h1_history = fetch_mt5_price_history(base.symbol, "H1")
+        mn1_history = fetch_mt5_price_history(base.symbol, "MN1", count=_MN1_BACKTEST_BARS)
         results.append(
             FtmoAssetAnalysis(
                 base=base,
@@ -915,10 +1425,96 @@ def analyze_ftmo_assets(
                 ),
                 h4_structure=compute_chart_structure(h4_history),
                 h1_structure=compute_chart_structure(h1_history),
-                trade_cost=get_trade_economics(base.symbol),
+                trade_cost=trade_cost,
+                mn1_stats=compute_technical_stats(
+                    mn1_history["Close"], history=mn1_history, periods_per_year=_MN1_PERIODS_PER_YEAR
+                ),
+                d1_structure=compute_chart_structure(d1_history),
+                mn1_structure=compute_chart_structure(mn1_history),
             )
         )
     return results
+
+
+def analyze_ftmo_asset_live(symbol: str, bid: float, ask: float, description: str) -> FtmoAssetAnalysis:
+    """The same monthly/D1/H4/H1 technical stats + chart structure +
+    backtests + trade cost analyze_ftmo_assets() computes in its batch
+    pipeline, but for exactly one symbol, on demand — built for the Watchlist's
+    per-asset detail popup (app.py), which needs a fast, genuinely live
+    single-symbol read rather than the full batch pipeline's per-symbol
+    Yahoo/news lookups. Deliberately skips analyze_assets()'s Yahoo-based
+    enrichment entirely and always builds the D1 base natively from MT5
+    (same construction as _enrich_with_native_d1, just unconditional
+    rather than gated on "Yahoo didn't already cover this symbol") —
+    MT5's own feed is both faster and more genuinely "live" than Yahoo's
+    daily bars anyway, which is exactly what a real-time dashboard needs.
+
+    Backtests are skipped (left None) only if D1 history itself came
+    back empty — matches _enrich_with_native_d1's own guard, since none
+    of the four backtest functions have been verified safe to call on a
+    truly empty price series."""
+    d1_history = fetch_mt5_price_history(symbol, "D1", count=_D1_BACKTEST_BARS)
+    d1_prices = d1_history["Close"]
+    # Both fetched once, up front, and reused below for the RSI/S-R
+    # backtests' real cost/guard-rail simulation AND the analysis' own
+    # base/trade_cost fields — same redundant-fetch avoidance as
+    # analyze_ftmo_assets' own identical pattern.
+    contract_spec = get_contract_spec(symbol)
+    trade_cost = get_trade_economics(symbol)
+    if d1_history.empty:
+        rsi_overbought_bt = rsi_oversold_bt = None
+        momentum_bt = volatility_regime_bt = support_resistance_bt = None
+        d1_stats = compute_technical_stats(d1_prices)
+    else:
+        # `ask` (the function's own parameter), not the D1 series' last
+        # close — see _enrich_with_native_d1's own identical fix/comment
+        # for why: matches format_ftmo_trade_cost's own price source
+        # exactly, so the two can never disagree on Forex/Exotics'
+        # price-dependent commission % just from using different prices.
+        exec_kwargs = _real_backtest_execution_kwargs(trade_cost, contract_spec, ask)
+        rsi_overbought_bt, rsi_oversold_bt = backtest_rsi_reaction(d1_history, **exec_kwargs)
+        momentum_bt = backtest_momentum_persistence(d1_prices)
+        volatility_regime_bt = backtest_volatility_regime(d1_prices)
+        support_resistance_bt = backtest_support_resistance_reaction(d1_history, **exec_kwargs)
+        d1_stats = compute_technical_stats(d1_prices, history=d1_history)
+
+    base = AssetAnalysis(
+        symbol=symbol,
+        description=description,
+        bid=bid,
+        ask=ask,
+        display_name=description,
+        data_source="mt5",
+        prices=d1_prices,
+        stats=d1_stats,
+        headlines=[],
+        contract_spec=contract_spec,
+        rsi_overbought_backtest=rsi_overbought_bt,
+        rsi_oversold_backtest=rsi_oversold_bt,
+        momentum_persistence_backtest=momentum_bt,
+        volatility_regime_backtest=volatility_regime_bt,
+        support_resistance_backtest=support_resistance_bt,
+    )
+    h4_history = fetch_mt5_price_history(symbol, "H4")
+    h1_history = fetch_mt5_price_history(symbol, "H1")
+    mn1_history = fetch_mt5_price_history(symbol, "MN1", count=_MN1_BACKTEST_BARS)
+    return FtmoAssetAnalysis(
+        base=base,
+        h4_stats=compute_technical_stats(
+            h4_history["Close"], history=h4_history, periods_per_year=_H4_PERIODS_PER_YEAR
+        ),
+        h1_stats=compute_technical_stats(
+            h1_history["Close"], history=h1_history, periods_per_year=_H1_PERIODS_PER_YEAR
+        ),
+        h4_structure=compute_chart_structure(h4_history),
+        h1_structure=compute_chart_structure(h1_history),
+        trade_cost=trade_cost,
+        mn1_stats=compute_technical_stats(
+            mn1_history["Close"], history=mn1_history, periods_per_year=_MN1_PERIODS_PER_YEAR
+        ),
+        d1_structure=compute_chart_structure(d1_history),
+        mn1_structure=compute_chart_structure(mn1_history),
+    )
 
 
 # Real, round-turn commission by MT5's own symbol-path category — see
@@ -972,11 +1568,15 @@ def format_ftmo_trade_cost(analysis: FtmoAssetAnalysis) -> str:
         commission_display = f"{commission_pct:.4f}% ({commission_note})"
         round_trip_note = ""
 
-    swap_display = (
-        f"{cost.swap_long_pct_per_day:+.4f}%/day held long"
-        if cost.swap_long_pct_per_day is not None
-        else "not available for this swap calculation mode"
-    )
+    # Both directions reported independently — a short recommendation
+    # needs its own real overnight cost to reason about, not just the
+    # long side (which is all this used to surface).
+    swap_parts = []
+    if cost.swap_long_pct_per_day is not None:
+        swap_parts.append(f"{cost.swap_long_pct_per_day:+.4f}%/day held long")
+    if cost.swap_short_pct_per_day is not None:
+        swap_parts.append(f"{cost.swap_short_pct_per_day:+.4f}%/day held short")
+    swap_display = ", ".join(swap_parts) if swap_parts else "not available for this swap calculation mode"
 
     return (
         f"  REAL trading cost ({cost.category}): spread {cost.spread_pct_of_price:.4f}% + "
@@ -986,26 +1586,48 @@ def format_ftmo_trade_cost(analysis: FtmoAssetAnalysis) -> str:
     )
 
 
-def _format_intraday_stats(symbol: str, label: str, stats: TechnicalStats) -> str:
+def format_timeframe_stats(symbol: str, label: str, stats: TechnicalStats, *, long_term: bool = False) -> str:
+    """Generic over any (symbol, label, TechnicalStats) — was named
+    format_intraday_stats and hardcoded "(near-term entry timing/stop
+    placement)" for every label until the real monthly (MN1) timeframe
+    was added and reused this function verbatim: that phrasing is
+    actively wrong for a monthly read (it's long-term structural CONTEXT,
+    never a near-term entry/stop reference — see FtmoAssetAnalysis's own
+    docstring on mn1_stats), so `long_term` now switches both the header
+    phrase and the ATR line's own "use for near-term stop distance"
+    suggestion, which was equally wrong for a monthly ATR (enormous
+    relative to an actual intraday stop, not a real reference for one)."""
+    purpose = "long-term structural/bias context, not for entry timing" if long_term else "near-term entry timing/stop placement"
     if stats.last_price is None:
-        return (
-            f"  {label} technical (near-term entry timing/stop "
-            f"placement): not available (insufficient MT5 {label} "
-            f"history for {symbol})"
-        )
+        return f"  {label} technical ({purpose}): not available (insufficient MT5 {label} history for {symbol})"
     bits = [f"last {stats.last_price:.4f}"]
     if stats.trend is not None and stats.pct_vs_sma20 is not None:
         bits.append(f"{stats.trend} ({stats.pct_vs_sma20:+.1f}% vs 20-bar SMA)")
+    if stats.market_regime is not None:
+        # Real gap found on a self-audit re-check: this line was missing
+        # entirely, so an H4/H1 market_regime of "trending_up"/"trending_
+        # down"/"choppy_up"/"choppy_down" only ever reached the model
+        # indirectly, through the setup-classifier's own text (rule 3 or
+        # 6 below) — and ONLY when one of those specific rules happened
+        # to fire. A clean trending_up/trending_down regime with no
+        # matching chart-structure pattern (a real, common case — the two
+        # detectors measure genuinely different things, see analysis/
+        # technical.py's own market_regime comment) silently never
+        # reached the model at all. Shown here directly, unconditionally,
+        # the same way the D1 read's "market type" line already works via
+        # ai/portfolio_suggest.py::format_enriched_asset_context.
+        bits.append(f"market type: {stats.market_regime}")
     if stats.rsi is not None:
         bits.append(f"RSI {stats.rsi:.0f}")
     if stats.atr_pct is not None:
-        bits.append(f"ATR {stats.atr_pct:.2f}% of price (use for near-term stop distance)")
+        atr_note = "reference only, NOT a near-term stop distance" if long_term else "use for near-term stop distance"
+        bits.append(f"ATR {stats.atr_pct:.2f}% of price ({atr_note})")
     if stats.volatility_annualized_pct is not None:
         bits.append(f"volatility {stats.volatility_annualized_pct:.1f}% (annualized)")
-    return f"  {label} technical (near-term entry timing/stop placement): {', '.join(bits)}"
+    return f"  {label} technical ({purpose}): {', '.join(bits)}"
 
 
-def _format_chart_structure(label: str, snapshot: ChartStructureSnapshot) -> str:
+def format_chart_structure(label: str, snapshot: ChartStructureSnapshot) -> str:
     """Real, computed chart structure — Fibonacci retracement, multi-
     level support/resistance with real touch counts, trendlines, and
     conservatively-detected chart patterns (see analysis/chart_structure.py's
@@ -1071,7 +1693,7 @@ def _candidate_levels(structure: ChartStructureSnapshot) -> list[float]:
     return levels
 
 
-def _format_mtf_confluence(analysis: FtmoAssetAnalysis) -> str:
+def format_mtf_confluence(analysis: FtmoAssetAnalysis) -> str:
     """Cross-timeframe read: does H4 agree with H1 on trend direction,
     and do any of their independently-computed levels line up at the
     same real price? Two timeframes agreeing on both counts is
@@ -1125,7 +1747,162 @@ def _format_mtf_confluence(analysis: FtmoAssetAnalysis) -> str:
     return f"  Multi-timeframe (H4 vs H1) trend alignment: {alignment}; confluence levels: {zones_text}"
 
 
-def _format_setup_signals(label: str, signals: list[SetupSignal]) -> str:
+def _regime_direction(regime: str | None) -> str | None:
+    """Collapses market_regime's 5 real states down to the 3 that matter
+    for a direction-vs-direction comparison — "up"/"down" fold trending_*
+    and choppy_* together (both are real net direction, see analysis/
+    technical.py's own market_regime comment for why efficiency/
+    cleanliness is a separate question from direction), "flat" covers
+    sideways, None means not enough history to say anything."""
+    if regime is None:
+        return None
+    if regime in ("trending_up", "choppy_up"):
+        return "up"
+    if regime in ("trending_down", "choppy_down"):
+        return "down"
+    return "flat"
+
+
+def classify_long_term_alignment(
+    analysis: FtmoAssetAnalysis,
+) -> tuple[str, str | None, list[str], list[str]]:
+    """Shared classification step behind BOTH format_long_term_alignment
+    (the long, reasoning-heavy version fed to the AI prompt) and
+    format_long_term_alignment_short (a one-line version for the UI
+    popup) — real bug found live: the popup was originally showing the
+    AI-facing text verbatim, a multi-sentence paragraph that's correct
+    reasoning depth for a model but real noise for a human glancing at a
+    dashboard; splitting the classification out once means both texts
+    can never silently disagree with each other the way maintaining two
+    independent copies of this same logic eventually would.
+
+    Returns (state, short_direction, agreeing_backdrop_names,
+    opposing_backdrop_names) where state is one of "not_available",
+    "flat", "no_backdrop", "structurally_backed", "counter_trend_spike",
+    "mixed"."""
+    short = _regime_direction(analysis.h4_stats.market_regime)
+    d1_dir = _regime_direction(analysis.base.stats.market_regime)
+    mn1_dir = _regime_direction(analysis.mn1_stats.market_regime)
+
+    if short is None:
+        return "not_available", short, [], []
+    if short == "flat":
+        return "flat", short, [], []
+
+    backdrop = [(name, d) for name, d in (("daily", d1_dir), ("monthly", mn1_dir)) if d not in (None, "flat")]
+    if not backdrop:
+        return "no_backdrop", short, [], []
+
+    agreeing = [name for name, d in backdrop if d == short]
+    opposing = [name for name, d in backdrop if d != short]
+    if not opposing:
+        return "structurally_backed", short, agreeing, opposing
+    if not agreeing:
+        return "counter_trend_spike", short, agreeing, opposing
+    return "mixed", short, agreeing, opposing
+
+
+def format_long_term_alignment(analysis: FtmoAssetAnalysis) -> str:
+    """Real bug found live 2026-08-22 (user's own words: this account's
+    analysis "reads, displays and analyzes H1, H4 but not the daily or
+    monthly charts... this way the analysis is missing the long/medium
+    term trends and can throw us in a fake trend unguarded") — H4/H1 were
+    the only timeframes ever compared against EACH OTHER
+    (format_mtf_confluence above), never against the genuinely longer-
+    term backdrop this account's own D1 and monthly (MN1) reads already
+    compute. This answers a real, different question than that H4-vs-H1
+    comparison: does the CURRENT short-term (H4) move have real backing
+    from the longer-term structure, or is it running against it —
+    exactly the "fake trend" risk flagged above.
+
+    Deliberately does NOT treat a counter-trend read as disqualifying —
+    the user's own stated preference is the opposite: short-term spikes
+    with no longer-term backing are explicitly worth trading for the
+    quick move they offer, PROVIDED they're correctly recognized as that
+    and exited on their own terms rather than mistaken for a durable
+    trend. This function's whole job is making that recognition explicit
+    and automatic rather than left to be inferred, not gatekeeping which
+    trades are allowed."""
+    state, short, agreeing, opposing = classify_long_term_alignment(analysis)
+
+    if state == "not_available":
+        return "  Long-term alignment: H4 market-type not available yet (insufficient history)."
+    if state == "flat":
+        return (
+            "  Long-term alignment: H4 shows no real short-term direction right now — "
+            "nothing yet to compare against the daily/monthly backdrop."
+        )
+    if state == "no_backdrop":
+        return (
+            "  Long-term alignment: no real daily or monthly directional backdrop available "
+            "(insufficient history, or both read sideways) — this H4 move has no longer-term "
+            "structure to either confirm or contradict it."
+        )
+    if state == "structurally_backed":
+        named = " and ".join(agreeing)
+        return (
+            f"  Long-term alignment: STRUCTURALLY BACKED — the H4 {short}ward move agrees "
+            f"with the real {named} backdrop, not just a short-term read in isolation — "
+            "genuinely stronger conviction evidence for sizing (per DEBATE THE POSITION SIZE "
+            "above). This is NOT, on its own, a reason to extend the holding window past this "
+            "account's own intraday default — that decision still runs entirely through the "
+            "HOLDING HORIZON/DEBATE THE HOLDING PERIOD debate above (real cost vs. move, swap "
+            "sign); a structurally-backed move that also clears THAT bar is a stronger case for "
+            "the overnight exception than an unbacked one would be, nothing more."
+        )
+    if state == "counter_trend_spike":
+        named = " and ".join(opposing)
+        return (
+            f"  Long-term alignment: COUNTER-TREND SPIKE — the H4 {short}ward move runs "
+            f"AGAINST the real {named} backdrop. This is NOT a reason to discard it outright "
+            "— a real, fast counter-trend move can be genuinely tradeable on its own terms — "
+            "but treat it explicitly as a short-lived move to capture and exit deliberately, "
+            "not as the start of a durable trend: a tighter stop, a firmer holding-window "
+            "commitment, and sizing that reflects lower conviction in it lasting are all "
+            "warranted specifically BECAUSE of this read, not despite it."
+        )
+    return (
+        f"  Long-term alignment: MIXED — the H4 {short}ward move agrees with the "
+        f"{' and '.join(agreeing)} backdrop but runs against the {' and '.join(opposing)} "
+        "one; partial, not full, longer-term confirmation."
+    )
+
+
+# Real UI messaging standard, set 2026-08-22 after direct user feedback
+# on this exact message ("this is very long and complex... give simple,
+# decisive message... like 'ball will drop down because gravity is
+# present so do not stand under the range of ball otherwise it will hit
+# you'"): every user-facing (not AI-prompt-facing) message on this page
+# should name the cause, the consequence, and the action in one short
+# sentence — not the full reasoning depth a model needs. This function
+# is the template other UI messages on this page should follow the same
+# way; see app.py's own use of it for a real example.
+LONG_TERM_ALIGNMENT_SHORT_MESSAGES = {
+    "not_available": "Not enough history yet to read this instrument's short-term trend.",
+    "flat": "No real short-term move right now — nothing to size up yet.",
+    "no_backdrop": "No long-term trend to check against yet — this move stands alone.",
+    "structurally_backed": "Move matches the bigger trend, so it's likely real — size with confidence.",
+    "counter_trend_spike": "Move fights the bigger trend, so it's likely a short spike — use a tight stop and exit fast, otherwise it may reverse on you.",
+    "mixed": "Daily and monthly trends disagree, so this is only half-confirmed — size smaller.",
+}
+
+
+def format_long_term_alignment_short(analysis: FtmoAssetAnalysis) -> str:
+    """One-line, human-facing version of format_long_term_alignment — for
+    a UI display, not the AI prompt (which uses the long version above;
+    a model needs the reasoning depth, a person reading a dashboard
+    doesn't). app.py's own Asset Health popup calls classify_long_term_
+    alignment directly instead of this wrapper (it separately needs the
+    raw `state` for color-coding, so calling this too would classify the
+    same analysis twice for no reason) — this convenience form is for
+    any OTHER caller that just wants the one-line message and doesn't
+    separately need the state. See LONG_TERM_ALIGNMENT_SHORT_MESSAGES'
+    own comment for why these are worded the way they are."""
+    state, _short, _agreeing, _opposing = classify_long_term_alignment(analysis)
+    return LONG_TERM_ALIGNMENT_SHORT_MESSAGES[state]
+
+
+def format_setup_signals(label: str, signals: list[SetupSignal]) -> str:
     if not signals:
         return f"  {label} setup read: none computed"
     bits = "; ".join(f"{s.name} — {s.detail}" for s in signals)
@@ -1137,23 +1914,63 @@ def format_ftmo_asset_context(
 ) -> str:
     """Reuses format_enriched_asset_context (called once per single-asset
     slice, unchanged) for each symbol's existing daily/feasibility/
-    backtest block, then appends the H4/H1 technical + chart-structure +
-    setup-classification lines, the multi-timeframe confluence/alignment
-    read, and the real trading-cost line right after it — keeps every
-    symbol's full read together rather than grouping all base reads
-    first and all intraday reads after."""
+    backtest block, then appends chart-structure + setup-classification
+    for ALL FOUR timeframes (real feature added live 2026-08-22, user's
+    own direct request — see FtmoAssetAnalysis's own docstring for why
+    D1/monthly previously stopped at a bare stats line), the multi-
+    timeframe confluence/alignment read, and the real trading-cost line
+    right after it — keeps every symbol's full read together rather than
+    grouping all base reads first and all intraday reads after."""
     lines = []
     for a in analyses:
         lines.append(format_enriched_asset_context([a.base], account_equity=account_equity))
-        lines.append(_format_intraday_stats(a.base.symbol, "H4", a.h4_stats))
-        lines.append(_format_chart_structure("H4", a.h4_structure))
-        lines.append(_format_setup_signals("H4", classify_setups(a.h4_stats, a.h4_structure)))
-        lines.append(_format_intraday_stats(a.base.symbol, "H1", a.h1_stats))
-        lines.append(_format_chart_structure("H1", a.h1_structure))
-        lines.append(_format_setup_signals("H1", classify_setups(a.h1_stats, a.h1_structure)))
-        lines.append(_format_mtf_confluence(a))
+        lines.append(format_chart_structure("D1", a.d1_structure))
+        lines.append(format_setup_signals("D1", classify_setups(a.base.stats, a.d1_structure)))
+        lines.append(format_timeframe_stats(a.base.symbol, "Monthly", a.mn1_stats, long_term=True))
+        lines.append(format_chart_structure("Monthly", a.mn1_structure))
+        lines.append(format_setup_signals("Monthly", classify_setups(a.mn1_stats, a.mn1_structure)))
+        lines.append(format_timeframe_stats(a.base.symbol, "H4", a.h4_stats))
+        lines.append(format_chart_structure("H4", a.h4_structure))
+        lines.append(format_setup_signals("H4", classify_setups(a.h4_stats, a.h4_structure)))
+        lines.append(format_timeframe_stats(a.base.symbol, "H1", a.h1_stats))
+        lines.append(format_chart_structure("H1", a.h1_structure))
+        lines.append(format_setup_signals("H1", classify_setups(a.h1_stats, a.h1_structure)))
+        lines.append(format_mtf_confluence(a))
+        lines.append(format_long_term_alignment(a))
         lines.append(format_ftmo_trade_cost(a))
     return "\n".join(lines)
+
+
+def fetch_ftmo_status(
+    account_summary: AccountSummary, deals: list[HistoricalDeal] | None = None
+) -> FtmoStatus:
+    """Real, freshly-computed FTMO compliance status for the given (also
+    freshly-fetched) account summary. Public/shared so every caller that
+    needs a status matching its own exact account snapshot — app.py's
+    top-of-page compliance panel, a Portfolio Suggestion click (which
+    fetches its own newer account summary a moment later), and the
+    unattended daily mega-analysis job (ai/mega_analysis.py) — gets one,
+    rather than each silently reasoning over a slightly stale snapshot
+    from earlier in its own run, a real (if usually small) correctness
+    gap for a compliance-critical number.
+
+    `deals` lets a caller that already fetched the full history this run
+    (app.py's live-positions fragment, for its own Trade History table)
+    pass it straight through instead of triggering a second identical
+    unbounded MT5 history fetch; omit it to fetch fresh."""
+    ftmo_deals = deals if deals is not None else get_history_deals(datetime(2000, 1, 1))
+    # Excludes deals with no symbol (MT5's own deposit/withdrawal/credit
+    # "balance" operations, e.g. the Challenge's initial funding itself)
+    # — those aren't trading P&L, and folding them in here would badly
+    # understate initial_balance (see risk/ftmo_rules.py's own matching
+    # filter for the full reasoning).
+    initial_balance = account_summary.balance - sum(d.profit for d in ftmo_deals if d.symbol)
+    return compute_ftmo_status(
+        ftmo_deals,
+        initial_balance=initial_balance,
+        current_equity=account_summary.equity,
+        current_balance=account_summary.balance,
+    )
 
 
 def format_ftmo_status_context(status: FtmoStatus) -> str:

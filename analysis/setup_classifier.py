@@ -1,18 +1,29 @@
 """Synthesizes analysis/technical.py's TechnicalStats with
 analysis/chart_structure.py's ChartStructureSnapshot into a small set of
 real, deterministic trade-setup archetypes — reversal, pullback-
-continuation, range-fade, breakout-watch, trend-following. This is a
-classification LAYER, not a new data source: every signal it reasons over
-was already computed by one of those two modules; this module only
-combines them under well-defined rules, so an AI reading the result gets
-"here is the kind of setup this looks like, and exactly why" instead of
-having to reconstruct that judgment itself from a dozen separate numbers
-every single time.
+continuation, range-fade, breakout-watch, trend-following, grind-
+continuation. This is a classification LAYER, not a new data source:
+every signal it reasons over was already computed by one of those two
+modules; this module only combines them under well-defined rules, so an
+AI reading the result gets "here is the kind of setup this looks like,
+and exactly why" instead of having to reconstruct that judgment itself
+from a dozen separate numbers every single time.
 
 Deliberately does NOT try to be exhaustive — an instrument with no
 confirmed structure just gets "no_clear_setup", which is a normal,
 common, and useful result (it tells the model not to force a thesis),
-not a failure of this module."""
+not a failure of this module.
+
+`trend_intact` (see its own rule below) is the clean-trend counterpart
+to `grind_continuation`: a real, cleanly-trending regime with no more
+specific trigger (a fresh reversal/pullback/breakout/trendline-retest)
+active right now still IS genuine directional evidence, not nothing —
+real gap found live 2026-08-22 (user's own words, looking at a real
+BTCUSD read: "the asset is clearly up trend but technical showing
+different story") where a clean `trending_up` regime with no special
+trigger fell all the way through to `no_clear_setup`, reading
+identically to genuinely having no evidence at all despite the
+trend/regime badges right next to it agreeing on a clean uptrend."""
 
 from dataclasses import dataclass
 
@@ -181,14 +192,80 @@ def classify_setups(stats: TechnicalStats, structure: ChartStructureSnapshot) ->
                 )
             )
 
+    # 6. Grind continuation — market_regime is choppy_up/choppy_down (see
+    # analysis/technical.py's own comment on that computation): a real
+    # net directional move over the medium-term window, just reached via
+    # a noisy, back-and-forth path rather than a clean trend. This is
+    # genuine directional evidence a model can act on — real bug found
+    # live: before market_regime distinguished "choppy but real
+    # direction" from "no direction at all", both cases were lumped into
+    # one "sideways" read, which then only ever fed range_fade_candidate
+    # (rule 3) or fell through to no_clear_setup below, discarding the
+    # real direction entirely. Momentum already at an extreme in the
+    # SAME direction (RSI overbought on a choppy uptrend, oversold on a
+    # choppy downtrend) argues the move may already be stretched, so this
+    # deliberately doesn't fire there — a fresh, not-yet-exhausted grind
+    # is a materially different setup than a tired one.
+    if stats.market_regime in ("choppy_up", "choppy_down"):
+        direction_word = "up" if stats.market_regime == "choppy_up" else "down"
+        momentum_extreme = stats.rsi is not None and (
+            (direction_word == "up" and stats.rsi >= 70) or (direction_word == "down" and stats.rsi <= 30)
+        )
+        if not momentum_extreme:
+            signals.append(
+                SetupSignal(
+                    name="grind_continuation",
+                    detail=(
+                        f"A real net {direction_word}ward move over the medium-term window, "
+                        "reached via a noisy, back-and-forth path rather than a clean "
+                        "trend — genuine directional evidence, just expect whipsaws rather "
+                        "than a straight-line move; RSI isn't already at an extreme that "
+                        "would argue the move is exhausted."
+                    ),
+                )
+            )
+
+    # 7. Trend intact — market_regime is a CLEAN trending_up/trending_down
+    # (not choppy — that's grind_continuation above), and nothing more
+    # SPECIFIC already fired for this same direction (a fresh trendline
+    # retest — trend_following — or a golden-zone pullback —
+    # pullback_continuation — are stronger, narrower versions of this
+    # exact situation, so this stays quiet rather than restating it).
+    # Same RSI-not-already-extreme guard as grind_continuation, for the
+    # same reason: a trend already stretched to an extreme is a
+    # materially different setup than a fresh, still-room-to-run one.
+    if stats.market_regime in ("trending_up", "trending_down") and not any(
+        s.name in ("trend_following", "pullback_continuation") for s in signals
+    ):
+        direction_word = "up" if stats.market_regime == "trending_up" else "down"
+        momentum_extreme = stats.rsi is not None and (
+            (direction_word == "up" and stats.rsi >= 70) or (direction_word == "down" and stats.rsi <= 30)
+        )
+        if not momentum_extreme:
+            signals.append(
+                SetupSignal(
+                    name="trend_intact",
+                    detail=(
+                        f"A clean, established {direction_word}trend (market regime reads "
+                        f"trending_{direction_word}) with no more specific reversal/"
+                        "pullback/breakout/trendline-retest trigger active right now — "
+                        "real directional evidence to lean with rather than a reason to "
+                        "sit out just because there's no fresh entry trigger this moment; "
+                        "RSI isn't already at an extreme that would argue the move is "
+                        "exhausted."
+                    ),
+                )
+            )
+
     if not signals:
         signals.append(
             SetupSignal(
                 name="no_clear_setup",
                 detail=(
                     "No specific structural setup (reversal, pullback, range-fade, "
-                    "breakout-watch, or trendline re-test) currently confirmed on this "
-                    "timeframe — a normal, common result, not a gap to explain away."
+                    "breakout-watch, trendline re-test, or grind-continuation) currently "
+                    "confirmed on this timeframe — a normal, common result, not a gap to "
+                    "explain away."
                 ),
             )
         )

@@ -221,8 +221,8 @@ def test_analyze_psx_assets_wires_backtests_onto_the_analysis(
 ):
     mock_history.return_value = _make_history()
     mock_company_data.return_value = _make_company_data()
-    overbought = RSIReactionBacktest("overbought", 70.0, 6, -5.0, 100.0, 10)
-    oversold = RSIReactionBacktest("oversold", 30.0, 5, 6.0, 80.0, 10)
+    overbought = RSIReactionBacktest("overbought", 70.0, 6, 1, 5, 0, 16.7, -0.4, 1.5, 3.0, 10)
+    oversold = RSIReactionBacktest("oversold", 30.0, 5, 4, 1, 0, 80.0, 1.4, 1.5, 3.0, 10)
     mock_rsi_bt.return_value = (overbought, oversold)
     beta_bt = BetaStabilityBacktest(0.5, 0.6, 0.55, 0.52, True)
     mock_beta_bt.return_value = beta_bt
@@ -230,7 +230,7 @@ def test_analyze_psx_assets_wires_backtests_onto_the_analysis(
     mock_momentum_bt.return_value = momentum_bt
     vol_regime_bt = VolatilityRegimeBacktest(5.0, 15, 10.0, 20, 10)
     mock_vol_regime_bt.return_value = vol_regime_bt
-    sr_bt = SupportResistanceBacktest(10, 70.0, 8, 60.0, 10)
+    sr_bt = SupportResistanceBacktest(10, 7, 3, 0, 70.0, 0.8, 8, 5, 3, 0, 62.5, 0.5, 1.5, 3.0, 10)
     mock_sr_bt.return_value = sr_bt
     eps_growth = EPSGrowthTrend(1.2, 1.0, 20.0, 2, 0.4, 0.3, 33.3)
     mock_eps_growth.return_value = eps_growth
@@ -531,21 +531,24 @@ def test_format_correlation_context_no_pairs_message_when_none_qualify():
 
 def test_format_psx_asset_context_includes_backtest_evidence():
     analysis = _analysis_with_stats()
-    analysis.rsi_overbought_backtest = RSIReactionBacktest("overbought", 70.0, 6, -4.5, 83.0, 10)
-    analysis.rsi_oversold_backtest = RSIReactionBacktest("oversold", 30.0, 5, 3.2, 60.0, 10)
+    analysis.rsi_overbought_backtest = RSIReactionBacktest("overbought", 70.0, 6, 5, 1, 0, 83.3, 1.5, 1.5, 3.0, 10)
+    analysis.rsi_oversold_backtest = RSIReactionBacktest("oversold", 30.0, 5, 3, 2, 0, 60.0, 0.4, 1.5, 3.0, 10)
     analysis.beta_stability_backtest = BetaStabilityBacktest(0.8, 0.9, 0.85, 0.82, True)
     analysis.momentum_persistence_backtest = MomentumPersistenceBacktest(0.42, 25, "persistent")
     analysis.volatility_regime_backtest = VolatilityRegimeBacktest(8.0, 15, 4.0, 20, 10)
-    analysis.support_resistance_backtest = SupportResistanceBacktest(10, 70.0, 8, 60.0, 10)
+    analysis.support_resistance_backtest = SupportResistanceBacktest(
+        10, 7, 3, 0, 70.0, 0.8, 8, 6, 2, 0, 75.0, 0.9, 1.5, 3.0, 10
+    )
     analysis.eps_growth_trend = EPSGrowthTrend(1.2, 1.0, 20.0, 2, 0.4, 0.3, 33.3)
 
     text = format_psx_asset_context([analysis])
     assert "6 distinct past episodes" in text
-    assert "reversed as the textbook convention would predict 83%" in text
+    assert "5 wins, 1 losses" in text
+    assert "win rate 83%" in text
     assert "STABLE" in text
     assert "0.42" in text and "persistent" in text
     assert "supports the 'coiled spring' reading" in text
-    assert "support held" in text and "70%" in text and "resistance rejected" in text and "60%" in text
+    assert "buying off support" in text and "70%" in text and "shorting off resistance" in text and "75%" in text
     assert "2 consecutive reported annual period(s)" in text
     assert "+20.0%" in text
 
@@ -563,7 +566,7 @@ def test_format_psx_asset_context_discloses_missing_backtest_evidence():
     assert "not enough real historical episodes" in text
     assert "not enough aligned history to compute" in text
     assert "not enough history to compute" in text
-    assert "not enough real historical tests of these levels to compute" in text
+    assert "not enough real historical tests of these levels" in text
     assert "EPS growth trend: not available" in text
 
 

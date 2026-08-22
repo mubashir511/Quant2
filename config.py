@@ -183,3 +183,39 @@ FTMO_COMMISSION_CRYPTO_PCT_ROUND_TURN = float(
 # narrower one might reasonably allow.
 FTMO_MAX_POSITION_COUNT = int(os.getenv("FTMO_MAX_POSITION_COUNT", "10"))
 FTMO_MAX_SYMBOL_EXPOSURE_PCT = float(os.getenv("FTMO_MAX_SYMBOL_EXPOSURE_PCT", "20"))
+
+# --- FTMO daily "mega market analysis" (unattended, OS-scheduled) ---
+# Runs the full FTMO Portfolio Suggestion pipeline (Claude Sonnet draft +
+# the entire AUDIT_MODELS pool + Copilot) once a day with nobody watching,
+# via a standalone script (mega_analysis_job.py) triggered by a Windows
+# Scheduled Task — deliberately NOT an in-process background thread,
+# confirmed live that a Streamlit script's own top-level code never
+# executes at all until a browser session connects, so a thread started
+# from inside app.py can't reliably self-arm after an unattended restart.
+#
+# Trigger time is anchored in UTC, not local PC time or the MT5 broker's
+# own server time — local-time scheduling would silently drift by an hour
+# across DST transitions (Windows Task Scheduler's local-time triggers
+# track wall-clock time, not a fixed UTC instant, and the US/EU DST
+# switchover dates don't even line up with each other). 14:00 UTC sits
+# right after the NY cash-equity-index open (13:30 UTC), inside the
+# London/New York liquidity overlap, with the entire NY session still
+# ahead for an intraday-to-1-day hold — the richest, most representative
+# window across this account's actual mix (forex majors, metals, US cash
+# indices, crypto, agriculturals/commodities).
+MEGA_ANALYSIS_TRIGGER_HOUR_UTC = int(os.getenv("MEGA_ANALYSIS_TRIGGER_HOUR_UTC", "14"))
+MEGA_ANALYSIS_TRIGGER_MINUTE_UTC = int(os.getenv("MEGA_ANALYSIS_TRIGGER_MINUTE_UTC", "0"))
+# mega_analysis_job.py is invoked by a repeating OS-level poll (every 15
+# minutes, set at the Task Scheduler level, not here), not a one-shot
+# trigger — this window is how long after the trigger instant a poll may
+# still treat today as due; it must exceed that 15-minute poll interval
+# so at least one poll always lands inside it. A poll landing OUTSIDE
+# this window with no successful run yet recorded for today means the PC
+# was off/asleep through the whole window — today is treated as missed
+# and skipped, not run late, by explicit design.
+MEGA_ANALYSIS_GRACE_MINUTES = int(os.getenv("MEGA_ANALYSIS_GRACE_MINUTES", "20"))
+# Idempotency/status marker shared between mega_analysis_job.py (writes
+# it after every attempt) and app.py's countdown display (reads it to
+# know whether today's run already happened, and to show the last
+# outcome) — see ai/mega_analysis.py.
+MEGA_ANALYSIS_STATE_FILE = os.getenv("MEGA_ANALYSIS_STATE_FILE", "mega_analysis_state.json")

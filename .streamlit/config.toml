@@ -1,0 +1,46 @@
+# Native theming only (no custom CSS) — colors are aligned with the
+# fixed categorical/gain/loss palette already used for every chart in
+# app.py (_CATEGORICAL_COLORS / _GAIN_COLOR / _LOSS_COLOR), so the page
+# chrome and the charts read as one consistent system. Both light and
+# dark variants are defined so users can still toggle in the app's
+# settings menu — a bare [theme] section on its own would lock the app
+# to one mode, but baseFontSize/chartCategoricalColors are only valid at
+# the top level (not per light/dark mode) on this Streamlit version, so
+# they live here while everything mode-specific lives below.
+
+[theme]
+baseFontSize = 15
+chartCategoricalColors = [
+    "#2a78d6", "#eb6834", "#1baf7a", "#eda100",
+    "#e87ba4", "#008300", "#4a3aa7", "#e34948",
+]
+
+[theme.light]
+primaryColor = "#2a78d6"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f4f6f9"
+textColor = "#1f2328"
+borderColor = "#d8dee5"
+font = "sans-serif"
+headingFont = "sans-serif"
+headingFontSizes = ["34px", "26px", "20px", "17px", "15px", "13px"]
+headingFontWeights = [700, 650, 600, 600, 500, 500]
+baseRadius = "medium"
+showWidgetBorder = true
+greenColor = "#1a7f37"
+redColor = "#cf222e"
+
+[theme.dark]
+primaryColor = "#5b9de0"
+backgroundColor = "#0e1117"
+secondaryBackgroundColor = "#181c25"
+textColor = "#e6edf3"
+borderColor = "#2a2f3a"
+font = "sans-serif"
+headingFont = "sans-serif"
+headingFontSizes = ["34px", "26px", "20px", "17px", "15px", "13px"]
+headingFontWeights = [700, 650, 600, 600, 500, 500]
+baseRadius = "medium"
+showWidgetBorder = true
+greenColor = "#3fb950"
+redColor = "#f85149"

@@ -9,21 +9,44 @@ from ai.claude_cli import CLI_FAILED_PREFIX, CLI_MISSING_MESSAGE
 from ai.ftmo_suggest import (
     AUDIT_INSTRUCTION,
     FtmoAssetAnalysis,
+    _MN1_BACKTEST_BARS,
+    _enrich_with_native_d1,
     _fetch_current_ftmo_price,
     _ftmo_commission_pct_round_turn,
+    _real_backtest_execution_kwargs,
+    analyze_ftmo_asset_live,
     analyze_ftmo_assets,
     build_ftmo_stage1_instruction,
     build_ftmo_stage2_instruction,
     build_ftmo_summary,
+    classify_long_term_alignment,
     format_ftmo_asset_context,
     format_ftmo_status_context,
     format_ftmo_trade_cost,
+    format_long_term_alignment,
+    format_long_term_alignment_short,
     suggest_ftmo_portfolio,
 )
 from ai.portfolio_suggest import AssetAnalysis, AuditResult
 from analysis.chart_structure import ChartStructureSnapshot, SRLevel, SRLevelsResult
-from analysis.technical import compute_technical_stats
+from analysis.technical import TechnicalStats, compute_technical_stats
 from data.mt5_source import AccountSummary, ContractSpec, MarketAsset, TradeCost
+
+
+def _ts(market_regime=None) -> TechnicalStats:
+    """Minimal TechnicalStats with only market_regime set — everything
+    format_long_term_alignment/its tests need, without needing a real
+    price series shaped to produce a specific regime. Built by keyword,
+    not position, specifically to avoid a real off-by-N field-index bug
+    (caught while writing this: market_regime is TechnicalStats' 12th
+    field, not its 10th, by direct field-order count)."""
+    return TechnicalStats(
+        last_price=None, sma20=None, pct_vs_sma20=None, trend=None,
+        change_1m_pct=None, change_3m_pct=None, change_6m_pct=None,
+        volatility_annualized_pct=None, support=None, resistance=None,
+        range_width_pct=None, market_regime=market_regime, atr=None,
+        atr_pct=None, rsi=None, volume_trend_pct=None,
+    )
 
 
 def _empty_chart_structure() -> ChartStructureSnapshot:
@@ -61,9 +84,9 @@ def _empty_history():
     return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"], dtype=float)
 
 
-def _make_base_analysis(symbol="EURUSD", description="Euro vs US Dollar"):
+def _make_base_analysis(symbol="EURUSD", description="Euro vs US Dollar", display_name=None):
     return AssetAnalysis(
-        symbol=symbol, description=description, bid=1.1000, ask=1.1005, display_name=None
+        symbol=symbol, description=description, bid=1.1000, ask=1.1005, display_name=display_name
     )
 
 
@@ -96,89 +119,361 @@ def _make_trade_cost(**overrides):
     return TradeCost(**{**defaults, **overrides})
 
 
-@patch("ai.ftmo_suggest.get_trade_economics")
+def test_enrich_with_native_d1_passes_through_already_enriched_bases():
+    # Yahoo already covered this one (e.g. XAUUSD -> GC=F) — must not be
+    # touched or re-fetched.
+    base = _make_base_analysis(display_name="Gold")
+    with patch("ai.ftmo_suggest.fetch_mt5_price_history") as mock_fetch:
+        result = _enrich_with_native_d1(base)
+    assert result is base
+    mock_fetch.assert_not_called()
+
+
 @patch("ai.ftmo_suggest.fetch_mt5_price_history")
-@patch("ai.ftmo_suggest.analyze_assets")
-def test_analyze_ftmo_assets_adds_real_h4_h1_stats(
-    mock_analyze_assets, mock_fetch_history, mock_trade_economics
+def test_enrich_with_native_d1_backfills_from_mt5_when_no_yahoo_mapping(mock_fetch):
+    # The real gap this closes: 16 of 17 real FTMO Market Watch symbols
+    # (confirmed live) have no Yahoo mapping at all — every forex pair,
+    # every single-stock CFD, both crypto pairs — so they never got any
+    # D1 technical/backtest coverage before this existed.
+    base = _make_base_analysis(display_name=None)
+    mock_fetch.return_value = _make_intraday_history(n=300)
+
+    result = _enrich_with_native_d1(base)
+
+    mock_fetch.assert_called_once_with("EURUSD", "D1", count=1500)
+    assert result is not base
+    assert result.display_name == "Euro vs US Dollar"
+    assert result.stats.last_price is not None
+    assert result.headlines == []
+    assert result.contract_spec == base.contract_spec
+
+
+@patch("ai.ftmo_suggest.fetch_mt5_price_history")
+def test_enrich_with_native_d1_leaves_bare_when_mt5_also_has_nothing(mock_fetch):
+    base = _make_base_analysis(display_name=None)
+    mock_fetch.return_value = _empty_history()
+
+    result = _enrich_with_native_d1(base)
+
+    assert result is base
+    assert result.display_name is None
+
+
+@patch("ai.ftmo_suggest.backtest_support_resistance_reaction")
+@patch("ai.ftmo_suggest.backtest_rsi_reaction")
+@patch("ai.ftmo_suggest.fetch_mt5_price_history")
+def test_enrich_with_native_d1_threads_real_trade_cost_into_backtests(
+    mock_fetch, mock_rsi_bt, mock_sr_bt
 ):
-    base = _make_base_analysis()
-    mock_analyze_assets.return_value = [base]
+    # Direct user request 2026-08-22: "review the allowed lot size, trade
+    # cost, and other execution related features and broker's allowed
+    # guard rails and then apply your backtest trade... such results are
+    # more realistic and dependable" — this locks in that a real,
+    # already-fetched TradeCost actually reaches the backtest engine's
+    # cost/guard-rail parameters, not just that the pure helper computes
+    # the right dict in isolation (see the _real_backtest_execution_
+    # kwargs tests above).
+    history = _make_intraday_history(n=300)
+    mock_fetch.return_value = history
+    mock_rsi_bt.return_value = (None, None)
+    mock_sr_bt.return_value = None
+    base = AssetAnalysis(
+        symbol="EURUSD", description="Euro vs US Dollar", bid=1.1000, ask=1.1005, display_name=None,
+        contract_spec=ContractSpec(
+            volume_min=0.01, volume_step=0.01, volume_max=500.0,
+            trade_contract_size=100_000.0, currency_margin="USD", margin_initial=1156.95,
+        ),
+    )
+    cost = _make_trade_cost(
+        category="Forex", spread_pct_of_price=0.005,
+        swap_long_pct_per_day=-0.0075, swap_short_pct_per_day=0.0003, min_stop_distance_pct=0.2,
+    )
+
+    _enrich_with_native_d1(base, trade_cost=cost)
+
+    # base.ask (1.1005), NOT the D1 series' last close — must match
+    # format_ftmo_trade_cost's own price source exactly (see
+    # _enrich_with_native_d1's own comment on this real fix).
+    expected_kwargs = _real_backtest_execution_kwargs(cost, base.contract_spec, base.ask)
+    mock_rsi_bt.assert_called_once_with(history, **expected_kwargs)
+    mock_sr_bt.assert_called_once_with(history, **expected_kwargs)
+
+
+@patch("ai.ftmo_suggest.get_trade_economics")
+@patch("ai.ftmo_suggest.get_contract_spec")
+@patch("ai.ftmo_suggest.fetch_mt5_price_history")
+def test_analyze_ftmo_assets_adds_real_h4_h1_stats(
+    mock_fetch_history, mock_contract_spec, mock_trade_economics
+):
+    # FTMO never touches Yahoo/analyze_assets anymore — every base is
+    # built bare (_build_bare_base_analysis) then natively backfilled
+    # from MT5 D1 (_enrich_with_native_d1), so the same mocked history
+    # feeds the D1 backfill as well as the H4/H1 extension this test is
+    # really about.
+    mock_contract_spec.return_value = None
     mock_fetch_history.return_value = _make_intraday_history()
     mock_trade_economics.return_value = _make_trade_cost()
 
     results = analyze_ftmo_assets([MarketAsset("EURUSD", "Euro vs US Dollar", 1.1000, 1.1005)])
 
     assert len(results) == 1
-    assert results[0].base is base
+    assert results[0].base.symbol == "EURUSD"
+    assert results[0].base.display_name == "Euro vs US Dollar"
+    assert results[0].base.data_source == "mt5"
     assert results[0].h4_stats.last_price is not None
     assert results[0].h1_stats.last_price is not None
     assert results[0].trade_cost is not None
     assert results[0].h4_structure is not None
     assert results[0].h1_structure is not None
-    # H4 fetched before H1, both for this exact symbol.
-    assert mock_fetch_history.call_args_list[0].args == ("EURUSD", "H4")
-    assert mock_fetch_history.call_args_list[1].args == ("EURUSD", "H1")
+    # D1 (native backfill) fetched first, then H4, then H1, all for this
+    # exact symbol.
+    assert mock_fetch_history.call_args_list[0].args == ("EURUSD", "D1")
+    assert mock_fetch_history.call_args_list[1].args == ("EURUSD", "H4")
+    assert mock_fetch_history.call_args_list[2].args == ("EURUSD", "H1")
     mock_trade_economics.assert_called_once_with("EURUSD")
 
 
+@patch("ai.ftmo_suggest.backtest_rsi_reaction")
 @patch("ai.ftmo_suggest.get_trade_economics")
+@patch("ai.ftmo_suggest.get_contract_spec")
 @patch("ai.ftmo_suggest.fetch_mt5_price_history")
-@patch("ai.ftmo_suggest.analyze_assets")
+def test_analyze_ftmo_assets_threads_real_trade_cost_into_rsi_backtest(
+    mock_fetch_history, mock_contract_spec, mock_trade_economics, mock_rsi_bt
+):
+    # Confirms the wiring at the analyze_ftmo_assets level specifically
+    # (not just _enrich_with_native_d1's own dedicated test above): the
+    # SAME TradeCost fetched for the "REAL trading cost" line also
+    # reaches the RSI backtest's real cost/guard-rail simulation, fetched
+    # only once (see the redundant-fetch-avoidance comment in the real
+    # code) rather than a second time for the backtest specifically.
+    mock_contract_spec.return_value = None
+    mock_fetch_history.return_value = _make_intraday_history()
+    real_cost = _make_trade_cost(
+        category="Forex", spread_pct_of_price=0.006,
+        swap_long_pct_per_day=-0.008, swap_short_pct_per_day=0.001, min_stop_distance_pct=0.1,
+    )
+    mock_trade_economics.return_value = real_cost
+    mock_rsi_bt.return_value = (None, None)
+
+    analyze_ftmo_assets([MarketAsset("EURUSD", "Euro vs US Dollar", 1.1000, 1.1005)])
+
+    mock_trade_economics.assert_called_once_with("EURUSD")
+    mock_rsi_bt.assert_called_once()
+    kwargs = mock_rsi_bt.call_args.kwargs
+    assert kwargs["round_trip_cost_pct"] == pytest.approx(0.006)  # no contract_spec -> spread only
+    assert kwargs["long_swap_pct_per_day"] == pytest.approx(-0.008)
+    assert kwargs["short_swap_pct_per_day"] == pytest.approx(0.001)
+    assert kwargs["min_stop_distance_pct"] == pytest.approx(0.1)
+
+
+@patch("ai.ftmo_suggest.get_trade_economics")
+@patch("ai.ftmo_suggest.get_contract_spec")
+@patch("ai.ftmo_suggest.fetch_mt5_price_history")
+def test_analyze_ftmo_assets_adds_d1_and_monthly_structure(
+    mock_fetch_history, mock_contract_spec, mock_trade_economics
+):
+    # Direct user request (2026-08-22): "redesign the charts and its
+    # decision with all H1, H4, D1 and monthly" — the backend half of
+    # that is analyze_ftmo_assets computing a real technical read and
+    # real chart structure for D1/monthly too, not just H4/H1.
+    mock_contract_spec.return_value = None
+    mock_fetch_history.return_value = _make_intraday_history()
+    mock_trade_economics.return_value = _make_trade_cost()
+
+    results = analyze_ftmo_assets([MarketAsset("EURUSD", "Euro vs US Dollar", 1.1000, 1.1005)])
+
+    assert results[0].mn1_stats.last_price is not None
+    assert results[0].d1_structure is not None
+    assert results[0].mn1_structure is not None
+    # D1, H4, H1, then MN1 (with its own bar count), all for this symbol.
+    assert mock_fetch_history.call_args_list[3].args == ("EURUSD", "MN1")
+    assert mock_fetch_history.call_args_list[3].kwargs == {"count": _MN1_BACKTEST_BARS}
+
+
+@patch("ai.ftmo_suggest.get_trade_economics")
+@patch("ai.ftmo_suggest.get_contract_spec")
+@patch("ai.ftmo_suggest.fetch_mt5_price_history")
+def test_analyze_ftmo_asset_live_builds_full_analysis_natively(
+    mock_fetch_history, mock_contract_spec, mock_trade_economics
+):
+    # A live single-symbol read never touches analyze_assets() (no Yahoo/
+    # news lookups) — only real MT5-native fetches, confirmed by NOT
+    # patching analyze_assets at all here (a stray call would error since
+    # it isn't mocked, e.g. it would try a real network call).
+    mock_fetch_history.return_value = _make_intraday_history(n=300)
+    mock_contract_spec.return_value = ContractSpec(
+        volume_min=0.01, volume_step=0.01, volume_max=100.0,
+        trade_contract_size=100000.0, currency_margin="USD", margin_initial=1000.0,
+    )
+    mock_trade_economics.return_value = _make_trade_cost()
+
+    result = analyze_ftmo_asset_live("EURUSD", bid=1.1000, ask=1.1005, description="Euro vs US Dollar")
+
+    assert isinstance(result, FtmoAssetAnalysis)
+    assert result.base.symbol == "EURUSD"
+    assert result.base.data_source == "mt5"
+    assert result.base.display_name == "Euro vs US Dollar"
+    assert result.base.stats.last_price is not None
+    # A straight monotonic synthetic series genuinely never touches a
+    # real support/resistance level to react to, so that one backtest
+    # legitimately comes back None here — momentum persistence doesn't
+    # need real S/R touches, so it's the one this fixture can actually
+    # exercise as "a backtest ran".
+    assert result.base.momentum_persistence_backtest is not None
+    assert result.h4_stats.last_price is not None
+    assert result.h1_stats.last_price is not None
+    assert result.h4_structure is not None
+    assert result.h1_structure is not None
+    assert result.trade_cost is not None
+    # D1 (base) fetched first, then H4, then H1, all for this exact symbol.
+    assert mock_fetch_history.call_args_list[0].args == ("EURUSD", "D1")
+    assert mock_fetch_history.call_args_list[1].args == ("EURUSD", "H4")
+    assert mock_fetch_history.call_args_list[2].args == ("EURUSD", "H1")
+
+
+@patch("ai.ftmo_suggest.backtest_support_resistance_reaction")
+@patch("ai.ftmo_suggest.backtest_rsi_reaction")
+@patch("ai.ftmo_suggest.get_trade_economics")
+@patch("ai.ftmo_suggest.get_contract_spec")
+@patch("ai.ftmo_suggest.fetch_mt5_price_history")
+def test_analyze_ftmo_asset_live_threads_real_cost_and_commission_into_backtests(
+    mock_fetch_history, mock_contract_spec, mock_trade_economics, mock_rsi_bt, mock_sr_bt
+):
+    # Live-popup sibling of test_analyze_ftmo_assets_threads_real_trade_
+    # cost_into_rsi_backtest above — this is the exact path app.py's
+    # Asset Health popup calls. Also confirms get_contract_spec/
+    # get_trade_economics are each fetched exactly ONCE per call (reused
+    # for both the backtest simulation AND the analysis' own base/
+    # trade_cost fields), not fetched a second time for the backtest.
+    history = _make_intraday_history(n=300)
+    mock_fetch_history.return_value = history
+    spec = ContractSpec(
+        volume_min=0.01, volume_step=0.01, volume_max=500.0,
+        trade_contract_size=100_000.0, currency_margin="USD", margin_initial=1156.95,
+    )
+    mock_contract_spec.return_value = spec
+    real_cost = _make_trade_cost(category="Forex", spread_pct_of_price=0.005)
+    mock_trade_economics.return_value = real_cost
+    mock_rsi_bt.return_value = (None, None)
+    mock_sr_bt.return_value = None
+
+    analyze_ftmo_asset_live("EURUSD", bid=1.1000, ask=1.1005, description="Euro vs US Dollar")
+
+    mock_contract_spec.assert_called_once_with("EURUSD")
+    mock_trade_economics.assert_called_once_with("EURUSD")
+    # ask (1.1005), NOT the D1 series' last close — must match
+    # format_ftmo_trade_cost's own price source exactly (see
+    # analyze_ftmo_asset_live's own comment on this real fix).
+    expected_kwargs = _real_backtest_execution_kwargs(real_cost, spec, 1.1005)
+    mock_rsi_bt.assert_called_once_with(history, **expected_kwargs)
+    mock_sr_bt.assert_called_once_with(history, **expected_kwargs)
+    # Real commission actually got folded in, not just the bare spread.
+    assert expected_kwargs["round_trip_cost_pct"] > 0.005
+
+
+@patch("ai.ftmo_suggest.get_trade_economics")
+@patch("ai.ftmo_suggest.get_contract_spec")
+@patch("ai.ftmo_suggest.fetch_mt5_price_history")
+def test_analyze_ftmo_asset_live_adds_d1_and_monthly_structure(
+    mock_fetch_history, mock_contract_spec, mock_trade_economics
+):
+    # Live-single-symbol sibling of test_analyze_ftmo_assets_adds_d1_and_
+    # monthly_structure above — this is the exact path app.py's Asset
+    # Health popup calls, so it's the one that actually feeds the
+    # redesigned 4-timeframe UI.
+    mock_fetch_history.return_value = _make_intraday_history(n=300)
+    mock_contract_spec.return_value = None
+    mock_trade_economics.return_value = _make_trade_cost()
+
+    result = analyze_ftmo_asset_live("EURUSD", bid=1.1000, ask=1.1005, description="Euro vs US Dollar")
+
+    assert result.mn1_stats.last_price is not None
+    assert result.d1_structure is not None
+    assert result.mn1_structure is not None
+    assert mock_fetch_history.call_args_list[3].args == ("EURUSD", "MN1")
+    assert mock_fetch_history.call_args_list[3].kwargs == {"count": _MN1_BACKTEST_BARS}
+
+
+@patch("ai.ftmo_suggest.get_trade_economics")
+@patch("ai.ftmo_suggest.get_contract_spec", return_value=None)
+@patch("ai.ftmo_suggest.fetch_mt5_price_history")
+def test_analyze_ftmo_asset_live_no_backtests_when_d1_history_empty(
+    mock_fetch_history, mock_contract_spec, mock_trade_economics
+):
+    # D1 empty, H4/H1/Monthly still have real bars — mirrors a genuinely
+    # new listing with no daily history yet but active intraday trading.
+    mock_fetch_history.side_effect = [
+        _empty_history(), _make_intraday_history(), _make_intraday_history(), _make_intraday_history(),
+    ]
+    mock_trade_economics.return_value = _make_trade_cost()
+
+    result = analyze_ftmo_asset_live("NEWSYM", bid=10.0, ask=10.01, description="New Symbol")
+
+    assert result.base.stats.last_price is None
+    assert result.base.support_resistance_backtest is None
+    assert result.base.rsi_overbought_backtest is None
+    assert result.h4_stats.last_price is not None  # H4/H1 unaffected by empty D1
+
+
+@patch("ai.ftmo_suggest.get_trade_economics")
+@patch("ai.ftmo_suggest.get_contract_spec")
+@patch("ai.ftmo_suggest.fetch_mt5_price_history")
 @patch("ai.ftmo_suggest.compute_technical_stats")
 def test_analyze_ftmo_assets_scales_volatility_correctly_per_timeframe(
-    mock_compute_stats, mock_analyze_assets, mock_fetch_history, mock_trade_economics
+    mock_compute_stats, mock_fetch_history, mock_contract_spec, mock_trade_economics
 ):
     # Regression: H4/H1 stats used to be computed with compute_technical_stats'
     # own default (daily-bar) scaling, understating real annualized
     # volatility by 2.5x-6x for intraday data (see analysis/technical.py's
     # own fix). H4 and H1 need genuinely DIFFERENT periods_per_year, not
     # the same value for both.
-    base = _make_base_analysis()
-    mock_analyze_assets.return_value = [base]
+    mock_contract_spec.return_value = None
     mock_fetch_history.return_value = _make_intraday_history()
     mock_trade_economics.return_value = _make_trade_cost()
     mock_compute_stats.return_value = compute_technical_stats(pd.Series(dtype=float))
 
     analyze_ftmo_assets([MarketAsset("EURUSD", "Euro vs US Dollar", 1.1000, 1.1005)])
 
-    h4_call, h1_call = mock_compute_stats.call_args_list
+    # _enrich_with_native_d1 computes its own D1 stats first (no
+    # periods_per_year override — the daily default is correct there),
+    # then the H4/H1/monthly extension loop computes the other three.
+    _d1_call, h4_call, h1_call, mn1_call = mock_compute_stats.call_args_list
     h4_periods = h4_call.kwargs["periods_per_year"]
     h1_periods = h1_call.kwargs["periods_per_year"]
+    mn1_periods = mn1_call.kwargs["periods_per_year"]
     assert h4_periods > 252  # scaled for intraday, not left at the daily default
     assert h1_periods > h4_periods  # H1 bars are more frequent than H4 bars
+    assert mn1_periods == 12  # 12 monthly bars/year, genuinely different from daily/intraday
 
 
 @patch("ai.ftmo_suggest.get_trade_economics")
+@patch("ai.ftmo_suggest.get_contract_spec")
 @patch("ai.ftmo_suggest.fetch_mt5_price_history")
-@patch("ai.ftmo_suggest.analyze_assets")
-def test_analyze_ftmo_assets_reports_progress_for_both_passes(
-    mock_analyze_assets, mock_fetch_history, mock_trade_economics
+def test_analyze_ftmo_assets_reports_progress(
+    mock_fetch_history, mock_contract_spec, mock_trade_economics
 ):
-    base = _make_base_analysis()
-    mock_analyze_assets.side_effect = lambda assets, on_progress=None: (
-        on_progress("Analyzing instruments: 1/1 — EURUSD") if on_progress else None
-    ) or [base]
+    mock_contract_spec.return_value = None
     mock_fetch_history.return_value = _make_intraday_history()
     mock_trade_economics.return_value = _make_trade_cost()
 
     calls = []
     analyze_ftmo_assets([MarketAsset("EURUSD", "Euro vs US Dollar", 1.1000, 1.1005)], on_progress=calls.append)
 
-    # The base pass's own progress (relayed through analyze_assets'
-    # on_progress param) plus this function's own extension-loop message.
-    assert any("Analyzing instruments" in c for c in calls)
-    assert any("Multi-timeframe technical" in c and "EURUSD" in c for c in calls)
+    # One consolidated progress message per symbol now (previously two
+    # separate passes — a base Yahoo-resolution pass, then this
+    # function's own extension pass — before FTMO stopped needing Yahoo
+    # at all).
+    assert len(calls) == 1
+    assert "1/1" in calls[0] and "EURUSD" in calls[0]
 
 
 @patch("ai.ftmo_suggest.get_trade_economics", return_value=None)
+@patch("ai.ftmo_suggest.get_contract_spec")
 @patch("ai.ftmo_suggest.fetch_mt5_price_history")
-@patch("ai.ftmo_suggest.analyze_assets")
 def test_analyze_ftmo_assets_degrades_cleanly_on_empty_intraday_history(
-    mock_analyze_assets, mock_fetch_history, mock_trade_economics
+    mock_fetch_history, mock_contract_spec, mock_trade_economics
 ):
-    base = _make_base_analysis(symbol="XAUUSD", description="Gold")
-    mock_analyze_assets.return_value = [base]
+    mock_contract_spec.return_value = None
     mock_fetch_history.return_value = _empty_history()
 
     results = analyze_ftmo_assets([MarketAsset("XAUUSD", "Gold", 2000.0, 2000.5)])
@@ -258,6 +553,52 @@ def test_format_ftmo_asset_context_shows_real_chart_structure_when_present():
     assert "two peaks at 1.2000 and 1.2010" in text
     # The reversal pattern should also surface through the H4 setup read.
     assert "reversal_candidate" in text
+
+
+def test_format_ftmo_asset_context_includes_d1_and_monthly_chart_structure_and_setup_read():
+    from analysis.chart_structure import ChartPattern
+
+    # Direct user request (2026-08-22): "redesign...with all H1, H4, D1
+    # and monthly" — this locks in that D1/monthly get the same real
+    # chart-structure + setup-read treatment H4/H1 already had, not just
+    # a bare stats line.
+    d1_history = _make_trending_history(start=1.0, drift=0.01)
+    mn1_history = _make_trending_history(start=1.0, drift=0.02)
+    d1_stats = compute_technical_stats(d1_history["Close"], history=d1_history)
+    mn1_stats = compute_technical_stats(mn1_history["Close"], history=mn1_history)
+    base = AssetAnalysis(
+        symbol="EURUSD", description="Euro vs US Dollar", bid=1.1000, ask=1.1005,
+        display_name="Euro vs US Dollar", stats=d1_stats,
+    )
+    d1_structure = ChartStructureSnapshot(
+        fibonacci=None, sr_levels=None, trendlines=None,
+        patterns=[ChartPattern(name="double_top", detail="D1 peaks at 1.2000 and 1.2010")],
+    )
+    mn1_structure = ChartStructureSnapshot(
+        fibonacci=None, sr_levels=None, trendlines=None,
+        patterns=[ChartPattern(name="double_top", detail="monthly peaks at 1.3000 and 1.3020")],
+    )
+    analysis = FtmoAssetAnalysis(
+        base=base,
+        h4_stats=compute_technical_stats(pd.Series(dtype=float)),
+        h1_stats=compute_technical_stats(pd.Series(dtype=float)),
+        h4_structure=_empty_chart_structure(),
+        h1_structure=_empty_chart_structure(),
+        trade_cost=None,
+        mn1_stats=mn1_stats,
+        d1_structure=d1_structure,
+        mn1_structure=mn1_structure,
+    )
+    text = format_ftmo_asset_context([analysis])
+    assert "D1 chart structure" in text
+    assert "Monthly chart structure" in text
+    assert "D1 peaks at 1.2000 and 1.2010" in text
+    assert "monthly peaks at 1.3000 and 1.3020" in text
+    assert "D1 setup read" in text
+    assert "Monthly setup read" in text
+    # The reversal pattern on each timeframe should surface through that
+    # timeframe's own setup read, same as the existing H4-only test above.
+    assert text.count("reversal_candidate") == 2
 
 
 def test_format_ftmo_asset_context_reports_conflicting_mtf_trend():
@@ -376,6 +717,125 @@ def test_format_ftmo_asset_context_reports_neither_when_both_flat():
     assert "ALIGNED" not in text
 
 
+# --- format_long_term_alignment ---
+# Real feature added live 2026-08-22 (user's own words: this account's
+# analysis "reads, displays and analyzes H1, H4 but not the daily or
+# monthly charts... this way the analysis is missing the long/medium
+# term trends and can throw us in a fake trend unguarded") — compares
+# the short-term (H4) directional read against the real daily/monthly
+# structural backdrop, distinct from format_mtf_confluence's H4-vs-H1
+# comparison above.
+
+
+def _analysis_with_regimes(h4_regime, d1_regime, mn1_regime) -> FtmoAssetAnalysis:
+    base = AssetAnalysis(
+        symbol="EURUSD", description="Euro vs US Dollar", bid=1.1000, ask=1.1005,
+        display_name="Euro vs US Dollar", stats=_ts(market_regime=d1_regime),
+    )
+    return FtmoAssetAnalysis(
+        base=base,
+        h4_stats=_ts(market_regime=h4_regime),
+        h1_stats=_ts(market_regime=None),
+        h4_structure=_empty_chart_structure(),
+        h1_structure=_empty_chart_structure(),
+        trade_cost=None,
+        mn1_stats=_ts(market_regime=mn1_regime),
+    )
+
+
+def test_long_term_alignment_structurally_backed_when_both_backdrops_agree():
+    analysis = _analysis_with_regimes("trending_up", "trending_up", "choppy_up")
+    text = format_long_term_alignment(analysis)
+    assert "STRUCTURALLY BACKED" in text
+    assert "daily and monthly" in text
+
+
+def test_long_term_alignment_counter_trend_spike_when_both_backdrops_oppose():
+    analysis = _analysis_with_regimes("choppy_up", "trending_down", "choppy_down")
+    text = format_long_term_alignment(analysis)
+    assert "COUNTER-TREND SPIKE" in text
+    # The user explicitly wants this framed as tradeable-but-managed, not
+    # discarded outright — confirm the language reflects that, not just
+    # the label.
+    assert "genuinely tradeable" in text
+    assert "tighter stop" in text
+
+
+def test_long_term_alignment_mixed_when_backdrops_disagree_with_each_other():
+    analysis = _analysis_with_regimes("trending_up", "trending_up", "choppy_down")
+    text = format_long_term_alignment(analysis)
+    assert "MIXED" in text
+
+
+def test_long_term_alignment_none_when_no_real_backdrop_direction():
+    # Both daily and monthly read sideways — no direction to compare
+    # against at all, distinct from a genuine CONTRADICTING backdrop.
+    analysis = _analysis_with_regimes("choppy_up", "sideways", "sideways")
+    text = format_long_term_alignment(analysis)
+    assert "no real daily or monthly directional backdrop" in text
+    assert "STRUCTURALLY BACKED" not in text
+    assert "COUNTER-TREND" not in text
+
+
+def test_long_term_alignment_none_when_h4_itself_flat_or_missing():
+    flat = _analysis_with_regimes("sideways", "trending_up", "trending_up")
+    assert "no real short-term direction" in format_long_term_alignment(flat)
+
+    missing = _analysis_with_regimes(None, "trending_up", "trending_up")
+    assert "not available" in format_long_term_alignment(missing)
+
+
+def test_format_ftmo_asset_context_includes_monthly_and_long_term_alignment():
+    analysis = _analysis_with_regimes("trending_up", "trending_up", "trending_up")
+    text = format_ftmo_asset_context([analysis])
+    assert "Monthly technical" in text
+    assert "Long-term alignment" in text
+    assert "STRUCTURALLY BACKED" in text
+
+
+# --- format_long_term_alignment_short / classify_long_term_alignment ---
+# Real UI feedback, live 2026-08-22: the long, reasoning-heavy AI-prompt
+# text (format_long_term_alignment above) was showing up verbatim in the
+# Asset Health popup — correct for a model, unreadable as a dashboard
+# line. These two share one classification step (classify_long_term_
+# alignment) with the long formatter so the two texts can never disagree
+# about WHICH state applies, only how verbosely they describe it.
+
+
+def test_long_term_alignment_short_is_one_short_sentence_per_state():
+    cases = [
+        ("trending_up", "trending_up", "choppy_up", "structurally_backed"),
+        ("choppy_up", "trending_down", "choppy_down", "counter_trend_spike"),
+        ("trending_up", "trending_up", "choppy_down", "mixed"),
+        ("choppy_up", "sideways", "sideways", "no_backdrop"),
+        ("sideways", "trending_up", "trending_up", "flat"),
+        (None, "trending_up", "trending_up", "not_available"),
+    ]
+    for h4, d1, mn1, expected_state in cases:
+        analysis = _analysis_with_regimes(h4, d1, mn1)
+        state, *_ = classify_long_term_alignment(analysis)
+        assert state == expected_state
+        short_text = format_long_term_alignment_short(analysis)
+        # "Short" is the whole point being tested here — no multi-
+        # sentence reasoning paragraph, just one real, decisive line.
+        assert short_text.count(". ") <= 1
+        assert len(short_text) < 160
+
+
+def test_long_term_alignment_short_and_long_never_disagree_on_state():
+    # Both formatters read from the same classify_long_term_alignment
+    # call — this locks in that a STRUCTURALLY BACKED long text always
+    # pairs with the structurally_backed short message, not a stale or
+    # independently-drifted one.
+    analysis = _analysis_with_regimes("trending_up", "trending_up", "trending_up")
+    assert "STRUCTURALLY BACKED" in format_long_term_alignment(analysis)
+    assert "likely real" in format_long_term_alignment_short(analysis)
+
+    analysis = _analysis_with_regimes("choppy_up", "trending_down", "choppy_down")
+    assert "COUNTER-TREND SPIKE" in format_long_term_alignment(analysis)
+    assert "short spike" in format_long_term_alignment_short(analysis)
+
+
 # --- _ftmo_commission_pct_round_turn / format_ftmo_trade_cost ---
 
 
@@ -425,6 +885,64 @@ def test_commission_unknown_category_returns_none_not_a_fabricated_zero():
     assert "unknown" in note.lower()
 
 
+# --- _real_backtest_execution_kwargs (real broker cost/guard-rail realism) ---
+
+
+def _make_spec(**overrides):
+    defaults = dict(
+        volume_min=0.01, volume_step=0.01, volume_max=500.0,
+        trade_contract_size=100_000.0, currency_margin="USD", margin_initial=1156.95,
+    )
+    return ContractSpec(**{**defaults, **overrides})
+
+
+def test_real_backtest_execution_kwargs_empty_when_no_trade_cost():
+    # No live TradeCost at all (e.g. MT5 unreachable) — the engine's own
+    # existing zero-cost/zero-restriction default, unchanged, not an
+    # error or a fabricated zero.
+    assert _real_backtest_execution_kwargs(None, _make_spec(), 1.1000) == {}
+
+
+def test_real_backtest_execution_kwargs_spread_only_without_contract_spec_or_price():
+    cost = _make_trade_cost(category="Forex", spread_pct_of_price=0.005)
+    kwargs = _real_backtest_execution_kwargs(cost, None, None)
+    assert kwargs["round_trip_cost_pct"] == pytest.approx(0.005)
+
+
+def test_real_backtest_execution_kwargs_adds_real_commission_when_available():
+    cost = _make_trade_cost(category="Forex", spread_pct_of_price=0.005)
+    spec = _make_spec(trade_contract_size=100_000.0)
+    kwargs = _real_backtest_execution_kwargs(cost, spec, 1.1000)
+    commission_pct, _ = _ftmo_commission_pct_round_turn("Forex", 100_000.0, 1.1000)
+    assert kwargs["round_trip_cost_pct"] == pytest.approx(0.005 + commission_pct)
+
+
+def test_real_backtest_execution_kwargs_skips_commission_for_unknown_category():
+    # A category _ftmo_commission_pct_round_turn genuinely can't price
+    # (returns None) must NOT be silently treated as zero — only the
+    # real spread should be netted in.
+    cost = _make_trade_cost(category="Equities I CFD", spread_pct_of_price=0.01)
+    kwargs = _real_backtest_execution_kwargs(cost, _make_spec(), 200.0)
+    assert kwargs["round_trip_cost_pct"] == pytest.approx(0.01)
+
+
+def test_real_backtest_execution_kwargs_defaults_missing_swap_to_zero():
+    cost = _make_trade_cost(swap_long_pct_per_day=None, swap_short_pct_per_day=None)
+    kwargs = _real_backtest_execution_kwargs(cost, None, None)
+    assert kwargs["long_swap_pct_per_day"] == 0.0
+    assert kwargs["short_swap_pct_per_day"] == 0.0
+
+
+def test_real_backtest_execution_kwargs_passes_through_real_swap_and_min_stop_distance():
+    cost = _make_trade_cost(
+        swap_long_pct_per_day=-0.0075, swap_short_pct_per_day=0.0003, min_stop_distance_pct=0.35
+    )
+    kwargs = _real_backtest_execution_kwargs(cost, None, None)
+    assert kwargs["long_swap_pct_per_day"] == pytest.approx(-0.0075)
+    assert kwargs["short_swap_pct_per_day"] == pytest.approx(0.0003)
+    assert kwargs["min_stop_distance_pct"] == pytest.approx(0.35)
+
+
 def test_format_ftmo_trade_cost_none_when_no_live_data():
     base = _make_base_analysis()
     analysis = FtmoAssetAnalysis(
@@ -465,6 +983,54 @@ def test_format_ftmo_trade_cost_combines_spread_and_commission():
     round_trip = 0.0052 + commission_pct
     assert f"{round_trip:.4f}%" in text
     assert "swap" in text.lower()
+
+
+def test_format_ftmo_trade_cost_reports_both_long_and_short_swap():
+    # A short recommendation needs its own real overnight cost to reason
+    # about — this used to only ever surface the long side.
+    spec = ContractSpec(
+        volume_min=0.01, volume_step=0.01, volume_max=500.0,
+        trade_contract_size=100_000.0, currency_margin="USD", margin_initial=1156.95,
+    )
+    base = AssetAnalysis(
+        symbol="EURUSD", description="Euro vs US Dollar", bid=1.15689, ask=1.15695,
+        display_name=None, contract_spec=spec,
+    )
+    cost = _make_trade_cost(swap_long_pct_per_day=-0.0075, swap_short_pct_per_day=0.0003)
+    analysis = FtmoAssetAnalysis(
+        base=base,
+        h4_stats=compute_technical_stats(pd.Series(dtype=float)),
+        h1_stats=compute_technical_stats(pd.Series(dtype=float)),
+        h4_structure=_empty_chart_structure(),
+        h1_structure=_empty_chart_structure(),
+        trade_cost=cost,
+    )
+    text = format_ftmo_trade_cost(analysis)
+    assert "-0.0075%/day held long" in text
+    assert "+0.0003%/day held short" in text
+
+
+def test_format_ftmo_trade_cost_handles_one_sided_swap_none():
+    spec = ContractSpec(
+        volume_min=0.01, volume_step=0.01, volume_max=500.0,
+        trade_contract_size=100_000.0, currency_margin="USD", margin_initial=1156.95,
+    )
+    base = AssetAnalysis(
+        symbol="EURUSD", description="Euro vs US Dollar", bid=1.15689, ask=1.15695,
+        display_name=None, contract_spec=spec,
+    )
+    cost = _make_trade_cost(swap_long_pct_per_day=-0.0075, swap_short_pct_per_day=None)
+    analysis = FtmoAssetAnalysis(
+        base=base,
+        h4_stats=compute_technical_stats(pd.Series(dtype=float)),
+        h1_stats=compute_technical_stats(pd.Series(dtype=float)),
+        h4_structure=_empty_chart_structure(),
+        h1_structure=_empty_chart_structure(),
+        trade_cost=cost,
+    )
+    text = format_ftmo_trade_cost(analysis)
+    assert "-0.0075%/day held long" in text
+    assert "held short" not in text
 
 
 def test_format_ftmo_trade_cost_flags_unknown_commission_as_a_floor():
@@ -592,6 +1158,13 @@ def test_ftmo_stage1_instruction_mentions_multi_timeframe_framing():
     assert "H4" in text
     assert "H1" in text
     assert "PRIMARY basis for the actual thesis" in text
+
+
+def test_ftmo_stage1_instruction_mentions_short_side_support():
+    text = build_ftmo_stage1_instruction()
+    assert '"side"' in text
+    assert '"buy"' in text
+    assert '"sell"' in text
 
 
 def test_ftmo_stage1_instruction_states_short_holding_horizon():

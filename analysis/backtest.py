@@ -25,7 +25,27 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from analysis.technical import ATR_WINDOW
+
 _MIN_BETA_OBSERVATIONS = 60  # ~3 months of trading days — a shorter window is too noisy to trust
+
+# Real trade-simulation convention shared by every directional backtest
+# below (RSI reversal, support/resistance bounce) — added 2026-08-22
+# replacing the old "average return N days later" style, which couldn't
+# tell a clean winner from a trade that crashed 8% then drifted back to
+# +2% by day 10 (both counted as identical "positive returns"). A stop/
+# target this simple can't capture everything a real, instrument-
+# specific stop/target debate would (see ai/ftmo_suggest.py's own
+# DEBATE THE STOP AND TARGET instruction, which deliberately does NOT
+# apply one flat ATR multiple uniformly) — it's a necessary, disclosed
+# simplification to get a CONSISTENT, comparable historical rule at all;
+# the 1.5x-stop/2:1-reward:risk combination isn't arbitrary, it matches
+# this project's own already-cited "2:1 Bulkowski/Rockefeller" reward:
+# risk convention and a common ATR-stop multiple, not a new invention.
+TRADE_SIM_STOP_ATR_MULTIPLE = 1.5
+TRADE_SIM_REWARD_RISK_RATIO = 2.0
+TRADE_SIM_TARGET_ATR_MULTIPLE = TRADE_SIM_STOP_ATR_MULTIPLE * TRADE_SIM_REWARD_RISK_RATIO
+TRADE_SIM_MAX_HOLDING_BARS = 10
 
 
 def compute_beta(
@@ -78,14 +98,206 @@ def _forward_returns_pct(prices: pd.Series, positions: list[int], forward_days: 
     return returns
 
 
+def _rolling_atr(ohlc: pd.DataFrame) -> pd.Series | None:
+    """Same True Range definition as analysis.technical._compute_atr (max
+    of the bar's own high-low range and its gap from the prior close),
+    computed as a rolling series across the WHOLE history rather than
+    just the latest value — a historical trade simulation has to use the
+    ATR that was actually available AT each past entry point, not
+    today's current ATR applied retroactively to trades years earlier.
+
+    None if the frame has no High/Low at all — PSX's own EOD feed (see
+    data/psx_source.py's own docstring) genuinely can't provide them,
+    same "explicitly disclosed as unavailable, never fabricated"
+    convention analysis.technical._compute_atr already uses for exactly
+    this same gap."""
+    if not {"High", "Low", "Close"}.issubset(ohlc.columns):
+        return None
+    high, low, close = ohlc["High"], ohlc["Low"], ohlc["Close"]
+    prev_close = close.shift(1)
+    true_range = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+    return true_range.rolling(ATR_WINDOW).mean()
+
+
+def _simulate_trades(
+    ohlc: pd.DataFrame,
+    entry_positions: list[int],
+    side: str,
+    atr: pd.Series,
+    stop_atr_multiple: float,
+    target_atr_multiple: float,
+    max_holding_bars: int,
+    min_stop_distance_pct: float = 0.0,
+    round_trip_cost_pct: float = 0.0,
+    swap_pct_per_day: float = 0.0,
+) -> list[tuple[float, str]]:
+    """The real engine behind every directional backtest below — replaces
+    the old "average return N bars later" measurement (which couldn't
+    tell a clean winner from a trade that crashed 8% then drifted back
+    to +2% by the measurement day) with an actual simulated trade: a
+    stop `stop_atr_multiple` x that entry's OWN historical ATR away, a
+    target `target_atr_multiple` x ATR away, then a real bar-by-bar walk
+    forward checking each bar's real High/Low for a touch.
+
+    Real execution realism added 2026-08-22 (direct user request: "review
+    the allowed lot size, trade cost, and other execution related
+    features and broker's allowed guard rails... such results are more
+    realistic and dependable"):
+    - `min_stop_distance_pct` (from data/mt5_source.py::TradeCost, MT5's
+      own SYMBOL_TRADE_STOPS_LEVEL): if the ATR-based stop would sit
+      CLOSER to entry than this broker-enforced floor, both stop and
+      target are widened to respect it — proportionally, so the target
+      stays the same reward:risk multiple of the (now wider) stop — since
+      a stop tighter than the floor could never actually have been
+      placed as a real order in the first place.
+    - `round_trip_cost_pct`/`swap_pct_per_day` (real spread+commission,
+      and per-bar-held swap — see TradeCost) are netted out of every
+      trade's realized R, win/loss/timeout alike, since a real trade
+      pays them regardless of outcome. This only ever moves the realized
+      R-multiple; it never changes whether a trade is classified a win,
+      loss, or timeout — that's still decided purely by whether price
+      actually touched the (possibly widened) stop/target level.
+
+    Real, disclosed limitation: these are TODAY's live spread/commission/
+    swap rate, applied uniformly to every historical trade — there is no
+    historical spread/swap time series available to this project (MT5
+    doesn't expose one, and FTMO's own commission schedule is a single
+    current published rate, not a historized one), so this assumes
+    today's %-of-price cost is a reasonable stand-in for what it was at
+    each past entry. The ATR-based stop/target itself has no such gap
+    (it uses the REAL historical ATR at each entry point, not today's) —
+    only the cost/swap side of the adjustment is a current-rate proxy.
+
+    If a single bar's range would have touched BOTH stop and target —
+    a genuine, unresolvable ambiguity without real intrabar tick/order
+    data — the stop counts as hit first. This is a deliberately
+    conservative convention (never overstates the win rate by assuming
+    the more favorable outcome), a standard practice in bar-based
+    backtesting.
+
+    A trade that touches neither within `max_holding_bars` is NOT
+    discarded — it's marked to market at its exit close and returned as
+    a "timeout", so the overall picture reflects every trade actually
+    taken, not just the ones that neatly resolved one way or the other.
+
+    Returns one (r_multiple, outcome) pair per real simulated trade,
+    outcome in {"win", "loss", "timeout"} — kept as an explicit tag
+    rather than inferred from the R value's sign, since a timeout
+    sitting at a slightly positive mark-to-market R is genuinely
+    undecided, not the same claim as a real target hit."""
+    high, low, close = ohlc["High"], ohlc["Low"], ohlc["Close"]
+    sign = 1.0 if side == "buy" else -1.0
+    results: list[tuple[float, str]] = []
+    for pos in entry_positions:
+        if pos + 1 >= len(ohlc):
+            continue
+        entry_atr = atr.iloc[pos]
+        if pd.isna(entry_atr) or entry_atr <= 0:
+            continue
+        entry_price = close.iloc[pos]
+        if not entry_price:
+            continue
+        stop_distance = stop_atr_multiple * entry_atr
+        # Real broker guard rail: a stop tighter than the symbol's own
+        # enforced minimum could never actually have been placed — widen
+        # both legs together so the target keeps the same R:R multiple
+        # of the (now realistic) stop distance.
+        min_stop_distance = min_stop_distance_pct / 100 * entry_price
+        if min_stop_distance > stop_distance:
+            stop_distance = min_stop_distance
+        target_distance = stop_distance * (target_atr_multiple / stop_atr_multiple)
+        stop_price = entry_price - sign * stop_distance
+        target_price = entry_price + sign * target_distance
+
+        outcome: str | None = None
+        outcome_r = 0.0
+        mark_to_market_r = 0.0
+        bars_held = 0
+        for fwd in range(1, max_holding_bars + 1):
+            idx = pos + fwd
+            if idx >= len(ohlc):
+                break
+            bars_held = fwd
+            bar_high, bar_low, bar_close = high.iloc[idx], low.iloc[idx], close.iloc[idx]
+            mark_to_market_r = sign * (bar_close - entry_price) / stop_distance
+            stop_hit = (bar_low <= stop_price) if side == "buy" else (bar_high >= stop_price)
+            target_hit = (bar_high >= target_price) if side == "buy" else (bar_low <= target_price)
+            if stop_hit:
+                outcome, outcome_r = "loss", -1.0
+                break
+            if target_hit:
+                outcome, outcome_r = "win", target_atr_multiple / stop_atr_multiple
+                break
+        if outcome is None:
+            outcome, outcome_r = "timeout", mark_to_market_r
+
+        # Real cost, netted into the realized R AFTER the win/loss/
+        # timeout verdict — a real trade pays spread/commission
+        # regardless of outcome, and swap for every bar actually held
+        # (already correctly signed: a negative swap_pct_per_day shrinks
+        # the result, a positive one grows it).
+        cost_r = (round_trip_cost_pct / 100 * entry_price) / stop_distance
+        swap_r = (swap_pct_per_day / 100 * bars_held * entry_price) / stop_distance
+        outcome_r = outcome_r - cost_r + swap_r
+        results.append((float(outcome_r), outcome))
+    return results
+
+
+@dataclass
+class _TradeSimSummary:
+    trades: int
+    wins: int
+    losses: int
+    timeouts: int
+    win_rate_pct: float | None  # wins / (wins + losses), among definitively RESOLVED trades only; None if none resolved
+    avg_r_multiple: float  # mean realized R across every trade taken, timeouts included at their mark-to-market value
+
+
+def _summarize_trade_results(results: list[tuple[float, str]]) -> _TradeSimSummary:
+    wins = sum(1 for _, outcome in results if outcome == "win")
+    losses = sum(1 for _, outcome in results if outcome == "loss")
+    timeouts = sum(1 for _, outcome in results if outcome == "timeout")
+    resolved = wins + losses
+    return _TradeSimSummary(
+        trades=len(results),
+        wins=wins,
+        losses=losses,
+        timeouts=timeouts,
+        win_rate_pct=(wins / resolved * 100) if resolved > 0 else None,
+        avg_r_multiple=float(sum(r for r, _ in results) / len(results)) if results else 0.0,
+    )
+
+
 @dataclass
 class RSIReactionBacktest:
+    """Real trade-simulation result, replacing the old avg-forward-return
+    style (see this module's own top-of-file note and _simulate_trades'
+    own docstring for why): "overbought" bets SHORT (a reversal down is
+    the textbook claim being tested), "oversold" bets LONG. win_rate_pct
+    is None (not 0.0) when zero trades ever definitively resolved —
+    genuinely different from "0% winners". `min_stop_distance_pct`/
+    `round_trip_cost_pct`/`swap_pct_per_day_used` (added 2026-08-22)
+    disclose exactly what real broker constraints/costs were baked into
+    avg_r_multiple — all default to 0.0 when a caller has no real
+    execution data for this symbol (e.g. PSX, no live broker feed at
+    all), which is honestly "not simulated with real costs", not
+    "simulated with zero real-world friction and that's fine"."""
     condition: str  # "overbought" or "oversold"
     threshold: float
-    occurrences: int
-    avg_forward_return_pct: float
-    reversal_rate_pct: float  # % of occurrences where price moved the "expected" reversal direction
-    forward_days: int
+    trades: int
+    wins: int
+    losses: int
+    timeouts: int
+    win_rate_pct: float | None
+    avg_r_multiple: float
+    stop_atr_multiple: float
+    target_atr_multiple: float
+    max_holding_bars: int
+    min_stop_distance_pct: float = 0.0
+    round_trip_cost_pct: float = 0.0
+    swap_pct_per_day_used: float = 0.0
 
 
 _RSI_WINDOW = 14
@@ -114,66 +326,92 @@ def _rolling_rsi(prices: pd.Series) -> pd.Series:
 
 
 def backtest_rsi_reaction(
-    prices: pd.Series,
-    forward_days: int = 10,
+    ohlc: pd.DataFrame,
+    max_holding_bars: int = TRADE_SIM_MAX_HOLDING_BARS,
     overbought: float = 70.0,
     oversold: float = 30.0,
     min_occurrences: int = 5,
+    stop_atr_multiple: float = TRADE_SIM_STOP_ATR_MULTIPLE,
+    target_atr_multiple: float = TRADE_SIM_TARGET_ATR_MULTIPLE,
+    min_stop_distance_pct: float = 0.0,
+    round_trip_cost_pct: float = 0.0,
+    long_swap_pct_per_day: float = 0.0,
+    short_swap_pct_per_day: float = 0.0,
 ) -> tuple[RSIReactionBacktest | None, RSIReactionBacktest | None]:
-    """For every historical day this instrument's own RSI crossed into
-    overbought/oversold territory, checks what its price actually did
-    over the following `forward_days` — real evidence for or against
-    treating the *current* RSI extreme as a reversal signal, rather than
-    assuming the textbook convention applies here.
+    """For every historical bar this instrument's own RSI crossed into
+    overbought/oversold territory, simulates the REAL trade the textbook
+    reversal claim implies (short on overbought, long on oversold) with
+    an ATR-based stop/target (see this module's own top-of-file note),
+    walked forward bar-by-bar for a genuine win/loss verdict — see
+    _simulate_trades' own docstring for exactly how a win/loss/timeout is
+    decided. Replaces the old "average return `forward_days` later"
+    measurement, which couldn't distinguish a clean winner from a trade
+    that dropped hard and only recovered to positive by the measurement
+    day.
 
-    Consecutive extreme days are collapsed into one "episode" (only the
-    first day of each streak counts) — RSI often stays extreme for
-    several days in a row, and counting each of those separately would
+    `min_stop_distance_pct`/`round_trip_cost_pct`/`long_swap_pct_per_day`/
+    `short_swap_pct_per_day` (added 2026-08-22, all default to 0.0 — no
+    broker constraint, no cost) let a caller with real live broker data
+    (see data/mt5_source.py::TradeCost) make the simulation respect that
+    broker's own minimum stop distance and net real spread/commission/
+    swap out of every trade — see _simulate_trades' own docstring. The
+    RIGHT swap rate for each side is picked automatically: overbought
+    bets short (uses `short_swap_pct_per_day`), oversold bets long (uses
+    `long_swap_pct_per_day`).
+
+    Consecutive extreme bars are collapsed into one "episode" (only the
+    first bar of each streak counts) — RSI often stays extreme for
+    several bars in a row, and counting each of those separately would
     inflate the occurrence count with highly-correlated, non-independent
     samples rather than genuinely distinct historical instances.
 
     Returns (overbought_result, oversold_result), either None if there
-    aren't at least `min_occurrences` real historical episodes to
-    average over — a backtest from 1-2 instances isn't trustworthy
-    evidence either way."""
-    prices = prices.dropna()
-    if len(prices) < _RSI_WINDOW + forward_days + 1:
+    aren't at least `min_occurrences` real historical episodes, or if
+    `ohlc` has no High/Low at all (ATR needs it — see _rolling_atr) — a
+    backtest from 1-2 instances, or with no real stop/target basis at
+    all, isn't trustworthy evidence either way."""
+    ohlc = ohlc.dropna(subset=[c for c in ("High", "Low", "Close") if c in ohlc.columns])
+    prices = ohlc["Close"] if "Close" in ohlc.columns else pd.Series(dtype=float)
+    if len(prices) < _RSI_WINDOW + max_holding_bars + 1:
+        return None, None
+
+    atr = _rolling_atr(ohlc)
+    if atr is None:
         return None, None
 
     rsi = _rolling_rsi(prices)
 
-    def _episode_returns(mask: pd.Series) -> list[float] | None:
+    def _episode_result(mask: pd.Series, side: str, swap_pct_per_day: float) -> RSIReactionBacktest | None:
         positions = _episode_start_positions(prices, mask)
-        returns = _forward_returns_pct(prices, positions, forward_days)
-        return returns if len(returns) >= min_occurrences else None
-
-    overbought_returns = _episode_returns(rsi >= overbought)
-    oversold_returns = _episode_returns(rsi <= oversold)
-
-    overbought_result = None
-    if overbought_returns is not None:
-        reversal_rate = sum(1 for r in overbought_returns if r < 0) / len(overbought_returns) * 100
-        overbought_result = RSIReactionBacktest(
-            condition="overbought",
-            threshold=overbought,
-            occurrences=len(overbought_returns),
-            avg_forward_return_pct=float(sum(overbought_returns) / len(overbought_returns)),
-            reversal_rate_pct=float(reversal_rate),
-            forward_days=forward_days,
+        if len(positions) < min_occurrences:
+            return None
+        trade_results = _simulate_trades(
+            ohlc, positions, side, atr, stop_atr_multiple, target_atr_multiple, max_holding_bars,
+            min_stop_distance_pct=min_stop_distance_pct, round_trip_cost_pct=round_trip_cost_pct,
+            swap_pct_per_day=swap_pct_per_day,
+        )
+        if len(trade_results) < min_occurrences:
+            return None
+        summary = _summarize_trade_results(trade_results)
+        return RSIReactionBacktest(
+            condition="overbought" if side == "sell" else "oversold",
+            threshold=overbought if side == "sell" else oversold,
+            trades=summary.trades,
+            wins=summary.wins,
+            losses=summary.losses,
+            timeouts=summary.timeouts,
+            win_rate_pct=summary.win_rate_pct,
+            avg_r_multiple=summary.avg_r_multiple,
+            stop_atr_multiple=stop_atr_multiple,
+            target_atr_multiple=target_atr_multiple,
+            max_holding_bars=max_holding_bars,
+            min_stop_distance_pct=min_stop_distance_pct,
+            round_trip_cost_pct=round_trip_cost_pct,
+            swap_pct_per_day_used=swap_pct_per_day,
         )
 
-    oversold_result = None
-    if oversold_returns is not None:
-        reversal_rate = sum(1 for r in oversold_returns if r > 0) / len(oversold_returns) * 100
-        oversold_result = RSIReactionBacktest(
-            condition="oversold",
-            threshold=oversold,
-            occurrences=len(oversold_returns),
-            avg_forward_return_pct=float(sum(oversold_returns) / len(oversold_returns)),
-            reversal_rate_pct=float(reversal_rate),
-            forward_days=forward_days,
-        )
-
+    overbought_result = _episode_result(rsi >= overbought, side="sell", swap_pct_per_day=short_swap_pct_per_day)
+    oversold_result = _episode_result(rsi <= oversold, side="buy", swap_pct_per_day=long_swap_pct_per_day)
     return overbought_result, oversold_result
 
 
@@ -343,11 +581,35 @@ def backtest_volatility_regime(
 
 @dataclass
 class SupportResistanceBacktest:
+    """Real trade-simulation result (see this module's own top-of-file
+    note and _simulate_trades' own docstring), replacing the old "% of
+    tests where price was higher/lower forward_days later" measurement:
+    a support test bets LONG (the level holds), a resistance test bets
+    SHORT (the level rejects). Each side's win_rate_pct is None (not
+    0.0) when zero of that side's trades ever definitively resolved.
+    `min_stop_distance_pct`/`round_trip_cost_pct`/swap fields (added
+    2026-08-22) disclose exactly what real broker constraints/costs were
+    baked into each side's avg_r_multiple — see RSIReactionBacktest's
+    own equivalent fields for the same reasoning."""
     support_tests: int
-    support_hold_rate_pct: float  # % of tests where price was higher forward_days later (held, didn't break down)
+    support_wins: int
+    support_losses: int
+    support_timeouts: int
+    support_win_rate_pct: float | None
+    support_avg_r_multiple: float
     resistance_tests: int
-    resistance_reject_rate_pct: float  # % of tests where price was lower forward_days later (rejected, didn't break out)
-    forward_days: int
+    resistance_wins: int
+    resistance_losses: int
+    resistance_timeouts: int
+    resistance_win_rate_pct: float | None
+    resistance_avg_r_multiple: float
+    stop_atr_multiple: float
+    target_atr_multiple: float
+    max_holding_bars: int
+    min_stop_distance_pct: float = 0.0
+    round_trip_cost_pct: float = 0.0
+    support_swap_pct_per_day_used: float = 0.0
+    resistance_swap_pct_per_day_used: float = 0.0
 
 
 _SR_WINDOW = 60  # matches analysis.technical.RANGE_WINDOW, for the same support/resistance convention
@@ -356,24 +618,49 @@ _MIN_SR_TESTS = 5
 
 
 def backtest_support_resistance_reaction(
-    prices: pd.Series,
-    forward_days: int = 10,
+    ohlc: pd.DataFrame,
+    max_holding_bars: int = TRADE_SIM_MAX_HOLDING_BARS,
     proximity_pct: float = _SR_PROXIMITY_PCT,
     min_tests: int = _MIN_SR_TESTS,
+    stop_atr_multiple: float = TRADE_SIM_STOP_ATR_MULTIPLE,
+    target_atr_multiple: float = TRADE_SIM_TARGET_ATR_MULTIPLE,
+    min_stop_distance_pct: float = 0.0,
+    round_trip_cost_pct: float = 0.0,
+    long_swap_pct_per_day: float = 0.0,
+    short_swap_pct_per_day: float = 0.0,
 ) -> SupportResistanceBacktest | None:
     """The support/resistance lines shown elsewhere (and used to justify
-    entries and stops) are computed from a rolling window — this checks
-    how often price has actually held or broken through those SAME
-    levels historically, rather than assuming a support/resistance line
-    is reliable just because it's a well-known charting concept.
+    entries and stops) are computed from a rolling window — this
+    simulates the REAL trade each level's own convention implies (long
+    off support, short off resistance) with a genuine ATR-based stop/
+    target, walked forward for a real win/loss verdict (see
+    _simulate_trades), rather than the old "% of tests where price was
+    merely higher/lower N bars later" measurement, which couldn't tell
+    a level that held cleanly from one that broke down hard and only
+    recovered above the test price by the measurement bar.
 
-    Support/resistance for day t is computed from the PRECEDING window
+    `min_stop_distance_pct`/`round_trip_cost_pct`/`long_swap_pct_per_day`/
+    `short_swap_pct_per_day` (added 2026-08-22, all default to 0.0) —
+    same real broker-execution realism as backtest_rsi_reaction's own
+    equivalent parameters: the support (long) leg uses
+    `long_swap_pct_per_day`, the resistance (short) leg uses
+    `short_swap_pct_per_day`.
+
+    Support/resistance for bar t is computed from the PRECEDING window
     only (`shift(1)` before the rolling min/max) — using a window that
     includes today would make "near the resistance" trivially true
     whenever today happens to be a new high, which isn't a real test of
-    whether a PRE-EXISTING level held."""
-    prices = prices.dropna()
-    if len(prices) < _SR_WINDOW + forward_days + 2:
+    whether a PRE-EXISTING level held.
+
+    None if there aren't at least `min_tests` real historical tests on
+    EACH side, or if `ohlc` has no High/Low at all (ATR needs it)."""
+    ohlc = ohlc.dropna(subset=[c for c in ("High", "Low", "Close") if c in ohlc.columns])
+    prices = ohlc["Close"] if "Close" in ohlc.columns else pd.Series(dtype=float)
+    if len(prices) < _SR_WINDOW + max_holding_bars + 2:
+        return None
+
+    atr = _rolling_atr(ohlc)
+    if atr is None:
         return None
 
     prior = prices.shift(1)
@@ -392,19 +679,43 @@ def backtest_support_resistance_reaction(
     support_positions = _episode_start_positions(prices, near_support)
     resistance_positions = _episode_start_positions(prices, near_resistance)
 
-    support_returns = _forward_returns_pct(prices, support_positions, forward_days)
-    resistance_returns = _forward_returns_pct(prices, resistance_positions, forward_days)
-
-    if len(support_returns) < min_tests or len(resistance_returns) < min_tests:
+    if len(support_positions) < min_tests or len(resistance_positions) < min_tests:
         return None
 
-    support_hold_rate = sum(1 for r in support_returns if r > 0) / len(support_returns) * 100
-    resistance_reject_rate = sum(1 for r in resistance_returns if r < 0) / len(resistance_returns) * 100
+    support_results = _simulate_trades(
+        ohlc, support_positions, "buy", atr, stop_atr_multiple, target_atr_multiple, max_holding_bars,
+        min_stop_distance_pct=min_stop_distance_pct, round_trip_cost_pct=round_trip_cost_pct,
+        swap_pct_per_day=long_swap_pct_per_day,
+    )
+    resistance_results = _simulate_trades(
+        ohlc, resistance_positions, "sell", atr, stop_atr_multiple, target_atr_multiple, max_holding_bars,
+        min_stop_distance_pct=min_stop_distance_pct, round_trip_cost_pct=round_trip_cost_pct,
+        swap_pct_per_day=short_swap_pct_per_day,
+    )
+    if len(support_results) < min_tests or len(resistance_results) < min_tests:
+        return None
+
+    support_summary = _summarize_trade_results(support_results)
+    resistance_summary = _summarize_trade_results(resistance_results)
 
     return SupportResistanceBacktest(
-        support_tests=len(support_returns),
-        support_hold_rate_pct=float(support_hold_rate),
-        resistance_tests=len(resistance_returns),
-        resistance_reject_rate_pct=float(resistance_reject_rate),
-        forward_days=forward_days,
+        support_tests=support_summary.trades,
+        support_wins=support_summary.wins,
+        support_losses=support_summary.losses,
+        support_timeouts=support_summary.timeouts,
+        support_win_rate_pct=support_summary.win_rate_pct,
+        support_avg_r_multiple=support_summary.avg_r_multiple,
+        resistance_tests=resistance_summary.trades,
+        resistance_wins=resistance_summary.wins,
+        resistance_losses=resistance_summary.losses,
+        resistance_timeouts=resistance_summary.timeouts,
+        resistance_win_rate_pct=resistance_summary.win_rate_pct,
+        resistance_avg_r_multiple=resistance_summary.avg_r_multiple,
+        stop_atr_multiple=stop_atr_multiple,
+        target_atr_multiple=target_atr_multiple,
+        max_holding_bars=max_holding_bars,
+        min_stop_distance_pct=min_stop_distance_pct,
+        round_trip_cost_pct=round_trip_cost_pct,
+        support_swap_pct_per_day_used=long_swap_pct_per_day,
+        resistance_swap_pct_per_day_used=short_swap_pct_per_day,
     )

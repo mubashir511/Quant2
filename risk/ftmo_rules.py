@@ -161,8 +161,13 @@ def compute_ftmo_status(
     )
 
 
+DEFAULT_HEADROOM_FRACTION = 0.5
+
+
 def would_breach_daily_loss_headroom(
-    status: FtmoStatus, planned_heat_pct: float, headroom_fraction: float = 0.5
+    status: FtmoStatus,
+    planned_heat_pct: float,
+    headroom_fraction: float = DEFAULT_HEADROOM_FRACTION,
 ) -> bool:
     """True if a planned trade's aggregate heat (% of equity at risk if
     every stop is hit — same figure risk/apply_suggestion.py-adjacent
