@@ -9,4 +9,17 @@ streamlit_log.txt
 mega_analysis_log.txt
 mega_analysis_bat_output.txt
 mega_analysis_state.json
+mega_analysis_progress.json
+mega_analysis_latest_suggestion.json
+mega_analysis_enabled.json
+mega_analysis_trigger.json
+mega_analysis.lock
+copilot_execution_log.txt
+copilot_execution_bat_output.txt
+copilot_execution_state.json
+copilot_execution_settlement.json
+copilot_execution_progress.json
+copilot_execution_enabled.json
+copilot_execution_interval.json
+copilot_execution.lock
 records/

@@ -1,7 +1,9 @@
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
-from data.mt5_execution import close_position, open_position
+import MetaTrader5 as mt5
+
+from data.mt5_execution import cancel_pending_order, close_position, open_position
 from data.mt5_source import MT5ConnectionError, Position
 
 
@@ -141,6 +143,47 @@ def test_close_position_raises_when_no_live_quote(mock_tick):
     position = _make_position()
     try:
         close_position(position)
+        assert False, "expected MT5ConnectionError"
+    except MT5ConnectionError:
+        pass
+
+
+@patch("MetaTrader5.order_send")
+def test_cancel_pending_order_sends_remove_request(mock_order_send):
+    mock_result = MagicMock()
+    mock_result.retcode = 10009
+    mock_result.comment = "Request executed"
+    mock_result.order = 555
+    mock_order_send.return_value = mock_result
+
+    result = cancel_pending_order(555)
+
+    assert result.success is True
+    assert result.ticket == 555
+    request = mock_order_send.call_args.args[0]
+    assert request["action"] == mt5.TRADE_ACTION_REMOVE
+    assert request["order"] == 555
+
+
+@patch("MetaTrader5.order_send")
+def test_cancel_pending_order_reports_rejection_without_raising(mock_order_send):
+    mock_result = MagicMock()
+    mock_result.retcode = 10006  # TRADE_RETCODE_REJECT
+    mock_result.comment = "Rejected"
+    mock_result.order = 0
+    mock_order_send.return_value = mock_result
+
+    result = cancel_pending_order(555)
+
+    assert result.success is False
+    assert result.ticket is None
+    assert result.comment == "Rejected"
+
+
+@patch("MetaTrader5.order_send", return_value=None)
+def test_cancel_pending_order_raises_connection_error_when_order_send_returns_none(mock_order_send):
+    try:
+        cancel_pending_order(555)
         assert False, "expected MT5ConnectionError"
     except MT5ConnectionError:
         pass

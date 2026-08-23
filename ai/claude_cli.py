@@ -83,6 +83,13 @@ def run_claude(
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
+            # Same defensive isolation as ai/copilot_cli.py's own Popen
+            # call, added after a real crash found there 2026-08-23 (two
+            # child CLI processes and their own parent Python process all
+            # died together from a Windows console-level signal) — this
+            # keeps a crash or console event on the parent's console from
+            # cascading into this child, and vice versa.
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
     except (FileNotFoundError, OSError) as e:
         logger.warning("run_claude: failed to launch %s: %s: %s", executable, type(e).__name__, e)

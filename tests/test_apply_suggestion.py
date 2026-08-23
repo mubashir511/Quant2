@@ -4,7 +4,7 @@ import pytest
 
 from ai.portfolio_suggest import AllocationEntry
 from data.mt5_source import AccountSummary, ContractSpec, MarketAsset, Position
-from risk.apply_suggestion import compute_rebalance_plan
+from risk.apply_suggestion import check_execution_safety_gates, compute_rebalance_plan
 
 ACCOUNT = AccountSummary(balance=100000.0, equity=100000.0, free_margin=90000.0, currency="USD")
 
@@ -549,3 +549,97 @@ def test_zero_contract_size_spec_marks_infeasible_instead_of_crashing():
     )
     assert len(plan) == 1
     assert plan[0].action == "infeasible"
+
+
+# --- check_execution_safety_gates ---
+
+
+def test_check_execution_safety_gates_passes_when_everything_clears():
+    ok, reason = check_execution_safety_gates(
+        is_demo=True, allow_live_execution=False, trading_permitted=True,
+    )
+    assert ok is True
+    assert reason == ""
+
+
+def test_check_execution_safety_gates_blocks_non_demo_without_override():
+    ok, reason = check_execution_safety_gates(
+        is_demo=False, allow_live_execution=False, trading_permitted=True,
+    )
+    assert ok is False
+    assert "doesn't" in reason
+    assert "ALLOW_LIVE_EXECUTION" in reason
+
+
+def test_check_execution_safety_gates_allows_non_demo_with_explicit_override():
+    ok, reason = check_execution_safety_gates(
+        is_demo=False, allow_live_execution=True, trading_permitted=True,
+    )
+    assert ok is True
+    assert reason == ""
+
+
+def test_check_execution_safety_gates_blocks_on_ftmo_heat():
+    ok, reason = check_execution_safety_gates(
+        is_demo=True, allow_live_execution=False, trading_permitted=True,
+        ftmo_heat_blocked=True, ftmo_heat_blocked_reason="Execution blocked: heat too high.",
+    )
+    assert ok is False
+    assert reason == "Execution blocked: heat too high."
+
+
+def test_check_execution_safety_gates_blocks_when_trading_not_permitted():
+    ok, reason = check_execution_safety_gates(
+        is_demo=True, allow_live_execution=False, trading_permitted=False,
+        trading_blocked_reason="AutoTrading is turned OFF.",
+    )
+    assert ok is False
+    assert reason == "Execution blocked: AutoTrading is turned OFF."
+
+
+def test_check_execution_safety_gates_demo_check_takes_priority_over_others():
+    # First-failure-wins ordering: even if heat is also blocked and
+    # trading isn't permitted, the demo/ALLOW_LIVE_EXECUTION message is
+    # the one surfaced -- matches the original inline dialog's own
+    # if/elif/elif priority order exactly.
+    ok, reason = check_execution_safety_gates(
+        is_demo=False, allow_live_execution=False, trading_permitted=False,
+        trading_blocked_reason="AutoTrading is turned OFF.",
+        ftmo_heat_blocked=True, ftmo_heat_blocked_reason="Execution blocked: heat too high.",
+    )
+    assert ok is False
+    assert "ALLOW_LIVE_EXECUTION" in reason
+
+
+def test_check_execution_safety_gates_heat_check_takes_priority_over_trading_permission():
+    ok, reason = check_execution_safety_gates(
+        is_demo=True, allow_live_execution=False, trading_permitted=False,
+        trading_blocked_reason="AutoTrading is turned OFF.",
+        ftmo_heat_blocked=True, ftmo_heat_blocked_reason="Execution blocked: heat too high.",
+    )
+    assert ok is False
+    assert reason == "Execution blocked: heat too high."
+
+
+# --- compute_aggregate_heat_pct ---
+
+
+def test_compute_aggregate_heat_pct_sums_priced_and_stopped_entries():
+    from risk.apply_suggestion import compute_aggregate_heat_pct
+
+    allocation = {
+        "EURUSD": AllocationEntry(pct=1.5, price=1.09, stop_loss=1.08),
+        "XAUUSD": AllocationEntry(pct=2.0, price=2000.0, stop_loss=1980.0),
+        "CASH": AllocationEntry(pct=96.5),
+    }
+    assert compute_aggregate_heat_pct(allocation) == 3.5
+
+
+def test_compute_aggregate_heat_pct_ignores_entries_missing_price_or_stop():
+    from risk.apply_suggestion import compute_aggregate_heat_pct
+
+    allocation = {
+        "EURUSD": AllocationEntry(pct=1.5, price=None, stop_loss=1.08),
+        "XAUUSD": AllocationEntry(pct=2.0, price=2000.0, stop_loss=None),
+    }
+    assert compute_aggregate_heat_pct(allocation) == 0.0

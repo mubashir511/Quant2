@@ -25,8 +25,10 @@ from ai.ftmo_suggest import (
     format_ftmo_trade_cost,
     format_long_term_alignment,
     format_long_term_alignment_short,
+    read_latest_suggestion,
     suggest_ftmo_portfolio,
 )
+from ai.ftmo_suggest import _write_latest_suggestion
 from ai.portfolio_suggest import AssetAnalysis, AuditResult
 from analysis.chart_structure import ChartStructureSnapshot, SRLevel, SRLevelsResult
 from analysis.technical import TechnicalStats, compute_technical_stats
@@ -1167,6 +1169,22 @@ def test_ftmo_stage1_instruction_mentions_short_side_support():
     assert '"sell"' in text
 
 
+def test_ftmo_stage1_instruction_mentions_pending_setups_section():
+    text = build_ftmo_stage1_instruction()
+    assert "## Pending Setups" in text
+    assert "trigger_condition" in text
+    # The "only one fenced block, ever" absolute claim must be gone now
+    # that a second (optional) Pending Setups block is allowed — a stale
+    # copy of this sentence would tell the model two contradictory things.
+    assert "ONLY fenced code block" not in text
+    assert "Exactly two fenced code blocks" in text
+
+
+def test_ftmo_stage1_instruction_forbids_symbol_overlap_between_sections():
+    text = build_ftmo_stage1_instruction()
+    assert "never both at once" in text
+
+
 def test_ftmo_stage1_instruction_states_short_holding_horizon():
     text = build_ftmo_stage1_instruction()
     assert "HOLDING HORIZON" in text
@@ -1191,6 +1209,24 @@ def test_ftmo_stage1_instruction_requires_per_instrument_position_size_debate():
     assert "conviction" in text.lower()
     assert "feasibility ceiling" in text.lower()
     assert "compliance headroom" in text.lower()
+
+
+def test_ftmo_stage1_instruction_requires_showing_stop_target_arithmetic_once():
+    # Real bug found in a live report (2026-08-22): the same instrument's
+    # ATR-based stop was stated as 1.26% of price in one paragraph and
+    # 0.019% in another, and a "20 pips" stop claim didn't match the
+    # actual 30-pip distance between the stated entry and stop prices —
+    # the model recomputed (or misremembered) the same number twice
+    # instead of reusing its own first, correct calculation.
+    text = build_ftmo_stage1_instruction()
+    assert "SHOW THE STOP/TARGET ARITHMETIC ONCE" in text
+    assert "pip size" in text.lower()
+    assert "Pending Setups" in text
+
+
+def test_ftmo_stage1_instruction_pending_setups_requires_reusing_stop_target_numbers():
+    text = build_ftmo_stage1_instruction()
+    assert "copied from there verbatim" in text
 
 
 def test_ftmo_stage1_instruction_requires_per_instrument_stop_target_debate():
@@ -1229,7 +1265,22 @@ def test_ftmo_audit_instruction_covers_trailing_vs_static_and_zero_grace_period(
     assert "static" in AUDIT_INSTRUCTION
     assert "ZERO grace period" in AUDIT_INSTRUCTION
     assert "Best Day Rule" in AUDIT_INSTRUCTION
+
+
+def test_ftmo_audit_instruction_covers_pending_setups_scrutiny():
+    assert "Pending Setups" in AUDIT_INSTRUCTION
+    assert "trigger_condition" in AUDIT_INSTRUCTION
+    assert "mechanically checkable" in AUDIT_INSTRUCTION
     assert "CONSISTENCY" in AUDIT_INSTRUCTION
+
+
+def test_ftmo_audit_instruction_requires_recomputing_pending_setups_arithmetic():
+    # Real bug found in a live report (2026-08-22): prose claimed one
+    # R:R/pip count while the entry's own price/stop_loss/take_profit
+    # numbers implied a different one. Auditors must actually recompute
+    # from the JSON's own numbers, not just eyeball plausibility.
+    assert "RECOMPUTE the stop distance" in AUDIT_INSTRUCTION
+    assert "gross R:R" in AUDIT_INSTRUCTION
 
 
 def test_ftmo_audit_instruction_has_no_beta_backtest_carveout():
@@ -1271,6 +1322,137 @@ def test_suggest_ftmo_portfolio_runs_draft_audit_revise(mock_run_claude, mock_au
     mock_audit.assert_called_once()
     _, kwargs = mock_audit.call_args
     assert kwargs["audit_instruction"] == AUDIT_INSTRUCTION
+    # Real bug found live: the manual button's default used to keep
+    # Copilot in FTMO's audit pool even after the user asked for it to
+    # be removed — that request applies to FTMO's audit pool as a
+    # whole, not just the scheduled path. Default is now False.
+    assert kwargs["include_copilot"] is False
+
+
+@patch("ai.ftmo_suggest.build_audit_block")
+@patch("ai.ftmo_suggest.run_claude")
+def test_suggest_ftmo_portfolio_can_exclude_copilot_from_the_audit_pool(mock_run_claude, mock_audit):
+    # Direct user request 2026-08-22: ai.mega_analysis.run_mega_analysis
+    # calls this with include_copilot=False (Copilot has a separate,
+    # dedicated role elsewhere) — this must actually reach build_audit_block.
+    mock_run_claude.side_effect = ["draft text", "final text"]
+    mock_audit.return_value = AuditResult(block="audit block", audit_available=True)
+
+    suggest_ftmo_portfolio("some ftmo summary", include_copilot=False)
+
+    _, kwargs = mock_audit.call_args
+    assert kwargs["include_copilot"] is False
+
+
+# --- read_latest_suggestion / _write_latest_suggestion ---
+# Moved here from ai.mega_analysis (2026-08-23): a real design bug found
+# live had this write happening only inside ai.mega_analysis.run_mega_
+# analysis, so the manual "Suggest Portfolio Mix" button's own
+# successful runs never armed Copilot at all — the user's own explicit
+# intent was that manual and scheduled runs differ only in what
+# triggers them. Moved into suggest_ftmo_portfolio() itself (below) so
+# BOTH callers get it unconditionally, with no per-caller opt-in.
+
+
+@pytest.fixture(autouse=True)
+def _isolated_latest_suggestion_file(tmp_path):
+    with patch.object(config, "MEGA_ANALYSIS_LATEST_SUGGESTION_FILE", str(tmp_path / "latest_suggestion.json")):
+        yield
+
+
+_WELL_FORMED_FINAL_ANSWER = (
+    "## Executive Summary\nSome prose.\n\n"
+    '```json\n{"EURUSD": {"pct": 1.5, "price": 1.09, "stop_loss": 1.08, '
+    '"take_profit": 1.11, "side": "buy"}, "CASH": 98.5}\n```\n\n'
+    '```json\n[{"symbol": "XAUUSD", "side": "buy", "pct": 1.0, '
+    '"trigger_condition": "H1 closes above 2000 with RSI turning up", '
+    '"price": 2000.0, "stop_loss": 1980.0, "take_profit": 2050.0, '
+    '"reason": "breakout watch"}]\n```'
+)
+
+
+def test_read_latest_suggestion_empty_dict_when_file_missing():
+    assert read_latest_suggestion() == {}
+
+
+def test_write_latest_suggestion_then_read_round_trips():
+    _write_latest_suggestion(_WELL_FORMED_FINAL_ANSWER)
+    saved = read_latest_suggestion()
+    assert saved["immediate_allocation"]["EURUSD"]["side"] == "buy"
+    assert saved["immediate_allocation"]["EURUSD"]["pct"] == 1.5
+    assert saved["pending_setups"][0]["symbol"] == "XAUUSD"
+    assert saved["pending_setups"][0]["trigger_condition"] == (
+        "H1 closes above 2000 with RSI turning up"
+    )
+    assert saved["generated_utc"]
+
+
+def test_write_latest_suggestion_does_not_overwrite_on_malformed_allocation():
+    _write_latest_suggestion(_WELL_FORMED_FINAL_ANSWER)
+    prior = read_latest_suggestion()
+
+    _write_latest_suggestion("Just prose, no allocation block at all.")
+
+    assert read_latest_suggestion() == prior
+
+
+def test_write_latest_suggestion_does_not_overwrite_on_malformed_pending_setups():
+    _write_latest_suggestion(_WELL_FORMED_FINAL_ANSWER)
+    prior = read_latest_suggestion()
+
+    # Valid allocation block, but a Pending Setups array with a duplicate
+    # symbol — malformed, must fail the whole write, not just skip the
+    # pending-setups half.
+    bad_answer = (
+        '```json\n{"EURUSD": {"pct": 1.5, "side": "buy"}, "CASH": 98.5}\n```\n\n'
+        '```json\n[{"symbol": "XAUUSD", "side": "buy", "pct": 1.0, "trigger_condition": "a"}, '
+        '{"symbol": "XAUUSD", "side": "sell", "pct": 1.0, "trigger_condition": "b"}]\n```'
+    )
+    _write_latest_suggestion(bad_answer)
+
+    assert read_latest_suggestion() == prior
+
+
+def test_read_latest_suggestion_empty_dict_on_corrupt_file(tmp_path):
+    corrupt_path = tmp_path / "corrupt_suggestion.json"
+    corrupt_path.write_text("{not valid json")
+    with patch.object(config, "MEGA_ANALYSIS_LATEST_SUGGESTION_FILE", str(corrupt_path)):
+        assert read_latest_suggestion() == {}
+
+
+# --- the real fix: BOTH callers of suggest_ftmo_portfolio get this for free ---
+
+
+@patch("ai.ftmo_suggest.build_audit_block", return_value=AuditResult(block="", audit_available=False))
+@patch("ai.ftmo_suggest.run_claude")
+def test_suggest_ftmo_portfolio_writes_latest_suggestion_on_success(mock_run_claude, mock_audit):
+    # This is THE regression test for the real bug the user caught live:
+    # a manual "Suggest Portfolio Mix" click (which calls
+    # suggest_ftmo_portfolio directly, exactly like this test does —
+    # NOT via ai.mega_analysis.run_mega_analysis) must arm Copilot's
+    # clerk too, not just a scheduled run. Only run_claude/build_audit_
+    # block are mocked here (not suggest_ftmo_portfolio itself), so the
+    # real internal _write_latest_suggestion call actually executes.
+    mock_run_claude.side_effect = ["draft text", _WELL_FORMED_FINAL_ANSWER]
+
+    suggest_ftmo_portfolio("some ftmo summary")
+
+    saved = read_latest_suggestion()
+    assert saved["immediate_allocation"]["EURUSD"]["pct"] == 1.5
+    assert saved["pending_setups"][0]["symbol"] == "XAUUSD"
+
+
+@patch("ai.ftmo_suggest.build_audit_block", return_value=AuditResult(block="", audit_available=False))
+@patch("ai.ftmo_suggest.run_claude")
+def test_suggest_ftmo_portfolio_does_not_write_latest_suggestion_on_cli_failure(mock_run_claude, mock_audit):
+    # The resumed stage-2 call failing falls back to a full-context
+    # retry (suggest_ftmo_portfolio's own existing behavior) — make that
+    # fail too, so the overall result is a genuine CLI failure.
+    mock_run_claude.side_effect = ["draft text", CLI_MISSING_MESSAGE, CLI_MISSING_MESSAGE]
+
+    suggest_ftmo_portfolio("some ftmo summary")
+
+    assert read_latest_suggestion() == {}
 
 
 @patch("ai.ftmo_suggest.build_past_lessons", return_value="PAST LESSONS TEXT")

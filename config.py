@@ -186,8 +186,12 @@ FTMO_MAX_SYMBOL_EXPOSURE_PCT = float(os.getenv("FTMO_MAX_SYMBOL_EXPOSURE_PCT", "
 
 # --- FTMO daily "mega market analysis" (unattended, OS-scheduled) ---
 # Runs the full FTMO Portfolio Suggestion pipeline (Claude Sonnet draft +
-# the entire AUDIT_MODELS pool + Copilot) once a day with nobody watching,
-# via a standalone script (mega_analysis_job.py) triggered by a Windows
+# the entire AUDIT_MODELS pool — Copilot is excluded from FTMO's audit
+# pool entirely now, not just here, see
+# ai.ftmo_suggest.suggest_ftmo_portfolio's own docstring: it has a
+# separate, dedicated role for FTMO and shouldn't also spend its own
+# budget auditing) once a day with nobody watching, via a standalone
+# script (mega_analysis_job.py) triggered by a Windows
 # Scheduled Task — deliberately NOT an in-process background thread,
 # confirmed live that a Streamlit script's own top-level code never
 # executes at all until a browser session connects, so a thread started
@@ -219,3 +223,144 @@ MEGA_ANALYSIS_GRACE_MINUTES = int(os.getenv("MEGA_ANALYSIS_GRACE_MINUTES", "20")
 # know whether today's run already happened, and to show the last
 # outcome) — see ai/mega_analysis.py.
 MEGA_ANALYSIS_STATE_FILE = os.getenv("MEGA_ANALYSIS_STATE_FILE", "mega_analysis_state.json")
+# The unattended run's own LIVE, in-progress status — a separate file
+# from MEGA_ANALYSIS_STATE_FILE (which only ever reflects the LAST
+# completed attempt's outcome). Added 2026-08-22, direct user request:
+# the automated run should show the same live step-by-step status the
+# manual "Suggest Portfolio Mix" button already shows, the only real
+# difference being WHAT triggers it (the scheduler vs. a click), not
+# whether it's visible while running. Written by ai.mega_analysis's own
+# progress callback on every stage/audit-progress update; read by
+# app.py's countdown widget to detect and display a run actively
+# happening right now, distinct from "here's how the last one went."
+MEGA_ANALYSIS_PROGRESS_FILE = os.getenv("MEGA_ANALYSIS_PROGRESS_FILE", "mega_analysis_progress.json")
+# User-controlled on/off switch for the unattended scheduled run, added
+# 2026-08-23 direct user request (a toggle next to the manual "Suggest
+# Portfolio Mix" button, mutually exclusive with it): defaults to
+# ENABLED when the file is missing/corrupt — this is opt-out, not
+# opt-in, so a fresh install or a deleted file never silently stops the
+# daily run. mega_analysis_job.py checks this before is_due() on every
+# poll; app.py's toggle writes it and reads it back as the toggle's
+# source of truth (so a totally separate OS process can see the choice).
+MEGA_ANALYSIS_ENABLED_FILE = os.getenv("MEGA_ANALYSIS_ENABLED_FILE", "mega_analysis_enabled.json")
+# User-overridable daily trigger time (UTC), added 2026-08-23 direct user
+# request (a time picker next to the enable/disable toggle): when this
+# file is missing/corrupt/out of range, ai.mega_analysis.read_mega_
+# analysis_trigger() falls back to MEGA_ANALYSIS_TRIGGER_HOUR_UTC/
+# MINUTE_UTC above unchanged, so an env-var-configured default still
+# works exactly as before until the user actually picks a new time.
+MEGA_ANALYSIS_TRIGGER_FILE = os.getenv("MEGA_ANALYSIS_TRIGGER_FILE", "mega_analysis_trigger.json")
+# The real, intended production model for the daily unattended run —
+# "sonnet" by default, matching the manual "Suggest Portfolio Mix"
+# button's own default. Overridable purely so a manual test run (e.g.
+# confirming the scheduler/lock-file fix actually completes end to end)
+# can use a cheap/fast model like "haiku" without editing code — remove
+# the env override once such a test is done, this should stay "sonnet"
+# for every real daily run.
+MEGA_ANALYSIS_MODEL = os.getenv("MEGA_ANALYSIS_MODEL", "sonnet")
+# The derived, machine-readable artifact ai.mega_analysis.run_mega_analysis
+# writes after every successful run — parsed straight from the same
+# final-answer text the human-readable session record (a pure-prose .md
+# file) already contains, but as real JSON this time
+# ({"generated_utc", "immediate_allocation", "pending_setups"}) so the
+# Copilot execution job (ai/copilot_execution.py) never has to
+# guess which saved .md record came from the mega session specifically
+# vs. a manual "Suggest Portfolio Mix" button click (both land in the
+# same FTMO_RECORDS_DIR, indistinguishably, today).
+MEGA_ANALYSIS_LATEST_SUGGESTION_FILE = os.getenv(
+    "MEGA_ANALYSIS_LATEST_SUGGESTION_FILE", "mega_analysis_latest_suggestion.json"
+)
+
+# --- FTMO Copilot execution check (unattended, OS-scheduled) ---
+# The "clerk/executioner" half of the boardroom architecture (see
+# ai/copilot_execution.py's own module docstring): reads the mega
+# session's Pending Setups, checks each one against fresh live MT5
+# technicals via GitHub Copilot CLI, and executes a confirmed one with
+# position sizing recomputed from live equity — direct user request
+# 2026-08-22/23, explicitly with NO new safety cap beyond the three
+# gates the manual "Apply Suggestion" dialog already enforces (see
+# risk/apply_suggestion.py::check_execution_safety_gates).
+#
+# How often the execution-check actually does real work — direct user
+# request 2026-08-23: originally hourly, but the check itself is cheap
+# (a handful of MT5 fetches + a few Copilot calls, not a 35-minute AI
+# pipeline), so tightened to check for a triggered Pending Setup more
+# often. copilot_execution_job.py's own OS-level Task Scheduler poll
+# interval (currently 5 minutes) is unrelated and unchanged — this is
+# purely how many of those polls actually turn into a real check versus
+# an instant "not due yet" exit.
+COPILOT_EXECUTION_CHECK_INTERVAL_MINUTES = int(
+    os.getenv("COPILOT_EXECUTION_CHECK_INTERVAL_MINUTES", "15")
+)
+# Analogous to MEGA_ANALYSIS_GRACE_MINUTES above but keyed to each
+# COPILOT_EXECUTION_CHECK_INTERVAL_MINUTES-sized window instead of a
+# fixed daily clock time; this window must exceed however often the
+# Task Scheduler poll actually runs so at least one poll always lands
+# inside it every interval. A window this generous relative to the
+# interval is safe, not wasteful — the per-interval dedup marker (see
+# is_execution_due) means a real check still only happens once per
+# interval regardless of how many polls land inside this window; a wide
+# window just gives more polls a chance to catch up if an earlier one
+# in the same interval was skipped or blocked.
+COPILOT_EXECUTION_GRACE_MINUTES = int(os.getenv("COPILOT_EXECUTION_GRACE_MINUTES", "10"))
+# Idempotency/status marker for this job, mirroring
+# MEGA_ANALYSIS_STATE_FILE's own role exactly, just for this second job.
+COPILOT_EXECUTION_STATE_FILE = os.getenv(
+    "COPILOT_EXECUTION_STATE_FILE", "copilot_execution_state.json"
+)
+# Per-symbol settlement tracking (order_placed/filled/closed_after_fill —
+# see ai/copilot_execution.py's own module docstring for why a flat
+# "already executed" set isn't enough given open_position places a GTC
+# PENDING limit order, never a market order) — reset whenever the mega
+# session's own generated_utc changes, i.e. a fresh mega session
+# supersedes all prior pending-setup tracking.
+COPILOT_EXECUTION_SETTLEMENT_FILE = os.getenv(
+    "COPILOT_EXECUTION_SETTLEMENT_FILE", "copilot_execution_settlement.json"
+)
+# Live, in-progress status for this job — mirrors
+# MEGA_ANALYSIS_PROGRESS_FILE's own role/rationale exactly (same standing
+# "automated runs must be as visible as a manual button click" principle
+# applies here too), just for this second job.
+COPILOT_EXECUTION_PROGRESS_FILE = os.getenv(
+    "COPILOT_EXECUTION_PROGRESS_FILE", "copilot_execution_progress.json"
+)
+# User-controlled on/off switch for the whole Copilot Execution Clerk
+# role, added 2026-08-23 direct user request (a toggle in the panel's own
+# heading): defaults to ENABLED when the file is missing/corrupt, same
+# opt-out-not-opt-in posture as MEGA_ANALYSIS_ENABLED_FILE. Checked once,
+# inside ai.copilot_execution.run_copilot_execution_check itself, so all
+# three of its call sites (the standalone poll, mega_analysis_job.py's
+# inline pass, app.py's manual-button inline pass) respect it uniformly.
+COPILOT_EXECUTION_ENABLED_FILE = os.getenv(
+    "COPILOT_EXECUTION_ENABLED_FILE", "copilot_execution_enabled.json"
+)
+# User-overridable review frequency (minutes), added 2026-08-23 direct
+# user request (a picker in the same panel): falls back to
+# COPILOT_EXECUTION_CHECK_INTERVAL_MINUTES above on a missing/corrupt/
+# non-positive value — see ai.copilot_execution.read_copilot_execution_
+# interval_minutes.
+COPILOT_EXECUTION_INTERVAL_FILE = os.getenv(
+    "COPILOT_EXECUTION_INTERVAL_FILE", "copilot_execution_interval.json"
+)
+# A hard ceiling on one execution-check pass — both the standalone
+# poll AND the inline pass mega_analysis_job.py fires right after
+# a successful run (see its own docstring) use this. Sized generously
+# above a realistic worst case (a handful of pending setups, sequential
+# MT5 fetches, then PARALLEL Copilot verdict calls each up to
+# COPILOT_VERIFICATION_TIMEOUT_SECONDS) but under a whole
+# COPILOT_EXECUTION_CHECK_INTERVAL_MINUTES window (600s < 900s at the
+# current 15-minute default — the shared EXECUTION_LOCK_PATH is what
+# actually keeps an overlapping next poll safe, not this margin alone),
+# so a hang here can never make either this job or the daily
+# mega-analysis job overrun its own scheduled window.
+COPILOT_EXECUTION_RUN_TIMEOUT_SECONDS = int(
+    os.getenv("COPILOT_EXECUTION_RUN_TIMEOUT_SECONDS", "600")
+)
+# Defensive cap on how many not-yet-settled Pending Setups get a live
+# Copilot verdict call in a single poll — nothing in the AI's own output
+# schema bounds how many it could emit, and each one fans out into a
+# real subprocess spawn; excess entries beyond this are logged and
+# dropped rather than checked, not silently truncated without a trace.
+COPILOT_EXECUTION_MAX_PENDING_SETUPS = int(
+    os.getenv("COPILOT_EXECUTION_MAX_PENDING_SETUPS", "10")
+)

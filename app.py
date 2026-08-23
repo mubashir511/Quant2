@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -19,7 +19,31 @@ from ai.ftmo_suggest import (
     format_ftmo_trade_cost,
     suggest_ftmo_portfolio,
 )
-from ai.mega_analysis import next_run_utc, read_state
+from ai.copilot_execution import (
+    EXECUTION_LOCK_PATH,
+    EXECUTION_LOCK_STALE_AFTER_SECONDS,
+    next_execution_check_utc,
+    read_copilot_execution_enabled,
+    read_copilot_execution_interval_minutes,
+    read_execution_progress,
+    read_execution_state,
+    read_settlement,
+    run_copilot_execution_check,
+    set_copilot_execution_enabled,
+    set_copilot_execution_interval_minutes,
+)
+from job_lock import acquire_lock, release_lock
+from utils import run_with_timeout
+from ai.mega_analysis import (
+    next_run_utc,
+    read_latest_suggestion,
+    read_mega_analysis_enabled,
+    read_mega_analysis_trigger,
+    read_progress,
+    read_state,
+    set_mega_analysis_enabled,
+    set_mega_analysis_trigger,
+)
 from ai.portfolio_suggest import (
     AUDIT_MODELS,
     AllocationEntry,
@@ -28,6 +52,7 @@ from ai.portfolio_suggest import (
     build_portfolio_summary,
     parse_final_allocation,
     strip_allocation_block,
+    strip_pending_setups_block,
     strip_leading_process_narration,
     suggest_portfolio,
 )
@@ -47,7 +72,11 @@ from data.mt5_source import (
     group_closed_trades,
 )
 from data.psx_source import PSX_INDICES, PSXAsset, PSXConnectionError, get_psx_market_watch
-from risk.apply_suggestion import compute_rebalance_plan
+from risk.apply_suggestion import (
+    check_execution_safety_gates,
+    compute_aggregate_heat_pct,
+    compute_rebalance_plan,
+)
 from risk.ftmo_rules import DEFAULT_HEADROOM_FRACTION, FtmoStatus, would_breach_daily_loss_headroom
 from risk.rebalance import evaluate_positions
 
@@ -133,18 +162,45 @@ def _cached_server_offset_seconds() -> float | None:
 
 def _render_mega_analysis_countdown() -> None:
     """FTMO-only: shows the countdown to the next unattended daily "mega
-    market analysis" (Claude Sonnet + the full audit pool + Copilot,
-    triggered by the Quant2MegaAnalysis Windows Scheduled Task — see
-    mega_analysis_job.py — independent of whether this page is even
+    market analysis" (Claude Sonnet + the full audit pool — Copilot is
+    deliberately excluded from FTMO's audit pool entirely now, not just
+    here, see ai.ftmo_suggest.suggest_ftmo_portfolio's own docstring for
+    why — triggered by the Quant2MegaAnalysis Windows Scheduled Task —
+    see mega_analysis_job.py — independent of whether this page is even
     open). Scheduling itself is anchored to plain UTC (see
     ai.mega_analysis's own docstrings for why local-time scheduling would
     silently drift across DST); this widget just converts that UTC
     instant to both this machine's local time (astimezone(), correctly
     DST-aware) and the broker's own server time (from a live tick,
     best-effort) purely for display, per the user's explicit request to
-    stay aware of both clocks alongside UTC."""
+    stay aware of both clocks alongside UTC.
+
+    Also shows the run's own LIVE progress while one is actually
+    happening (see ai.mega_analysis::_write_progress) — direct user
+    request 2026-08-22: the unattended run should be visible the same
+    way the manual "Suggest Portfolio Mix" button already is, the only
+    real difference being WHAT triggers it. "Live" is detected purely
+    from timestamps (progress fresher than 5 minutes old AND newer than
+    the last COMPLETED attempt) rather than an explicit start/stop flag
+    — once run_scheduled_mega_analysis finishes and writes real state,
+    that naturally becomes the newer of the two again, turning this back
+    off with no separate cleanup step needed."""
     now_utc = datetime.now(timezone.utc)
     state = read_state()
+    progress = read_progress()
+    live_message = None
+    progress_ts = progress.get("updated_utc")
+    if progress_ts:
+        try:
+            progress_dt = datetime.fromisoformat(progress_ts)
+        except ValueError:
+            progress_dt = None
+        if progress_dt is not None:
+            age_seconds = (now_utc - progress_dt).total_seconds()
+            last_attempt = state.get("last_attempt_utc")
+            newer_than_last_attempt = last_attempt is None or progress_ts > last_attempt
+            if 0 <= age_seconds < 300 and newer_than_last_attempt:
+                live_message = progress.get("message")
     target = next_run_utc(now_utc, state=state)
     remaining_seconds = max(0, int((target - now_utc).total_seconds()))
     hours, rem = divmod(remaining_seconds, 3600)
@@ -160,38 +216,249 @@ def _render_mega_analysis_countdown() -> None:
             broker_time = target + pd.Timedelta(seconds=offset_seconds)
             broker_str = broker_time.strftime("%Y-%m-%d %H:%M") + " broker server time"
 
-    with st.container(border=True):
-        st.subheader(":material/schedule: Next Mega Market Analysis")
-        st.caption(
-            "Unattended daily FTMO run — Claude Sonnet draft + the full "
-            f"{len(AUDIT_MODELS)}-model audit pool + Copilot — fires once a day "
-            f"at {config.MEGA_ANALYSIS_TRIGGER_HOUR_UTC:02d}:"
-            f"{config.MEGA_ANALYSIS_TRIGGER_MINUTE_UTC:02d} UTC (inside the "
-            "London/New York liquidity overlap, right after the NY cash-index "
-            "open), independent of whether this page is open. If this PC is "
-            "off through that whole window, that day is skipped rather than "
-            "run late — the next one fires normally the following day."
-        )
-        col1, col2 = st.columns(2)
-        col1.metric("Time remaining", f"{hours}h {minutes:02d}m {seconds:02d}s")
-        col2.metric(
-            "Scheduled for (local)",
-            target.astimezone().strftime("%Y-%m-%d %H:%M %Z"),
-        )
-        st.caption(f"Same instant in UTC: {target.strftime('%Y-%m-%d %H:%M')} · {broker_str}")
+    # No own border here (direct user request 2026-08-23: merge this
+    # visually with the manual "Suggest Portfolio Mix" controls into one
+    # shared box) — the caller supplies the surrounding
+    # st.container(border=True) instead.
+    st.subheader(":material/schedule: Next Mega Market Analysis")
+    if live_message:
+        st.info(f":material/autorenew: Running now — {live_message}")
+    # Direct user request 2026-08-23: significantly shortened (2-3 lines,
+    # not the full design rationale — kept in this module's own docstring
+    # above instead), and no longer names a specific model or trigger
+    # time — both are user-changeable (the model via MEGA_ANALYSIS_MODEL,
+    # the time via the picker below), so hardcoding either here would go
+    # stale the moment either one is actually changed.
+    st.caption(
+        f"Unattended daily FTMO run, reviewed by up to {len(AUDIT_MODELS)} audit models "
+        "before it's finalized. Copilot handles execution separately, checking every "
+        f"{config.COPILOT_EXECUTION_CHECK_INTERVAL_MINUTES} min (see below)."
+    )
+    col1, col2 = st.columns(2)
+    col1.metric("Time remaining", f"{hours}h {minutes:02d}m {seconds:02d}s")
+    col2.metric(
+        "Scheduled for (local)",
+        target.astimezone().strftime("%Y-%m-%d %H:%M %Z"),
+    )
+    st.caption(f"Same instant in UTC: {target.strftime('%Y-%m-%d %H:%M')} · {broker_str}")
 
-        last_status = state.get("last_status")
-        last_attempt = state.get("last_attempt_utc")
-        if last_status == "success" and last_attempt:
-            st.success(f"Last run ({last_attempt} UTC): succeeded.")
-        elif last_status in ("error", "cli_failed", "timeout") and last_attempt:
-            st.warning(
-                f"Last attempt ({last_attempt} UTC) did NOT succeed: "
-                f"{state.get('last_detail', '(no detail recorded)')}"
-            )
+    # Direct user request 2026-08-23: let the user change the daily
+    # trigger time from the UI instead of only via the
+    # MEGA_ANALYSIS_TRIGGER_HOUR_UTC/MINUTE_UTC env vars. Seeded from the
+    # persisted file into session_state only once per session (not every
+    # 1-second fragment tick) so this widget's own interaction is never
+    # clobbered by re-reading the file; the countdown above catches up on
+    # the very next tick since this whole function reruns every second.
+    _trigger_hour, _trigger_minute = read_mega_analysis_trigger()
+    if "mega_analysis_trigger_time" not in st.session_state:
+        st.session_state["mega_analysis_trigger_time"] = dt_time(_trigger_hour, _trigger_minute)
+    _new_trigger_time = st.time_input(
+        "Change daily trigger time (UTC)", key="mega_analysis_trigger_time", step=300
+    )
+    if (_new_trigger_time.hour, _new_trigger_time.minute) != (_trigger_hour, _trigger_minute):
+        set_mega_analysis_trigger(_new_trigger_time.hour, _new_trigger_time.minute)
+
+    last_status = state.get("last_status")
+    last_attempt = state.get("last_attempt_utc")
+    # Compact caption-styled status instead of a full st.success/st.warning
+    # alert box (direct user request 2026-08-23: shrink this and squeeze
+    # the gap before the manual controls below it).
+    if last_status == "success" and last_attempt:
+        st.caption(f":green[✓ Last run ({last_attempt} UTC): succeeded.]")
+    elif last_status in ("error", "cli_failed", "timeout") and last_attempt:
+        st.caption(
+            f":orange[⚠ Last attempt ({last_attempt} UTC) did NOT succeed: "
+            f"{state.get('last_detail', '(no detail recorded)')}]"
+        )
 
 
 _render_mega_analysis_countdown = st.fragment(run_every=1)(_render_mega_analysis_countdown)
+
+
+def _render_copilot_execution_panel() -> None:
+    """FTMO-only: shows the mega session's own Immediate Allocation AND
+    Pending Setups (the "clerk/executioner" half of the boardroom
+    architecture — see ai/copilot_execution.py's own module docstring),
+    each with its real status (placed/failed-with-reason for immediate
+    targets; unchecked/order placed/filled/closed-after-fill plus
+    Copilot's own reasoning text for Pending Setups), and a live-progress
+    banner while a check is actually running — same standing "automated
+    runs must be as visible as a manual button click" principle as
+    _render_mega_analysis_countdown above, applied to this second
+    unattended job. The Immediate Allocation table was added 2026-08-23
+    direct user request ("I see position in 5 assets but only 2 assets
+    are showing up in the clerk section") — this panel previously only
+    ever rendered pending_setups, never the immediate_allocation targets
+    ai.copilot_execution.run_copilot_execution_check actually tries to
+    execute every poll, so a FAILED attempt (no settlement record ever
+    gets created for those) was invisible here even though it was
+    already in the log file. Also has its own enable/disable toggle, a
+    "next review" timer, and a review-frequency picker (direct user
+    request 2026-08-23) — all three widgets live inside this same
+    st.fragment(run_every=5), which is safe here (unlike the mega
+    analysis toggle) since nothing OUTSIDE this fragment needs to react
+    to them; the whole panel simply redraws itself on its own next tick."""
+    suggestion = read_latest_suggestion()
+    pending_setups = suggestion.get("pending_setups", [])
+
+    now_utc = datetime.now(timezone.utc)
+    exec_state = read_execution_state()
+    exec_progress = read_execution_progress()
+    live_message = None
+    progress_ts = exec_progress.get("updated_utc")
+    if progress_ts:
+        try:
+            progress_dt = datetime.fromisoformat(progress_ts)
+        except ValueError:
+            progress_dt = None
+        if progress_dt is not None:
+            age_seconds = (now_utc - progress_dt).total_seconds()
+            last_attempt = exec_state.get("last_attempt_utc")
+            newer_than_last_attempt = last_attempt is None or progress_ts > last_attempt
+            if 0 <= age_seconds < 300 and newer_than_last_attempt:
+                live_message = exec_progress.get("message")
+
+    with st.container(border=True):
+        heading_col, toggle_col = st.columns([3, 1])
+        with heading_col:
+            st.subheader(":material/support_agent: Copilot Execution Clerk")
+        with toggle_col:
+            if "copilot_execution_enabled_toggle" not in st.session_state:
+                st.session_state["copilot_execution_enabled_toggle"] = read_copilot_execution_enabled()
+            copilot_enabled = st.toggle("Enabled", key="copilot_execution_enabled_toggle")
+            if copilot_enabled != read_copilot_execution_enabled():
+                set_copilot_execution_enabled(copilot_enabled)
+
+        if live_message:
+            st.info(f":material/autorenew: Running now — {live_message}")
+        st.caption(
+            "Unattended: reads the mega session's own guidance, checks each Pending "
+            "Setup against fresh live technicals via GitHub Copilot, and executes a "
+            "confirmed one immediately — no human confirmation step."
+        )
+
+        interval_minutes = read_copilot_execution_interval_minutes()
+        next_check = next_execution_check_utc(now_utc, state=exec_state)
+        remaining_seconds = max(0, int((next_check - now_utc).total_seconds()))
+        rem_minutes, rem_seconds = divmod(remaining_seconds, 60)
+
+        timer_col, freq_col = st.columns([1, 1])
+        with timer_col:
+            st.metric(
+                "Next review",
+                "due now" if remaining_seconds <= 0 else f"{rem_minutes}m {rem_seconds:02d}s",
+            )
+        with freq_col:
+            # Range starts at 1 min (direct user request 2026-08-23).
+            # Always includes the CURRENT value too (whatever it is) so a
+            # custom/hand-edited interval never breaks this selectbox —
+            # st.selectbox requires its key's stored value to be one of
+            # the options offered.
+            _freq_options = sorted({1, 2, 5, 10, 15, 30, 60, interval_minutes})
+            if "copilot_execution_interval_select" not in st.session_state:
+                st.session_state["copilot_execution_interval_select"] = interval_minutes
+            new_interval = st.selectbox("Review every (min)", _freq_options, key="copilot_execution_interval_select")
+            if new_interval != interval_minutes:
+                set_copilot_execution_interval_minutes(new_interval)
+        if interval_minutes < 5:
+            st.caption(
+                ":gray[The Windows Scheduled Task itself only polls every 5 min, so anything "
+                "below that still checks at most every ~5 min in practice.]"
+            )
+
+        if not copilot_enabled:
+            st.caption(":gray[Disabled — won't check or execute anything until re-enabled.]")
+
+        if not suggestion:
+            st.caption("No mega-analysis suggestion on file yet.")
+            return
+
+        settled = read_settlement().get("settled", {})
+        last_verdicts = exec_state.get("last_verdicts", {})
+        # Added 2026-08-23 direct user request ("I see position in 5
+        # assets but only 2 assets are showing up in the clerk section")
+        # — this table previously only ever showed pending_setups; the
+        # immediate_allocation targets (what compute_rebalance_plan
+        # actually tries to execute every poll) were never displayed at
+        # all, so a symbol that failed (no settlement record ever gets
+        # created for a failed attempt) was invisible outside the log
+        # file. last_execution_results covers every symbol in the latest
+        # plan, success or failure.
+        immediate_allocation = suggestion.get("immediate_allocation", {})
+        last_execution_results = exec_state.get("last_execution_results", {})
+        immediate_symbols = [s for s in immediate_allocation if s.upper() != "CASH"]
+        st.caption("**Immediate allocation** — feasible right now per the mega session:")
+        if not immediate_symbols:
+            st.caption("Cash-only — no immediate-allocation targets from the latest mega session.")
+        else:
+            imm_rows = []
+            for symbol in immediate_symbols:
+                entry = immediate_allocation[symbol]
+                rec = settled.get(symbol)
+                result = last_execution_results.get(symbol)
+                if rec is not None:
+                    status = rec.get("state", "unknown")
+                elif result is not None:
+                    status = "placed" if result.get("success") else "failed"
+                else:
+                    status = "not yet checked"
+                imm_rows.append(
+                    {
+                        "Symbol": symbol,
+                        "Side": entry.get("side"),
+                        "Target %": entry.get("pct"),
+                        "Status": status,
+                        "Detail": result.get("detail", "") if result is not None else "",
+                    }
+                )
+            st.dataframe(pd.DataFrame(imm_rows), hide_index=True)
+
+        if not pending_setups:
+            st.caption("No Pending Setups from the latest mega session — nothing to watch for.")
+        else:
+            st.caption("**Pending Setups** — conditional, watched until the next mega session:")
+            rows = []
+            for s in pending_setups:
+                symbol = s.get("symbol", "?")
+                rec = settled.get(symbol)
+                # .get(..., "unknown") rather than direct indexing — this
+                # file is entirely self-managed, but a display function
+                # should degrade to a placeholder rather than crash the
+                # whole page if it's ever hand-edited or half-written.
+                status = rec.get("state", "unknown") if rec is not None else "unchecked"
+                verdict = last_verdicts.get(symbol, {})
+                raw_text = verdict.get("raw_text", "") or ""
+                # Direct user request 2026-08-23: when Copilot judges a
+                # setup genuinely STALE (not just "hasn't triggered yet")
+                # due to a real delay, the prompt asks it to lead with a
+                # "STALE SETUP WARNING:" line — surfaced here verbatim
+                # rather than buried in the log/state file only.
+                reasoning = raw_text[:300] + ("…" if len(raw_text) > 300 else "") if raw_text else ""
+                rows.append(
+                    {
+                        "Symbol": symbol,
+                        "Side": s.get("side"),
+                        "Status": status,
+                        "Last verdict": (
+                            "CONFIRMED" if verdict.get("confirmed") else "NOT_CONFIRMED"
+                        ) if symbol in last_verdicts else "not yet checked",
+                        "Trigger condition": s.get("trigger_condition"),
+                        "Copilot's reasoning": reasoning,
+                    }
+                )
+            st.dataframe(pd.DataFrame(rows), hide_index=True)
+
+        last_status = exec_state.get("last_status")
+        last_attempt = exec_state.get("last_attempt_utc")
+        if last_status == "success" and last_attempt:
+            st.success(f"Last check ({last_attempt} UTC): {exec_state.get('last_detail', 'succeeded')}.")
+        elif last_status == "blocked" and last_attempt:
+            st.warning(f"Last check ({last_attempt} UTC) executed nothing: {exec_state.get('last_detail', '')}")
+        elif last_status == "disabled" and last_attempt:
+            st.caption(f"Last check ({last_attempt} UTC): skipped — the clerk was disabled.")
+
+
+_render_copilot_execution_panel = st.fragment(run_every=5)(_render_copilot_execution_panel)
 
 
 def _render_allocation_chart(allocation: dict[str, AllocationEntry]) -> None:
@@ -338,24 +605,6 @@ def _render_capital_at_risk_chart(
         height=max(360, 34 * len(symbols)),
     )
     st.plotly_chart(fig, use_container_width=True)
-
-
-def _compute_aggregate_heat_pct(allocation: dict[str, AllocationEntry]) -> float:
-    """Same 'aggregate heat' math _render_capital_at_risk_chart visualizes,
-    pulled out as its own pure function so the FTMO pre-execution gate
-    below can reuse the identical number the chart already shows for the
-    same allocation, rather than a second, possibly-diverging computation.
-    Only ever called for FTMO (which trades real leveraged MT5
-    instruments, pct_is_risk=True territory — see
-    _render_capital_at_risk_chart's own docstring) — sums entry.pct
-    directly, since that now already equals each position's real % of
-    equity at risk to its stop."""
-    total = 0.0
-    for symbol, entry in allocation.items():
-        if symbol == "CASH" or entry.price is None or entry.stop_loss is None:
-            continue
-        total += entry.pct
-    return total
 
 
 def _render_week52_position_chart(analyses: list) -> None:
@@ -1988,7 +2237,7 @@ for _prefix, _records_dir in (
         _loaded = _load_latest_saved_suggestion(_records_dir)
         if _loaded is not None:
             _final_answer, _generated_at = _loaded
-            _display_text = strip_allocation_block(_final_answer)
+            _display_text = strip_pending_setups_block(strip_allocation_block(_final_answer))
             if len(_display_text) < 200 and len(_final_answer) > 200:
                 _display_text = _final_answer
             _display_text = strip_leading_process_narration(_display_text)
@@ -1999,13 +2248,46 @@ for _prefix, _records_dir in (
             st.session_state[f"{_prefix}last_suggestion_text"] = None
 
 st.header(":material/insights: Portfolio Suggestion", divider=True)
-if selected_exchange == "FTMO":
-    _render_mega_analysis_countdown()
 _portfolio_controls_box = st.container(border=True)
 with _portfolio_controls_box:
+    # Direct user request 2026-08-23: the manual "Suggest Portfolio Mix"
+    # controls now live inside the same box as the Mega Market Analysis
+    # countdown for FTMO, rather than a separate box below it.
+    mega_analysis_enabled = False
+    if selected_exchange == "FTMO":
+        _render_mega_analysis_countdown()
+        # Outside the countdown's own st.fragment on purpose — a widget
+        # inside a fragment only triggers a fragment-scoped rerun, which
+        # would leave the "Suggest Portfolio Mix" disabled= state below
+        # (defined in this outer, non-fragment script) stuck showing the
+        # PREVIOUS value until some unrelated full rerun happened to
+        # catch up. Placed here instead, a toggle click is a normal
+        # full-script rerun, so the button's disabled state updates in
+        # the same instant. Seeded from the persisted file only once per
+        # session (not on every rerun) so a later change from THIS
+        # widget's own interaction is never clobbered by the file value.
+        if "mega_analysis_enabled_toggle" not in st.session_state:
+            st.session_state["mega_analysis_enabled_toggle"] = read_mega_analysis_enabled()
+        mega_analysis_enabled = st.toggle(
+            "Automated daily analysis",
+            key="mega_analysis_enabled_toggle",
+            help="Mutually exclusive with the manual button below — only one "
+            "trigger path is armed at a time.",
+        )
+        if mega_analysis_enabled != read_mega_analysis_enabled():
+            set_mega_analysis_enabled(mega_analysis_enabled)
     button_col, model_col, apply_col = st.columns([2, 1, 1])
     with button_col:
-        suggest_clicked = st.button("Suggest Portfolio Mix")
+        suggest_clicked = st.button(
+            "Suggest Portfolio Mix",
+            disabled=selected_exchange == "FTMO" and mega_analysis_enabled,
+            help=(
+                "Automated daily analysis is on — toggle it off above to "
+                "trigger this manually."
+                if selected_exchange == "FTMO" and mega_analysis_enabled
+                else None
+            ),
+        )
     with model_col:
         selected_model = st.selectbox(
             "Model", ["sonnet", "opus", "haiku"], index=0, label_visibility="collapsed"
@@ -2066,18 +2348,7 @@ with _portfolio_controls_box:
             index_tags = list(PSX_INDICES.keys())
             selected_index_label = st.selectbox("PSX Index", index_labels, index=0)
             selected_index_tag = index_tags[index_labels.index(selected_index_label)]
-    elif selected_exchange == "FTMO":
-        st.caption(
-            "Real FTMO 1-Stage Challenge account (same MT5 terminal as PMEX, "
-            "fully separate balance/positions/history) — not a rule-backed "
-            "recommendation, but it does factor in this account's own real "
-            "compliance headroom above, its own open positions, and H1/H4/D1 "
-            f"technical reads per instrument. Claude drafts a suggestion with "
-            f"live web research, up to {len(AUDIT_MODELS)} free models audit "
-            "it, then Claude revises. Can take up to ~35 minutes and uses "
-            "significant Claude Pro usage."
-        )
-    else:
+    elif selected_exchange != "FTMO":
         st.caption(
             "Early-stage and discretionary — not a rule-backed recommendation, but "
             "it does factor in your open positions above. Claude drafts a "
@@ -2086,6 +2357,13 @@ with _portfolio_controls_box:
             "more of them get to weigh in), then Claude revises. Can take up to "
             "~35 minutes and uses significant Claude Pro usage."
         )
+    # FTMO's own description was removed here (direct user request
+    # 2026-08-23) — the Mega Market Analysis section above already
+    # explains the pipeline; no separate caption is shown for the
+    # manual controls now that they share its box.
+
+if selected_exchange == "FTMO":
+    _render_copilot_execution_panel()
 
 if suggest_clicked and selected_exchange == "PSX":
     error_message = None
@@ -2152,7 +2430,7 @@ if suggest_clicked and selected_exchange == "PSX":
     st.session_state["psx_suggestion_warning"] = warning_message
     if suggestion is not None and not error_message:
         allocation = parse_final_allocation(suggestion)
-        display_text = strip_allocation_block(suggestion)
+        display_text = strip_pending_setups_block(strip_allocation_block(suggestion))
         if len(display_text) < 200 and len(suggestion) > 200:
             display_text = suggestion
         display_text = strip_leading_process_narration(display_text)
@@ -2232,6 +2510,45 @@ elif suggest_clicked and selected_exchange == "FTMO":
                 )
                 if suggestion == CLI_MISSING_MESSAGE or suggestion.startswith(CLI_FAILED_PREFIX):
                     error_message = suggestion
+                else:
+                    # Manual and scheduled runs differ only in what
+                    # triggers them, never in what they produce or feed
+                    # downstream (direct user correction 2026-08-23) —
+                    # this mirrors mega_analysis_job.py's own inline
+                    # wiring exactly, down to sharing the literal same
+                    # lock, so a manual click and the standalone poll
+                    # can never run Copilot's execution-check at
+                    # once. Skips gracefully (not blocking) if the
+                    # standalone poll already holds the lock right now.
+                    _on_stage("Handing off to Copilot for an immediate execution-check...")
+                    if acquire_lock(EXECUTION_LOCK_PATH, EXECUTION_LOCK_STALE_AFTER_SECONDS):
+                        try:
+                            # Same hard timeout ceiling and sentinel
+                            # pattern as mega_analysis_job.py's own
+                            # inline call — a hang here must never
+                            # freeze this whole Streamlit session
+                            # indefinitely.
+                            _copilot_timed_out = object()
+                            _copilot_result = run_with_timeout(
+                                lambda: run_copilot_execution_check(on_stage=_on_stage),
+                                config.COPILOT_EXECUTION_RUN_TIMEOUT_SECONDS,
+                                default=_copilot_timed_out,
+                                catch_exceptions=False,
+                            )
+                            if _copilot_result is _copilot_timed_out:
+                                _on_stage(
+                                    "Copilot's execution-check timed out after "
+                                    f"{config.COPILOT_EXECUTION_RUN_TIMEOUT_SECONDS / 60:.0f} minutes."
+                                )
+                        except Exception as e:
+                            _on_stage(f"Copilot's execution-check failed: {e}")
+                        finally:
+                            release_lock(EXECUTION_LOCK_PATH)
+                    else:
+                        _on_stage(
+                            "Copilot's execution check is already running right now — "
+                            "it will pick this up on its own next run instead."
+                        )
 
         if error_message:
             status.update(label="Failed", state="error")
@@ -2248,7 +2565,7 @@ elif suggest_clicked and selected_exchange == "FTMO":
     st.session_state["ftmo_suggestion_warning"] = warning_message
     if suggestion is not None and not error_message:
         allocation = parse_final_allocation(suggestion, require_side=True)
-        display_text = strip_allocation_block(suggestion)
+        display_text = strip_pending_setups_block(strip_allocation_block(suggestion))
         if len(display_text) < 200 and len(suggestion) > 200:
             display_text = suggestion
         display_text = strip_leading_process_narration(display_text)
@@ -2348,7 +2665,7 @@ elif suggest_clicked:
     st.session_state["suggestion_warning"] = warning_message
     if suggestion is not None and not error_message:
         allocation = parse_final_allocation(suggestion, require_side=True)
-        display_text = strip_allocation_block(suggestion)
+        display_text = strip_pending_setups_block(strip_allocation_block(suggestion))
         if len(display_text) < 200 and len(suggestion) > 200:
             # Stripping removed almost everything — likely the model used
             # more than one fenced block in a way that confused
@@ -2561,21 +2878,22 @@ if st.session_state.get(f"{_execution_state_prefix}rebalance_plan"):
         # FTMO-specific hard pre-execution check — PMEX has no daily-loss
         # rule to check against, so this never applies there. Computed
         # from the same allocation the capital-at-risk chart already
-        # visualizes (see _compute_aggregate_heat_pct), not from `plan`
+        # visualizes (see compute_aggregate_heat_pct), not from `plan`
         # itself (whose PlannedOrder objects don't carry a %-of-equity
         # figure).
         ftmo_heat_blocked = False
+        ftmo_heat_blocked_reason = ""
         if selected_exchange == "FTMO" and ftmo_status is not None:
             current_allocation = (
                 st.session_state.get(f"{_execution_state_prefix}suggested_allocation") or {}
             )
-            planned_heat_pct = _compute_aggregate_heat_pct(current_allocation)
+            planned_heat_pct = compute_aggregate_heat_pct(current_allocation)
             if would_breach_daily_loss_headroom(ftmo_status, planned_heat_pct):
                 ftmo_heat_blocked = True
                 allowed_pct = (
                     max(0.0, ftmo_status.daily_loss_headroom_pct) * DEFAULT_HEADROOM_FRACTION
                 )
-                st.error(
+                ftmo_heat_blocked_reason = (
                     f"Execution blocked: this plan's aggregate heat "
                     f"({planned_heat_pct:.2f}% of equity at risk if every stop "
                     f"is hit) would exceed {DEFAULT_HEADROOM_FRACTION:.0%} of "
@@ -2599,20 +2917,22 @@ if st.session_state.get(f"{_execution_state_prefix}rebalance_plan"):
             (True, "") if config.USE_MOCK_DATA else is_trading_permitted()
         )
 
-        execution_blocked = False
-        if not (is_demo or config.ALLOW_LIVE_EXECUTION):
-            execution_blocked = True
-            st.error(
-                "Execution blocked: the connected account's server doesn't "
-                "look like a demo account and ALLOW_LIVE_EXECUTION isn't "
-                "set. Refusing to place real orders on what may be a live "
-                "account."
-            )
-        elif ftmo_heat_blocked:
-            execution_blocked = True  # blocking message already shown above
-        elif not trading_permitted:
-            execution_blocked = True
-            st.error(f"Execution blocked: {trading_blocked_reason}")
+        # See risk/apply_suggestion.py::check_execution_safety_gates'
+        # own docstring for why this is a shared, pure function now
+        # rather than inline logic here — the unattended Copilot
+        # execution job needs the exact same three gates, and this logic
+        # must never drift between two independently-maintained copies.
+        execution_ok, block_reason = check_execution_safety_gates(
+            is_demo=is_demo,
+            allow_live_execution=config.ALLOW_LIVE_EXECUTION,
+            trading_permitted=trading_permitted,
+            trading_blocked_reason=trading_blocked_reason,
+            ftmo_heat_blocked=ftmo_heat_blocked,
+            ftmo_heat_blocked_reason=ftmo_heat_blocked_reason,
+        )
+        execution_blocked = not execution_ok
+        if execution_blocked and block_reason:
+            st.error(block_reason)
 
         # A Cancel button is always available, blocked or not — previously
         # only the unblocked branch rendered one, so a BLOCKED plan (the

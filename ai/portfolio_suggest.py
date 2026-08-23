@@ -1480,6 +1480,133 @@ def strip_allocation_block(response_text: str) -> str:
     return (response_text[: match.start()] + response_text[match.end() :]).strip()
 
 
+_PENDING_SETUPS_BLOCK_PATTERN = re.compile(r"```json\s*(\[.*?\])\s*```", re.DOTALL | re.IGNORECASE)
+
+
+def _last_pending_setups_match(response_text: str) -> re.Match | None:
+    """Mirrors _last_allocation_match, but for the array-shaped Pending
+    Setups block (see PendingSetup/parse_pending_setups) — trivially
+    disambiguated from the allocation block by bracket shape (`[...]`
+    vs `{...}`), so both can coexist in one response without either
+    regex ever matching the other's block."""
+    matches = list(_PENDING_SETUPS_BLOCK_PATTERN.finditer(response_text))
+    return matches[-1] if matches else None
+
+
+@dataclass
+class PendingSetup:
+    symbol: str
+    side: str
+    pct: float
+    trigger_condition: str  # specific & mechanically checkable — re-evaluated hourly against real technicals, not vibes
+    price: float | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    reason: str = ""
+
+
+def parse_pending_setups(
+    response_text: str, immediate_symbols: frozenset[str] = frozenset()
+) -> list[PendingSetup] | None:
+    """Extract the trailing ```json [...]``` Pending Setups array the
+    FTMO mega-analysis prompt asks for (see the "## Pending Setups"
+    section of ai.ftmo_suggest's _INSTRUCTION_TAIL) — guidance for setups
+    that aren't feasible right now but are worth watching for until the
+    next mega session, later evaluated hourly by ai.copilot_execution
+    against fresh live technicals.
+
+    Unlike parse_final_allocation, an ABSENT block is not a failure —
+    `[]` — since "nothing worth flagging today" is a normal, expected
+    outcome, not something the model should ever have to fabricate an
+    entry to avoid. A PRESENT-but-malformed block (bad JSON, not a list,
+    a non-dict item, an invalid/missing side, a non-numeric pct, a
+    missing/blank trigger_condition, a duplicate symbol within the array,
+    or a symbol that also appears in `immediate_symbols`) fails the WHOLE
+    parse (`None`) — same "malformed data is a structural violation, not
+    a partial-credit situation" philosophy as parse_final_allocation,
+    and specifically closes off any ambiguity about which of two
+    conflicting instructions for the same symbol should win (there must
+    never be a "which one wins" merge to resolve downstream). `side` has
+    no default here (unlike the bare-number legacy shape in
+    parse_final_allocation) — a pending setup is always a fresh idea, not
+    a currently-held position inferring a direction from context, so an
+    absent or invalid side is always a hard failure. `price`/`stop_loss`/
+    `take_profit` stay optional, same reasoning as AllocationEntry: a
+    missing stop is an execution-time "infeasible" concern for
+    compute_rebalance_plan to naturally surface, not a parse failure."""
+    match = _last_pending_setups_match(response_text)
+    if match is None:
+        return []
+    try:
+        data = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list):
+        return None
+
+    immediate_symbols = frozenset(s for s in immediate_symbols if s.upper() != "CASH")
+
+    result: list[PendingSetup] = []
+    seen_symbols: set[str] = set()
+    for item in data:
+        if not isinstance(item, dict):
+            return None
+        symbol = item.get("symbol")
+        if not isinstance(symbol, str) or not symbol:
+            return None
+        if symbol in seen_symbols or symbol in immediate_symbols:
+            return None
+        seen_symbols.add(symbol)
+        side = item.get("side")
+        if isinstance(side, str) and side.lower() in ("buy", "sell"):
+            side_norm = side.lower()
+        else:
+            return None
+        pct = item.get("pct")
+        if not isinstance(pct, (int, float)):
+            return None
+        trigger_condition = item.get("trigger_condition")
+        if not isinstance(trigger_condition, str) or not trigger_condition.strip():
+            return None
+        price = item.get("price")
+        stop_loss = item.get("stop_loss")
+        take_profit = item.get("take_profit")
+        if price is not None and not isinstance(price, (int, float)):
+            return None
+        if stop_loss is not None and not isinstance(stop_loss, (int, float)):
+            return None
+        if take_profit is not None and not isinstance(take_profit, (int, float)):
+            return None
+        reason = item.get("reason", "")
+        if not isinstance(reason, str):
+            return None
+        result.append(
+            PendingSetup(
+                symbol=symbol,
+                side=side_norm,
+                pct=float(pct),
+                trigger_condition=trigger_condition,
+                price=float(price) if price is not None else None,
+                stop_loss=float(stop_loss) if stop_loss is not None else None,
+                take_profit=float(take_profit) if take_profit is not None else None,
+                reason=reason,
+            )
+        )
+    return result
+
+
+def strip_pending_setups_block(response_text: str) -> str:
+    """Removes only the trailing ```json [...]``` Pending Setups block
+    (see parse_pending_setups) so the displayed prose doesn't show a
+    trailing raw JSON dump — sibling to strip_allocation_block, same
+    last-occurrence-only removal rationale (a model-authored ```json
+    block used earlier for legitimate prose content stays untouched)."""
+    match = _last_pending_setups_match(response_text)
+    if match is None:
+        return response_text.strip()
+    return (response_text[: match.start()] + response_text[match.end() :]).strip()
+
+
 def strip_leading_process_narration(response_text: str) -> str:
     """A prompt-only defense against a model narrating its internal
     draft/audit/revision process (e.g. a leading "## Internal Review &
@@ -2173,6 +2300,7 @@ def build_audit_block(
     on_progress: Callable[[str], None] | None = None,
     audit_instruction: str = AUDIT_INSTRUCTION,
     past_lessons: str = "",
+    include_copilot: bool = True,
 ) -> AuditResult:
     """Runs every model in AUDIT_MODELS in parallel against Claude's own
     stage-1 draft, retrying each one individually (see
@@ -2181,6 +2309,14 @@ def build_audit_block(
     review, unlike the old Gemini-gated design. audit_available is true if
     *any* model responds, so the pool tolerates several being down at once
     (see AUDIT_MODELS for why it's spread across multiple providers).
+
+    `include_copilot` defaults to True (every existing caller's behavior
+    unchanged). The scheduled FTMO mega-analysis run (see
+    ai.mega_analysis.run_mega_analysis) passes False — direct user request
+    2026-08-22: Copilot has a separate, dedicated role elsewhere and
+    should not also spend its own request budget on the unattended run's
+    audit pool. AUDIT_MODELS itself (the 10-model OpenRouter pool) is
+    untouched by this flag; only the extra 11th Copilot voice is skipped.
 
     `audit_instruction` lets a different market's suggestion pipeline (see
     ai/psx_suggest.py) reuse this exact retry/pooling/progress machinery
@@ -2203,17 +2339,18 @@ def build_audit_block(
         label: ModelAuditStatus(state="waiting", attempt=0, max_attempts=0)
         for label, _, _ in AUDIT_MODELS
     }
-    # Copilot gets its own entry too — see _run_copilot_with_status's own
-    # docstring for why this matters: without it, a slow Copilot call was
-    # invisible to on_progress and could leave the UI looking frozen
-    # after every OpenRouter model had already finished.
-    status_map[_COPILOT_STATUS_LABEL] = ModelAuditStatus(state="waiting", attempt=0, max_attempts=1)
+    if include_copilot:
+        # Copilot gets its own entry too — see _run_copilot_with_status's own
+        # docstring for why this matters: without it, a slow Copilot call was
+        # invisible to on_progress and could leave the UI looking frozen
+        # after every OpenRouter model had already finished.
+        status_map[_COPILOT_STATUS_LABEL] = ModelAuditStatus(state="waiting", attempt=0, max_attempts=1)
     # Looked up when composing audit_sections below, so each model's audit
     # text can be shown to Claude alongside its own capability/
     # specialization profile — see AUDIT_MODELS' own comment for why.
     profile_by_label = {label: profile for label, _, profile in AUDIT_MODELS}
 
-    with ThreadPoolExecutor(max_workers=len(AUDIT_MODELS) + 1) as pool:
+    with ThreadPoolExecutor(max_workers=len(AUDIT_MODELS) + (1 if include_copilot else 0)) as pool:
         # Submitted as individual futures (not list(pool.map(...))) so one
         # audit's exception can't abort iteration before a sibling's
         # already-completed result is collected.
@@ -2236,11 +2373,13 @@ def build_audit_block(
         # deliberate simplification, not an oversight), but its live
         # status IS now tracked (_run_copilot_with_status) and included
         # in the loop's own completion check below, so it can't finish
-        # invisibly after every OpenRouter model already has.
-        copilot_future = pool.submit(_run_copilot_with_status, draft, status_map)
+        # invisibly after every OpenRouter model already has. Skipped
+        # entirely when include_copilot is False (see this function's own
+        # docstring — the scheduled mega-analysis run's own explicit ask).
+        copilot_future = pool.submit(_run_copilot_with_status, draft, status_map) if include_copilot else None
 
         last_rendered = None
-        while not (all(f.done() for f in futures) and copilot_future.done()):
+        while not (all(f.done() for f in futures) and (copilot_future is None or copilot_future.done())):
             if on_progress is not None:
                 text = _format_audit_progress(status_map)
                 if text != last_rendered:
@@ -2251,7 +2390,7 @@ def build_audit_block(
             on_progress(_format_audit_progress(status_map))
 
         audit_results = [f.result() for f in futures]
-        copilot_result = copilot_future.result()
+        copilot_result = copilot_future.result() if copilot_future is not None else None
 
     audit_sections = []
     audit_available = False
@@ -2263,22 +2402,23 @@ def build_audit_block(
             audit_sections.append(f"{label} ({profile}) audit:\n{text}")
             audit_available = True
 
-    copilot_label = "GitHub Copilot CLI (live web access — the only reviewer that can independently verify a claim, not just judge its internal consistency)"
-    if copilot_result == COPILOT_MISSING_MESSAGE or copilot_result.startswith(COPILOT_FAILED_PREFIX):
-        # The real reason (a timeout, an auth failure, a non-zero exit
-        # code with its actual stderr) travels with the failure, not
-        # just a generic "not available" — this is what gets saved into
-        # the session record, the only place a real cause survives past
-        # the live UI ticker's own lifetime.
-        audit_sections.append(f"{copilot_label} audit: not available this time ({copilot_result}).")
-    elif copilot_result == _NO_EXTERNAL_NOTES_MESSAGE:
-        # Nothing was actually verified — show the note but don't count it
-        # as a contributing audit voice (audit_available stays whatever the
-        # 10 OpenRouter models already decided).
-        audit_sections.append(f"{copilot_label} audit: {copilot_result}")
-    else:
-        audit_sections.append(f"{copilot_label} audit:\n{copilot_result}")
-        audit_available = True
+    if include_copilot:
+        copilot_label = "GitHub Copilot CLI (live web access — the only reviewer that can independently verify a claim, not just judge its internal consistency)"
+        if copilot_result == COPILOT_MISSING_MESSAGE or copilot_result.startswith(COPILOT_FAILED_PREFIX):
+            # The real reason (a timeout, an auth failure, a non-zero exit
+            # code with its actual stderr) travels with the failure, not
+            # just a generic "not available" — this is what gets saved into
+            # the session record, the only place a real cause survives past
+            # the live UI ticker's own lifetime.
+            audit_sections.append(f"{copilot_label} audit: not available this time ({copilot_result}).")
+        elif copilot_result == _NO_EXTERNAL_NOTES_MESSAGE:
+            # Nothing was actually verified — show the note but don't count it
+            # as a contributing audit voice (audit_available stays whatever the
+            # 10 OpenRouter models already decided).
+            audit_sections.append(f"{copilot_label} audit: {copilot_result}")
+        else:
+            audit_sections.append(f"{copilot_label} audit:\n{copilot_result}")
+            audit_available = True
 
     return AuditResult(block="\n\n".join(audit_sections), audit_available=audit_available)
 

@@ -36,9 +36,12 @@ from ai.portfolio_suggest import (
     format_enriched_asset_context,
     get_openrouter_audit,
     parse_final_allocation,
+    parse_pending_setups,
     strip_allocation_block,
     strip_leading_process_narration,
+    strip_pending_setups_block,
     suggest_portfolio,
+    PendingSetup,
 )
 from ai.claude_cli import CLI_FAILED_PREFIX, CLI_MISSING_MESSAGE
 from ai.copilot_cli import CLI_FAILED_PREFIX as COPILOT_FAILED_PREFIX
@@ -1024,6 +1027,170 @@ def test_strip_allocation_block_only_removes_the_last_block_not_earlier_ones():
     }
 
 
+def test_parse_pending_setups_empty_list_when_no_block_present():
+    # A normal, expected outcome — nothing worth flagging today is not a
+    # parse failure, unlike an absent allocation block.
+    assert parse_pending_setups("Just prose, no pending setups block.") == []
+
+
+def test_parse_pending_setups_extracts_valid_entries():
+    text = (
+        "Some prose.\n\n"
+        '```json\n{"EURUSD": {"pct": 15, "price": 1.09, "stop_loss": 1.08, "side": "sell"}, '
+        '"CASH": 85}\n```\n\n'
+        "## Pending Setups\n"
+        '```json\n[{"symbol": "XAUUSD", "side": "buy", "pct": 1.0, '
+        '"trigger_condition": "H1 closes above 2000 with RSI turning up", '
+        '"price": 2000.0, "stop_loss": 1980.0, "take_profit": 2050.0, "reason": "breakout watch"}]\n```'
+    )
+    setups = parse_pending_setups(text)
+    assert setups == [
+        PendingSetup(
+            symbol="XAUUSD",
+            side="buy",
+            pct=1.0,
+            trigger_condition="H1 closes above 2000 with RSI turning up",
+            price=2000.0,
+            stop_loss=1980.0,
+            take_profit=2050.0,
+            reason="breakout watch",
+        )
+    ]
+
+
+def test_parse_pending_setups_tolerates_missing_optional_fields():
+    text = '```json\n[{"symbol": "XAUUSD", "side": "buy", "pct": 1.0, "trigger_condition": "cond"}]\n```'
+    setups = parse_pending_setups(text)
+    assert setups == [
+        PendingSetup(symbol="XAUUSD", side="buy", pct=1.0, trigger_condition="cond")
+    ]
+
+
+def test_parse_pending_setups_none_when_json_malformed():
+    # Must have a balanced [...] pair for the array-shaped block to even
+    # be matched in the first place (an unbalanced bracket, like a plain
+    # "no block present" case, is indistinguishable from "nothing to
+    # flag" and correctly yields [] instead — this text is deliberately
+    # bracket-balanced but invalid JSON inside, e.g. a trailing comma).
+    text = '```json\n[{"symbol": "XAUUSD",}]\n```'
+    assert parse_pending_setups(text) is None
+
+
+def test_parse_pending_setups_object_shaped_block_is_not_matched():
+    text = '```json\n{"symbol": "XAUUSD"}\n```'
+    # An object-shaped block is the allocation block's own pattern, not
+    # this one — no array-shaped match exists here at all, so this is
+    # "no block found" (empty list), not "malformed block found" (None).
+    assert parse_pending_setups(text) == []
+
+
+def test_parse_pending_setups_none_when_array_item_is_not_a_dict():
+    text = '```json\n["XAUUSD"]\n```'
+    assert parse_pending_setups(text) is None
+
+
+def test_parse_pending_setups_none_when_side_missing():
+    # Unlike parse_final_allocation, there is no default here — a pending
+    # setup is always a fresh idea, never a currently-held position to
+    # infer a direction from context.
+    text = '```json\n[{"symbol": "XAUUSD", "pct": 1.0, "trigger_condition": "cond"}]\n```'
+    assert parse_pending_setups(text) is None
+
+
+def test_parse_pending_setups_none_when_side_invalid():
+    text = '```json\n[{"symbol": "XAUUSD", "side": "long", "pct": 1.0, "trigger_condition": "cond"}]\n```'
+    assert parse_pending_setups(text) is None
+
+
+def test_parse_pending_setups_none_when_pct_not_numeric():
+    text = '```json\n[{"symbol": "XAUUSD", "side": "buy", "pct": "a lot", "trigger_condition": "cond"}]\n```'
+    assert parse_pending_setups(text) is None
+
+
+def test_parse_pending_setups_none_when_trigger_condition_missing():
+    text = '```json\n[{"symbol": "XAUUSD", "side": "buy", "pct": 1.0}]\n```'
+    assert parse_pending_setups(text) is None
+
+
+def test_parse_pending_setups_none_when_trigger_condition_blank():
+    text = '```json\n[{"symbol": "XAUUSD", "side": "buy", "pct": 1.0, "trigger_condition": "   "}]\n```'
+    assert parse_pending_setups(text) is None
+
+
+def test_parse_pending_setups_none_when_duplicate_symbol_within_array():
+    text = (
+        '```json\n[{"symbol": "XAUUSD", "side": "buy", "pct": 1.0, "trigger_condition": "a"}, '
+        '{"symbol": "XAUUSD", "side": "sell", "pct": 1.0, "trigger_condition": "b"}]\n```'
+    )
+    assert parse_pending_setups(text) is None
+
+
+def test_parse_pending_setups_none_when_symbol_overlaps_immediate_allocation():
+    text = '```json\n[{"symbol": "EURUSD", "side": "buy", "pct": 1.0, "trigger_condition": "cond"}]\n```'
+    assert parse_pending_setups(text, immediate_symbols=frozenset({"EURUSD", "CASH"})) is None
+
+
+def test_parse_pending_setups_cash_in_immediate_symbols_is_ignored():
+    # CASH is never a real tradeable symbol — passing it through in
+    # immediate_symbols (as parse_final_allocation's own keys would
+    # include) must not itself cause a spurious collision.
+    text = '```json\n[{"symbol": "CASH", "side": "buy", "pct": 1.0, "trigger_condition": "cond"}]\n```'
+    # "CASH" as a pending-setup symbol is nonsensical but not explicitly
+    # forbidden by schema validation itself — this test only confirms
+    # the immediate_symbols CASH-filtering doesn't itself misfire.
+    assert parse_pending_setups(text, immediate_symbols=frozenset({"CASH"})) == [
+        PendingSetup(symbol="CASH", side="buy", pct=1.0, trigger_condition="cond")
+    ]
+
+
+def test_parse_pending_setups_uses_last_block_if_multiple():
+    text = (
+        '```json\n[{"symbol": "WRONG", "side": "buy", "pct": 1.0, "trigger_condition": "a"}]\n```\n'
+        'more text\n'
+        '```json\n[{"symbol": "RIGHT", "side": "buy", "pct": 1.0, "trigger_condition": "b"}]\n```'
+    )
+    setups = parse_pending_setups(text)
+    assert len(setups) == 1
+    assert setups[0].symbol == "RIGHT"
+
+
+def test_parse_pending_setups_coexists_with_allocation_object_block():
+    # Bracket-shape disambiguation: an object-shaped allocation block and
+    # an array-shaped pending-setups block in the same response must each
+    # be found by their own parser without interference.
+    text = (
+        '```json\n{"EURUSD": {"pct": 15, "side": "buy"}, "CASH": 85}\n```\n\n'
+        '```json\n[{"symbol": "XAUUSD", "side": "buy", "pct": 1.0, "trigger_condition": "cond"}]\n```'
+    )
+    allocation = parse_final_allocation(text, require_side=True)
+    setups = parse_pending_setups(text)
+    assert allocation["EURUSD"].side == "buy"
+    assert setups[0].symbol == "XAUUSD"
+
+
+def test_strip_pending_setups_block_removes_json_leaves_prose():
+    text = 'Some reasoning here.\n\n```json\n[{"symbol": "XAUUSD"}]\n```'
+    stripped = strip_pending_setups_block(text)
+    assert "Some reasoning here." in stripped
+    assert "```json" not in stripped
+    assert "XAUUSD" not in stripped
+
+
+def test_strip_pending_setups_block_leaves_allocation_block_untouched():
+    text = (
+        '```json\n{"EURUSD": {"pct": 15}, "CASH": 85}\n```\n\n'
+        '```json\n[{"symbol": "XAUUSD"}]\n```'
+    )
+    stripped = strip_pending_setups_block(text)
+    assert '"EURUSD"' in stripped
+    assert "XAUUSD" not in stripped
+
+
+def test_strip_pending_setups_block_noop_when_no_block_present():
+    text = "Just prose."
+    assert strip_pending_setups_block(text) == text
+
+
 def test_strip_leading_process_narration_removes_leaked_internal_section():
     # Regression test for a real live run (haiku): a leaked
     # "## Internal Review & Revision Process" section narrating which
@@ -1327,7 +1494,22 @@ def test_build_audit_block_no_notes_case_does_not_flip_audit_available(mock_audi
     # "nothing to verify" is not the same as "a successful audit ran."
     result = build_audit_block("some summary", "Claude's draft mix with no notes section.")
     assert result.audit_available is False
-    assert "nothing to independently verify" in result.block
+
+
+@patch("config.AUDIT_RETRY_TIMEOUT_SECONDS", 1)
+@patch("config.AUDIT_RETRY_INTERVAL_SECONDS", 1)
+@patch("ai.portfolio_suggest.get_openrouter_audit", return_value="a real audit response")
+@patch("ai.portfolio_suggest.run_copilot", return_value="SUPPORTED: verified live.")
+def test_build_audit_block_excludes_copilot_entirely_when_asked(mock_run_copilot, mock_audit):
+    # Direct user request 2026-08-22: the scheduled FTMO mega-analysis run
+    # passes include_copilot=False since Copilot has a separate, dedicated
+    # role elsewhere — it must not be spawned at all in that case, not
+    # merely hidden from the resulting text.
+    draft = "Draft.\n\n## External Research Notes\n- A claim — Source."
+    result = build_audit_block("some summary", draft, include_copilot=False)
+    mock_run_copilot.assert_not_called()
+    assert "Copilot" not in result.block
+    assert result.audit_available is True  # the 10 real OpenRouter audits alone still carry this.
 
 
 @patch("ai.portfolio_suggest.get_openrouter_audit")

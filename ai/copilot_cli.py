@@ -87,6 +87,29 @@ def run_copilot(prompt: str, timeout: int = 240) -> str:
                 stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
+                # Real bug found live 2026-08-23: two PARALLEL Copilot
+                # verdict calls (ai.copilot_execution runs one per not-
+                # yet-settled Pending Setup via ThreadPoolExecutor) both
+                # died at the same instant with Windows exit code
+                # 3221225786 (0xC000013A, STATUS_CONTROL_C_EXIT) — the
+                # code Windows reports when a CTRL_BREAK/CTRL_C reaches a
+                # console process — and the PARENT python process running
+                # copilot_execution_job.py died within the same few
+                # seconds too (confirmed via job_lock's own PID-liveness
+                # check finding it dead on the next poll). Without this
+                # flag, a spawned child shares the parent's console
+                # process group by default on Windows, so any console
+                # signal (or a crash inside copilot.exe severe enough to
+                # affect its own process group) can cascade to everything
+                # else attached to that console — including this parent.
+                # Isolating the child into its OWN process group can't
+                # explain what originally triggers the signal, but it
+                # does stop it from taking the parent down too, so a
+                # crashed copilot.exe becomes the ordinary, already-
+                # handled "CLI exited non-zero" failure path below instead
+                # of an unrecoverable process-level crash that orphans
+                # the execution lock.
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             )
         except (FileNotFoundError, OSError) as e:
             logger.warning("run_copilot: failed to launch %s: %s: %s", executable, type(e).__name__, e)

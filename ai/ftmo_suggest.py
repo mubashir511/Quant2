@@ -1,7 +1,9 @@
+import json
 import logging
+import os
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -18,6 +20,8 @@ from ai.portfolio_suggest import (
     build_past_lessons,
     build_positions_context,
     format_enriched_asset_context,
+    parse_final_allocation,
+    parse_pending_setups,
 )
 from ai.session_record import SessionRecord, save_portfolio_session
 from analysis.backtest import (
@@ -527,6 +531,34 @@ _INSTRUCTION_HEAD = (
     "moves lack longer-term backing and reverse faster, so the wider, "
     "give-it-room stop that's appropriate for a structurally-backed trend "
     "would just absorb a bigger loss before the read on it changes.\n\n"
+    "SHOW THE STOP/TARGET ARITHMETIC ONCE, THEN REUSE IT — never "
+    "recompute or restate it a second time. A real, recurring, previously"
+    "-caught failure mode: computing a stop/target distance correctly "
+    "here, then re-deriving (or misremembering) a DIFFERENT, "
+    "contradicting number for the same instrument later in the same "
+    "response (in Outlook & Triggers to Revisit, or in the Pending "
+    "Setups section below) — e.g. stating an instrument's ATR as both "
+    "1.26% of price in one paragraph and 0.019% in another, or "
+    "asserting a stop is '20 pips away' when the actual entry and stop "
+    "prices you wrote down are 30 pips apart. To prevent this: (1) do "
+    "the arithmetic explicitly, in the instrument's own price units, "
+    "not just as an isolated percentage — state the ATR value, multiply "
+    "it by your chosen multiple to get a distance in real price units "
+    "(dollars, or the quote currency's own smallest unit for an FX "
+    "pair), then ADD or SUBTRACT that distance from the entry price to "
+    "get the actual stop/target price, so the price you write down is "
+    "arithmetically derived, not independently guessed; (2) for an FX "
+    "pair, the pip distance is `|entry price - stop price| / pip size` "
+    "— derive it from the two actual prices you just chose, never state "
+    "a pip count that doesn't match them; (3) once you've computed an "
+    "instrument's entry/stop/target here, that exact same instrument's "
+    "entry/stop/target anywhere ELSE in this response — the Outlook & "
+    "Triggers to Revisit prose, and the Pending Setups JSON block if "
+    "this instrument appears there — MUST reuse these same numbers "
+    "verbatim, never a re-derived or rounded-differently second version. "
+    "If a later section only has room for a summary, summarize the "
+    "CONCLUSION (the price levels), not the arithmetic that produced "
+    "it, and copy the numbers across exactly.\n\n"
     "DEBATE THE POSITION SIZE PER INSTRUMENT, don't spread capital "
     "evenly or apply one flat % across the mix. Weigh, explicitly, per "
     "instrument: (1) conviction strength — how well-supported is this "
@@ -863,6 +895,15 @@ _INSTRUCTION_TAIL = (
     "Idle-cash deployment triggers (with their required time-based "
     "fallback, checklist item e) and what would change this view going "
     "forward.\n"
+    "## Pending Setups\n"
+    "For each specific, not-yet-triggered setup worth watching for "
+    "before the next mega analysis (if any — this section and its "
+    "trailing JSON array, described below, are entirely optional and "
+    "should be omitted together when there's nothing worth flagging), a "
+    "short prose paragraph per setup: the symbol, direction, the exact "
+    "trigger condition, and why it's worth watching for. This is the "
+    "human-readable form of the machine-readable Pending Setups JSON "
+    "array required below — the two must describe the same setups.\n"
     "\n"
     "Throughout, write in ONE confident, single-voice analyst register — "
     "never reference the multi-stage or multi-model process that "
@@ -876,9 +917,13 @@ _INSTRUCTION_TAIL = (
     "\n\n"
     "Write all of your reasoning and explanation as plain prose/markdown "
     "using the section headers specified above — do not put any of it "
-    "inside a fenced code block. The ONLY fenced code block in your "
-    "entire response must be a single one at the very end (after the "
-    "'Recommended Allocation' section), exactly like this (replace the "
+    "inside a fenced code block. Exactly two fenced code blocks are "
+    "permitted in your entire response, both at the very end (after "
+    "every prose section above, including 'Pending Setups') and in this "
+    "order, with no other fenced blocks anywhere else: first the "
+    "allocation object described immediately below; then — only if you "
+    "wrote a '## Pending Setups' section above — a second block. The "
+    "first, the allocation block, must look exactly like this (replace the "
     "example values with your actual final numbers, one key per "
     "instrument symbol traded above plus one \"CASH\" key, pct values "
     "summing to 100, no comments or extra text inside the block). Every "
@@ -927,6 +972,47 @@ _INSTRUCTION_TAIL = (
     '{"EXAMPLE_LONG": {"side": "buy", "pct": 1.5, "price": 82.50, "stop_loss": 78.00, "take_profit": 94.00}, '
     '"EXAMPLE_SHORT": {"side": "sell", "pct": 1.5, "price": 145.00, "stop_loss": 149.50, "take_profit": 133.00}, '
     '"CASH": 97.0}\n'
+    "```"
+    "\n\n"
+    "If — and only if — you wrote a '## Pending Setups' section above "
+    "(see its own description), add a second fenced block directly "
+    "after the allocation block, containing a JSON array "
+    "(leave it empty — [] — if there is nothing worth flagging; do not "
+    "invent a setup just to fill this section) of objects, each with: "
+    "\"symbol\" (must NOT be a symbol you already gave a nonzero \"pct\" "
+    "to in the allocation block above — a symbol is either feasible now "
+    "(goes in the allocation block) or conditional (goes here), never "
+    "both at once, and never repeated within this array either), "
+    "\"side\" (\"buy\"/\"sell\", required — this is always a fresh idea, "
+    "not a currently-held position with a direction to infer from "
+    "context), \"pct\" (same meaning as in the allocation block: % of "
+    "equity you'd risk if it triggers and the stop is hit), "
+    "\"trigger_condition\" (a SPECIFIC, mechanically-checkable "
+    "description — an exact price level plus an indicator threshold and "
+    "the timeframe it's read on, e.g. \"H1 closes above 1.0950 with "
+    "RSI(14) below 35 turning up, and H4 trend_intact remains true\" — a "
+    "separate automated process re-evaluates this hourly against fresh "
+    "live technicals until it either triggers or the next mega analysis "
+    "supersedes it, so vague language like \"if it looks strong\" cannot "
+    "be mechanically checked and must not be used), \"price\", "
+    "\"stop_loss\", and \"take_profit\" (your best estimate of these at "
+    "the moment the trigger condition is expected to be met — same real "
+    "ATR/reward:risk grounding as the allocation block's own fields — "
+    "and if you already worked out this exact instrument's stop/target "
+    "in your DEBATE THE STOP AND TARGET reasoning or your Outlook & "
+    "Triggers to Revisit prose above, these three numbers MUST be "
+    "copied from there verbatim, not recomputed independently here — "
+    "see that section's own \"SHOW THE STOP/TARGET ARITHMETIC ONCE\" "
+    "rule for why restating it a second time is exactly how this has "
+    "produced self-contradicting numbers before), "
+    "and \"reason\" (why this is worth watching for, one or two "
+    "sentences):\n"
+    "```json\n"
+    '[{"symbol": "EXAMPLE_WATCH", "side": "buy", "pct": 1.0, '
+    '"trigger_condition": "H1 closes above 2000.00 with RSI(14) below '
+    '35 turning up, and H4 trend_intact remains true", "price": 2000.00, '
+    '"stop_loss": 1980.00, "take_profit": 2050.00, "reason": "Pullback '
+    'into a well-tested H4 support zone within an intact uptrend."}]\n'
     "```"
 )
 
@@ -1099,6 +1185,26 @@ AUDIT_INSTRUCTION = (
     "basing this on.\n"
     "4. A CONTRADICTED score is a real, concrete flaw — treat it with "
     "the same weight as a math or compliance-headroom error.\n"
+    "\n"
+    "If the draft includes a 'Pending Setups' section and its trailing "
+    "JSON array, give those the same real-numbers scrutiny as the "
+    "allocation block, PLUS one check specific to this section: for "
+    "each entry, actually RECOMPUTE the stop distance (|price - "
+    "stop_loss|), the reward distance (|take_profit - price|), and the "
+    "gross R:R (reward/risk) directly from that entry's own three JSON "
+    "numbers — a real, recurring failure mode caught before is the "
+    "prose claiming one R:R (or one ATR%, or one pip count) while the "
+    "JSON's own price/stop_loss/take_profit numbers imply a different "
+    "one (e.g. a stop 30 pips from entry labeled '20 pips', or an ATR-"
+    "based distance computed correctly in prose but a different, "
+    "uncorrected price written into the JSON). Flag ANY mismatch "
+    "between the prose's claimed numbers and what the JSON's own three "
+    "fields actually compute as a required-fix arithmetic error, not a "
+    "stylistic note — same weight as a compliance-headroom error. Also "
+    "check that each trigger_condition is specific and mechanically "
+    "checkable (a real price level plus an indicator threshold and "
+    "timeframe), not vague language an automated hourly check couldn't "
+    "evaluate.\n"
     "\n"
     "Produce a structured audit report — agreements, flaws, gaps, the "
     "backtest scorecard from above, and specific suggested improvements "
@@ -2062,6 +2168,105 @@ def _fetch_current_ftmo_price(symbol: str) -> float | None:
     return float(history["Close"].iloc[-1])
 
 
+def read_latest_suggestion() -> dict:
+    """Best-effort read of the FTMO pipeline's own derived, machine-
+    readable artifact (see config.MEGA_ANALYSIS_LATEST_SUGGESTION_FILE's
+    own comment) — `{}` on anything missing/unreadable, same safe-
+    default convention as read_state/read_progress. The sole consumer
+    (ai.copilot_execution) treats an empty dict as "nothing to check
+    yet," never as an error.
+
+    Despite the "MEGA_ANALYSIS" name (kept for backward compatibility
+    with the existing config constant and file on disk — renaming would
+    just churn every deployed instance for no behavioral gain), this is
+    written by ANY successful suggest_ftmo_portfolio() call now, not
+    only the scheduled mega session — see that function's own docstring
+    for why: a real bug found live, the manual "Suggest Portfolio Mix"
+    button and the scheduled run were built as two separate mechanisms
+    when they should always have been the same one, differing only in
+    what triggers them."""
+    path = Path(config.MEGA_ANALYSIS_LATEST_SUGGESTION_FILE)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_latest_suggestion(final_answer: str) -> None:
+    """Parses this FTMO suggestion's own final answer (the exact same
+    text the .md session record already embeds) into real JSON, so
+    Copilot's execution job never has to guess which saved .md record is
+    the relevant one — both a manual click and a scheduled run land in
+    the same FTMO_RECORDS_DIR today, indistinguishably. Called
+    unconditionally from suggest_ftmo_portfolio() on every real success,
+    regardless of caller — see that function's own docstring.
+
+    On a parse failure (a malformed response — rare, but possible), logs
+    a warning and leaves whatever was written by the PRIOR successful
+    call in place rather than overwriting it with nothing — a stale-but-
+    valid suggestion is safer for the execution job to keep reading than
+    an empty one, and this must never wipe out a still-valid Pending
+    Setups list.
+
+    Written atomically (temp file + os.replace) since — unlike a purely
+    cosmetic progress file — this file is read by a SEPARATE OS process
+    (copilot_execution_job.py) on its own independent poll cycle and
+    directly drives real order placement; a torn read from a non-atomic
+    write is a real, if narrow, possibility worth closing off given what
+    depends on this file being well-formed."""
+    allocation = parse_final_allocation(final_answer, require_side=True)
+    if allocation is None:
+        logger.warning(
+            "Could not parse this FTMO suggestion's own allocation block "
+            "— leaving the prior latest-suggestion file untouched."
+        )
+        return
+    immediate_symbols = frozenset(allocation.keys())
+    pending_setups = parse_pending_setups(final_answer, immediate_symbols=immediate_symbols)
+    if pending_setups is None:
+        logger.warning(
+            "Could not parse this FTMO suggestion's own Pending Setups "
+            "block — leaving the prior latest-suggestion file untouched."
+        )
+        return
+
+    payload = {
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "immediate_allocation": {
+            symbol: {
+                "pct": entry.pct,
+                "price": entry.price,
+                "stop_loss": entry.stop_loss,
+                "take_profit": entry.take_profit,
+                "side": entry.side,
+            }
+            for symbol, entry in allocation.items()
+        },
+        "pending_setups": [
+            {
+                "symbol": s.symbol,
+                "side": s.side,
+                "pct": s.pct,
+                "trigger_condition": s.trigger_condition,
+                "price": s.price,
+                "stop_loss": s.stop_loss,
+                "take_profit": s.take_profit,
+                "reason": s.reason,
+            }
+            for s in pending_setups
+        ],
+    }
+    path = Path(config.MEGA_ANALYSIS_LATEST_SUGGESTION_FILE)
+    try:
+        tmp_path = path.with_name(path.name + ".tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2))
+        os.replace(tmp_path, path)
+    except OSError as e:
+        logger.warning("Could not write latest-suggestion file %s: %s", path, e)
+
+
 def suggest_ftmo_portfolio(
     summary: str,
     timeout: int | None = None,
@@ -2070,13 +2275,39 @@ def suggest_ftmo_portfolio(
     on_audit_progress: Callable[[str], None] | None = None,
     model: str | None = None,
     save_record: bool = False,
+    include_copilot: bool = False,
 ) -> str:
     """Mirrors ai.portfolio_suggest.suggest_portfolio's three-stage draft/
     audit/revise flow exactly, but with FTMO-appropriate instructions and
     audit checklist, and its own records directory
     (config.FTMO_RECORDS_DIR) so FTMO's daily-loss/trailing-max-loss/
     Best-Day-Rule audit lessons never mix with PMEX's or PSX's — the two
-    other markets' failure modes don't meaningfully transfer here."""
+    other markets' failure modes don't meaningfully transfer here.
+
+    `include_copilot` defaults to False — direct user request: Copilot
+    has a separate, dedicated role for FTMO now (the hourly clerk/
+    executioner, see ai/copilot_execution.py) and must not also
+    double as an FTMO auditor, whether this is called from the manual
+    "Suggest Portfolio Mix" button (app.py) or the unattended scheduled
+    run (ai.mega_analysis.run_mega_analysis) — an earlier fix only
+    scoped this to the scheduled path, which was too narrow; both FTMO
+    call sites now agree. This is FTMO-specific: PMEX's own
+    ai.portfolio_suggest.suggest_portfolio and PSX's own suggestion
+    pipeline are untouched and still include Copilot in their audit pool
+    by default via build_audit_block's own (unchanged) default of True
+    — only FTMO's relationship with Copilot has changed.
+
+    On any genuine (non-CLI-failure) result, ALSO parses it into the
+    derived MEGA_ANALYSIS_LATEST_SUGGESTION_FILE artifact (see
+    _write_latest_suggestion) — the sole source of truth
+    ai.copilot_execution's clerk reads to know what's feasible right now
+    vs. worth watching for until the next FTMO suggestion. Deliberately
+    unconditional on the caller: a real design bug found live had this
+    write happening only inside ai.mega_analysis.run_mega_analysis, so
+    the manual "Suggest Portfolio Mix" button's own successful runs
+    never armed Copilot at all, contradicting the user's own explicit
+    intent that manual and scheduled runs differ only in what triggers
+    them, never in what they produce or feed downstream."""
     timeout = config.PORTFOLIO_SUGGESTION_TIMEOUT_SECONDS if timeout is None else timeout
     revision_timeout = (
         config.PORTFOLIO_REVISION_TIMEOUT_SECONDS if revision_timeout is None else revision_timeout
@@ -2120,6 +2351,7 @@ def suggest_ftmo_portfolio(
         on_progress=on_audit_progress,
         audit_instruction=AUDIT_INSTRUCTION,
         past_lessons=past_lessons,
+        include_copilot=include_copilot,
     )
     _notify(
         "Audit received — Claude is revising its suggestion..."
@@ -2179,5 +2411,8 @@ def suggest_ftmo_portfolio(
             ),
             records_dir=records_dir,
         )
+
+    if not (final_answer == CLI_MISSING_MESSAGE or final_answer.startswith(CLI_FAILED_PREFIX)):
+        _write_latest_suggestion(final_answer)
 
     return final_answer

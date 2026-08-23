@@ -333,3 +333,72 @@ def compute_rebalance_plan(
             )
 
     return plans
+
+
+def compute_aggregate_heat_pct(allocation: dict[str, AllocationEntry]) -> float:
+    """Total % of equity at risk across a whole target allocation if
+    every stop were hit at once — extracted from app.py's own
+    _compute_aggregate_heat_pct (originally written for the capital-at-
+    risk chart and the FTMO pre-execution heat gate) so the unattended
+    hourly Copilot execution job can compute the identical number for
+    its own merged target mix rather than a second, possibly-diverging
+    calculation. Only meaningful for real leveraged MT5 instruments
+    (pct_is_risk=True territory) — sums entry.pct directly, since that
+    already equals each position's real % of equity at risk to its
+    stop. A CASH entry, or any entry missing a price/stop_loss (nothing
+    concrete enough yet to size or risk), contributes zero."""
+    total = 0.0
+    for symbol, entry in allocation.items():
+        if symbol == "CASH" or entry.price is None or entry.stop_loss is None:
+            continue
+        total += entry.pct
+    return total
+
+
+def check_execution_safety_gates(
+    is_demo: bool,
+    allow_live_execution: bool,
+    trading_permitted: bool,
+    trading_blocked_reason: str = "",
+    ftmo_heat_blocked: bool = False,
+    ftmo_heat_blocked_reason: str = "",
+) -> tuple[bool, str]:
+    """The three real-money safety gates that must pass before ANY
+    PlannedOrder from compute_rebalance_plan is actually sent to MT5 —
+    extracted from app.py's "Confirm and Execute" dialog (where it first
+    lived, inline) so this exact logic can never drift between two
+    independently-maintained copies once a second caller (the unattended
+    hourly Copilot execution job) needs it too. Pure — no Streamlit, no
+    MT5 imports — callers own fetching the live inputs and rendering any
+    resulting message.
+
+    Same priority order as the original inline version, checked in this
+    exact sequence (first failure wins, matching what a human reviewing
+    the dialog would see first):
+    1. `is_demo or allow_live_execution` — refuses to run at all against
+       what looks like a real account unless explicitly overridden (see
+       config.ALLOW_LIVE_EXECUTION's own docstring for why this defaults
+       to blocked).
+    2. `ftmo_heat_blocked` — FTMO-only: would this plan's aggregate heat
+       breach the account's real remaining daily-loss headroom (see
+       risk/ftmo_rules.py::would_breach_daily_loss_headroom). Always
+       False for PMEX, which has no daily-loss rule to check against.
+    3. `trading_permitted` — real MT5-level permission (the terminal's
+       own AutoTrading toggle / account-level trade_allowed), distinct
+       from the two policy checks above.
+
+    Returns (True, "") if every gate passes; otherwise (False, reason)
+    with the reason for whichever gate failed first — the same messages
+    the dialog has always shown, just computed in one place now."""
+    if not (is_demo or allow_live_execution):
+        return False, (
+            "Execution blocked: the connected account's server doesn't "
+            "look like a demo account and ALLOW_LIVE_EXECUTION isn't "
+            "set. Refusing to place real orders on what may be a live "
+            "account."
+        )
+    if ftmo_heat_blocked:
+        return False, ftmo_heat_blocked_reason
+    if not trading_permitted:
+        return False, f"Execution blocked: {trading_blocked_reason}"
+    return True, ""

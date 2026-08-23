@@ -58,6 +58,35 @@ def open_position(
     )
 
 
+def cancel_pending_order(ticket: int) -> OrderResult:
+    """Cancels a still-unfilled pending order (the GTC limit order
+    open_position places — see its own docstring). Nothing in this file
+    could do this before: open_position/close_position cover placing an
+    entry and exiting a filled position, but a pending order that never
+    fills sits on the account indefinitely (MT5 tracks pending orders and
+    filled positions as separate concepts — get_pending_orders() vs
+    get_open_positions()), and this project's own automated setups need
+    a way to withdraw one that's been superseded rather than leaving it
+    to orphan. Same non-raising-on-rejection / raising-on-no-connection
+    contract as open_position/close_position."""
+    import MetaTrader5 as mt5
+
+    request = {"action": mt5.TRADE_ACTION_REMOVE, "order": ticket}
+
+    result = mt5.order_send(request)
+    if result is None:
+        error = mt5.last_error()
+        raise MT5ConnectionError(f"order_send returned nothing for order {ticket} ({error}).")
+
+    success = result.retcode == mt5.TRADE_RETCODE_DONE
+    return OrderResult(
+        success=success,
+        retcode=result.retcode,
+        comment=result.comment,
+        ticket=ticket if success else None,
+    )
+
+
 def close_position(position: Position, volume: float | None = None) -> OrderResult:
     """Closes (fully, or partially if `volume` is given) an existing
     position via an immediate market deal referencing its ticket. Exits
