@@ -334,12 +334,18 @@ def test_compute_chart_structure_only_scans_for_swing_points_once():
 def test_compute_chart_structure_still_produces_correct_results_after_sharing_swing_points():
     # The refactor to share one swing-point scan must produce IDENTICAL
     # results to calling each function independently with its own scan.
+    # compute_chart_structure's own `patterns` also concatenates
+    # candlestick patterns (analysis/candlestick_patterns.py, added
+    # 2026-08-26) — included here via its own independent call too, not
+    # just the swing-based detect_chart_patterns.
+    from analysis.candlestick_patterns import detect_candlestick_patterns
+
     history = _make_history(_zigzag([105, 100, 120, 110, 150, 133], 8))
     shared = compute_chart_structure(history)
     independent_fib = compute_fibonacci_levels(history)
     independent_sr = compute_sr_levels(history)
     independent_trendlines = compute_trendlines(history)
-    independent_patterns = detect_chart_patterns(history)
+    independent_patterns = detect_chart_patterns(history) + detect_candlestick_patterns(history)
 
     assert shared.fibonacci == independent_fib
     assert shared.sr_levels == independent_sr

@@ -1,11 +1,15 @@
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import pytest
 import requests
 
 from data.macro_source import (
+    _leg_vs_12m_ma,
+    _match_pring_stage,
     fetch_country_indicators,
     fetch_fx_rate_to_usd,
+    fetch_macro_cycle_diagnostic,
     fetch_market_indicators,
     fetch_pakistan_rates,
 )
@@ -205,3 +209,175 @@ def test_fetch_pakistan_rates_none_on_request_failure(mock_get):
 def test_fetch_pakistan_rates_none_when_no_tables_found(mock_get):
     mock_get.return_value = _mock_sbp_response(text="<html><body>nothing here</body></html>")
     assert fetch_pakistan_rates() is None
+
+
+# --- _leg_vs_12m_ma: pure computation, no network ---
+
+
+def _monthly_series(values: list[float]) -> pd.Series:
+    dates = pd.date_range("2025-01-01", periods=len(values), freq="MS")
+    return pd.Series(values, index=dates)
+
+
+def test_leg_vs_12m_ma_detects_current_above_trailing_average():
+    # 13 flat months at 100, then a 14th (current) at 120 -- the trailing
+    # 12 months used are indices [1:13] (index 0 is discarded), all 100.
+    values = [100.0] * 13 + [120.0]
+    leg = _leg_vs_12m_ma("Test", "TST", _monthly_series(values))
+    assert leg.current == 120.0
+    assert leg.moving_avg_12m == pytest.approx(100.0)
+    assert leg.above_ma is True
+
+
+def test_leg_vs_12m_ma_detects_current_below_trailing_average():
+    values = [100.0] * 13 + [80.0]
+    leg = _leg_vs_12m_ma("Test", "TST", _monthly_series(values))
+    assert leg.current == 80.0
+    assert leg.moving_avg_12m == pytest.approx(100.0)
+    assert leg.above_ma is False
+
+
+def test_leg_vs_12m_ma_none_when_fewer_than_13_months():
+    values = [100.0] * 6
+    leg = _leg_vs_12m_ma("Test", "TST", _monthly_series(values))
+    assert leg.current == 100.0  # still populated
+    assert leg.moving_avg_12m is None
+    assert leg.above_ma is None
+
+
+def test_leg_vs_12m_ma_none_when_fetch_failed():
+    leg = _leg_vs_12m_ma("Test", "TST", None)
+    assert leg.current is None
+    assert leg.moving_avg_12m is None
+    assert leg.above_ma is None
+
+
+# --- _match_pring_stage: pure stage-matching, no network ---
+
+
+@pytest.mark.parametrize(
+    "bonds_up,stocks_up,commodities_up,expected_stage",
+    [
+        (True, False, False, "Stage I"),
+        (True, True, False, "Stage II"),
+        (True, True, True, "Stage III"),
+        (False, True, True, "Stage IV"),
+        (False, False, True, "Stage V"),
+        (False, False, False, "Stage VI"),
+    ],
+)
+def test_match_pring_stage_canonical_combinations(bonds_up, stocks_up, commodities_up, expected_stage):
+    stage_label, stage_description, note = _match_pring_stage(bonds_up, stocks_up, commodities_up)
+    assert stage_label == expected_stage
+    assert stage_description  # non-empty
+    assert "little forecasting value" in note
+
+
+def test_match_pring_stage_mixed_when_combination_not_canonical():
+    # (bonds_up=False, stocks_up=True, commodities_up=False) is one of
+    # the 2 non-canonical combinations -- a real, expected outcome.
+    stage_label, stage_description, note = _match_pring_stage(False, True, False)
+    assert stage_label is None
+    assert stage_description is None
+    assert "mixed" in note.lower() or "ambiguous" in note.lower()
+
+
+def test_match_pring_stage_none_when_bonds_leg_missing():
+    stage_label, _, note = _match_pring_stage(None, True, True)
+    assert stage_label is None
+    assert "yield" in note.lower()
+
+
+def test_match_pring_stage_none_when_equity_or_commodity_missing():
+    stage_label, _, note = _match_pring_stage(True, None, True)
+    assert stage_label is None
+    assert "equity or commodity" in note.lower()
+
+
+# --- fetch_macro_cycle_diagnostic: mocked end-to-end ---
+
+
+def _fake_cycle_history(values: list[float]) -> pd.DataFrame:
+    dates = pd.date_range("2025-01-01", periods=len(values), freq="MS")
+    return pd.DataFrame({"Close": values}, index=dates)
+
+
+def _cycle_ticker_side_effect(histories: dict[str, list[float] | None]):
+    def side_effect(symbol):
+        mock = MagicMock()
+        values = histories.get(symbol)
+        mock.history.return_value = _fake_cycle_history(values) if values is not None else pd.DataFrame()
+        return mock
+
+    return side_effect
+
+
+@patch("yfinance.Ticker")
+def test_fetch_macro_cycle_diagnostic_computes_a_clean_stage_match(mock_ticker_cls):
+    # Yields falling (below their own MA) -> bonds_up=True; equities and
+    # commodities rising (above their own MA) -> Stage III.
+    flat13 = [100.0] * 13
+    mock_ticker_cls.side_effect = _cycle_ticker_side_effect({
+        "^IRX": flat13 + [80.0],
+        "^TNX": flat13 + [80.0],
+        "^GSPC": flat13 + [120.0],
+        "DBC": flat13 + [120.0],
+        "DX-Y.NYB": flat13 + [105.0],
+    })
+    diagnostic = fetch_macro_cycle_diagnostic()
+    assert diagnostic.stage_label == "Stage III"
+    assert "little forecasting value" in diagnostic.note
+
+
+@patch("yfinance.Ticker")
+def test_fetch_macro_cycle_diagnostic_tolerates_a_missing_ticker(mock_ticker_cls):
+    flat13 = [100.0] * 13
+    mock_ticker_cls.side_effect = _cycle_ticker_side_effect({
+        "^IRX": flat13 + [80.0],
+        "^TNX": flat13 + [80.0],
+        "^GSPC": flat13 + [120.0],
+        "DBC": None,  # missing
+        "DX-Y.NYB": flat13 + [105.0],
+    })
+    diagnostic = fetch_macro_cycle_diagnostic()
+    assert diagnostic.commodity_index.above_ma is None
+    assert diagnostic.yield_3m.above_ma is not None  # others still populate
+    assert diagnostic.stage_label is None
+    assert "equity or commodity" in diagnostic.note.lower()
+
+
+@patch("yfinance.Ticker")
+def test_fetch_macro_cycle_diagnostic_reports_curve_twist_when_yields_disagree(mock_ticker_cls):
+    flat13 = [100.0] * 13
+    mock_ticker_cls.side_effect = _cycle_ticker_side_effect({
+        "^IRX": flat13 + [120.0],  # above its MA
+        "^TNX": flat13 + [80.0],   # below its MA -- disagreement
+        "^GSPC": flat13 + [120.0],
+        "DBC": flat13 + [120.0],
+        "DX-Y.NYB": flat13 + [105.0],
+    })
+    diagnostic = fetch_macro_cycle_diagnostic()
+    assert diagnostic.stage_label is None
+    assert "twist" in diagnostic.note.lower()
+
+
+@patch("yfinance.Ticker")
+def test_fetch_macro_cycle_diagnostic_dollar_index_not_used_in_stage_matching(mock_ticker_cls):
+    flat13 = [100.0] * 13
+
+    def build(dollar_last):
+        return _cycle_ticker_side_effect({
+            "^IRX": flat13 + [80.0],
+            "^TNX": flat13 + [80.0],
+            "^GSPC": flat13 + [120.0],
+            "DBC": flat13 + [120.0],
+            "DX-Y.NYB": flat13 + [dollar_last],
+        })
+
+    mock_ticker_cls.side_effect = build(50.0)
+    stage_a = fetch_macro_cycle_diagnostic().stage_label
+
+    mock_ticker_cls.side_effect = build(200.0)
+    stage_b = fetch_macro_cycle_diagnostic().stage_label
+
+    assert stage_a == stage_b == "Stage III"

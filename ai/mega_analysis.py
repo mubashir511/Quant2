@@ -13,7 +13,7 @@ from ai.ftmo_suggest import (
     read_latest_suggestion,
     suggest_ftmo_portfolio,
 )
-from data.mt5_source import connect, get_account_summary, get_market_watch, get_open_positions
+from data.mt5_source import connect, get_account_summary, get_market_watch, get_open_positions, get_pending_orders
 from utils import run_with_timeout
 
 # Re-exported so existing callers (ai/copilot_execution.py, app.py) that
@@ -119,8 +119,33 @@ def read_progress() -> dict:
     status (see config.MEGA_ANALYSIS_PROGRESS_FILE's own comment for why
     this is a separate file from read_state's completed-attempt marker)
     — `{}` on anything missing/unreadable, same safe-default convention
-    as read_state, since the only consumer (app.py's countdown widget)
-    already treats an empty dict as "nothing live to show" correctly."""
+    as read_state, since every consumer already treats an empty dict as
+    "nothing live to show" correctly.
+
+    Shape as of 2026-08-27: `{"steps": [str, ...], "current_activity":
+    str | None, "updated_utc": str}` — two different kinds of status,
+    kept separate because they behave completely differently:
+
+    `steps` is a growing list of genuinely discrete, one-time
+    milestones (connecting, analyzing instrument N/18, starting the
+    audit pool...) — bounded to a few dozen entries per run, so
+    appending is fine (this is the 2026-08-25 fix: the OLD single-
+    `"message"` shape made the display flicker, one line replacing the
+    last, instead of reading as a steady step-by-step log).
+
+    `current_activity` is a single, frequently-OVERWRITTEN slot for
+    whatever's happening RIGHT NOW that updates far more often than
+    once per milestone — namely the audit-model pool's own per-second,
+    per-model retry/countdown status. A real run confirmed live
+    2026-08-27: appending that instead of overwriting it ballooned the
+    old single `messages` list to 246+ near-duplicate entries within
+    minutes (the manual "Suggest Portfolio Mix" button never had this
+    problem — it already renders this exact same on_audit_progress
+    callback into a single `st.empty()` placeholder it overwrites, not
+    an accumulating log; this mirrors that for the file-backed
+    unattended path). `_reset_progress` clears both at the start of
+    each new run so a stale prior run's status never bleeds into a
+    fresh one's display."""
     path = Path(config.MEGA_ANALYSIS_PROGRESS_FILE)
     if not path.exists():
         return {}
@@ -130,12 +155,118 @@ def read_progress() -> dict:
         return {}
 
 
-def _write_progress(message: str) -> None:
+def mega_session_is_live(progress: dict, state: dict) -> bool:
+    """True iff `progress` (from read_progress()) reflects a mega
+    session that's still genuinely in flight, not a stale leftover from
+    a run that already finished or crashed. Shared by app.py's own
+    live-progress display and ai.copilot_execution's pre-execution
+    check (previously two independent copies of this exact heuristic —
+    consolidated here 2026-08-27 after fixing a real bug in both at
+    once: see below).
+
+    Two signals, both required:
+
+    1. `progress` must be NEWER than the last COMPLETED attempt
+       recorded in `state` — this is what correctly detects "still
+       running" even during a long silent stretch with zero new writes
+       (e.g. Claude's own multi-minute web-research call), since
+       `state` only advances once the run actually finishes.
+    2. A generous absolute age ceiling, so a genuinely crashed/orphaned
+       process that never got to write a real completion state at all
+       doesn't read as "live" forever. Set to _RUN_TIMEOUT_SECONDS —
+       the same hard ceiling the scheduled run itself is bounded by, so
+       this can never time out a run that's still legitimately within
+       its own allowed budget.
+
+    Confirmed too short before at a flat 300 seconds (5 minutes): a
+    real run's single "Claude is researching..." step and its
+    audit-pool phase can each individually run longer than that with
+    no new progress write, which wrongly hid the whole live-progress
+    UI mid-run (found live 2026-08-27) — and, in ai.copilot_execution's
+    copy, could in principle have let the execution-check job act
+    mid-run instead of correctly waiting."""
+    progress_ts = progress.get("updated_utc")
+    if not progress_ts:
+        return False
+    try:
+        progress_dt = datetime.fromisoformat(progress_ts)
+    except ValueError:
+        return False
+    age_seconds = (datetime.now(timezone.utc) - progress_dt).total_seconds()
+    last_attempt = state.get("last_attempt_utc")
+    newer_than_last_attempt = last_attempt is None or progress_ts > last_attempt
+    return 0 <= age_seconds < _RUN_TIMEOUT_SECONDS and newer_than_last_attempt
+
+
+def _reset_progress() -> None:
+    """Clears the live-progress log at the start of a new run — called
+    once, before the first _notify, so app.py's live-progress display
+    never shows a leftover step (or leftover current_activity) from the
+    PRIOR run alongside the new one's."""
+    payload = {"steps": [], "current_activity": None, "updated_utc": datetime.now(timezone.utc).isoformat()}
+    try:
+        Path(config.MEGA_ANALYSIS_PROGRESS_FILE).write_text(json.dumps(payload))
+    except OSError as e:
+        logger.warning("Could not reset progress file %s: %s", config.MEGA_ANALYSIS_PROGRESS_FILE, e)
+
+
+def _write_step(message: str) -> None:
     """Best-effort — a failure to write this purely-cosmetic live-status
     file must never break the real analysis it's reporting on, so unlike
     _write_state (whose job IS to reliably record the outcome), this
-    swallows its own I/O errors rather than letting them propagate."""
-    payload = {"message": message, "updated_utc": datetime.now(timezone.utc).isoformat()}
+    swallows its own I/O errors rather than letting them propagate.
+
+    Appends to the run's own `steps` log (see read_progress's own
+    docstring for the shape/rationale) — for genuinely discrete,
+    one-time milestones only; a status that repeats/updates many times
+    a minute belongs in _write_current_activity instead, not here.
+
+    Also CLEARS `current_activity` back to None. A discrete milestone
+    means whatever noisy sub-status was live a moment ago (the
+    instrument-scan's "N/18 — SYMBOL", the audit pool's per-model
+    countdown) has now genuinely concluded — without this, its last
+    value would linger and keep rendering as "live" even after the run
+    has moved on to a completely different phase (a real bug caught
+    while wiring up the instrument-scan's own current_activity use,
+    2026-08-27, before it ever shipped).
+
+    Read-modify-write against whatever's on disk right now (falling
+    back to an empty list if the file is missing/corrupt) rather than
+    keeping the list in memory, since this, _write_current_activity,
+    and _reset_progress are the only writers and nothing else needs to
+    stay in sync with them across the single-process pipeline that
+    calls this."""
+    prior = read_progress()
+    steps = prior.get("steps", [])
+    if not isinstance(steps, list):
+        steps = []
+    steps.append(message)
+    payload = {
+        "steps": steps,
+        "current_activity": None,
+        "updated_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        Path(config.MEGA_ANALYSIS_PROGRESS_FILE).write_text(json.dumps(payload))
+    except OSError as e:
+        logger.warning("Could not write progress file %s: %s", config.MEGA_ANALYSIS_PROGRESS_FILE, e)
+
+
+def _write_current_activity(text: str) -> None:
+    """Best-effort, same swallow-I/O-errors convention as _write_step.
+
+    OVERWRITES the single `current_activity` slot rather than appending
+    — for high-frequency, self-superseding status only (right now: the
+    audit-model pool's own per-second, per-model retry/countdown text).
+    Appending this instead of overwriting it is exactly what ballooned
+    a real run's progress log to 246+ near-duplicate entries within
+    minutes (confirmed live 2026-08-27) — see read_progress's docstring."""
+    prior = read_progress()
+    payload = {
+        "steps": prior.get("steps", []),
+        "current_activity": text,
+        "updated_utc": datetime.now(timezone.utc).isoformat(),
+    }
     try:
         Path(config.MEGA_ANALYSIS_PROGRESS_FILE).write_text(json.dumps(payload))
     except OSError as e:
@@ -243,18 +374,22 @@ def run_mega_analysis(
     need to (and no longer does) trigger that separately.
 
     Every stage/audit-progress message is ALSO broadcast to
-    read_progress()'s own file (see _write_progress) regardless of
-    whether a caller supplied on_stage/on_audit_progress — direct user
-    request 2026-08-22: the unattended run should show the same live
-    step-by-step status the manual "Suggest Portfolio Mix" button
-    already shows, the only real difference being WHAT triggers it, not
-    whether it's visible while running. app.py's countdown widget is
-    what actually renders this; this function's own job is just to keep
-    the file honestly up to date."""
+    read_progress()'s own file (see _write_step/_write_current_activity)
+    regardless of whether a caller supplied on_stage/on_audit_progress —
+    direct user request 2026-08-22: the unattended run should show the
+    same live step-by-step status the manual "Suggest Portfolio Mix"
+    button already shows, the only real difference being WHAT triggers
+    it, not whether it's visible while running. app.py's live-progress
+    display is what actually renders this; this function's own job is
+    just to keep the file honestly up to date. Calls _reset_progress()
+    first, before anything else, so this run's own step log starts
+    empty rather than carrying over whatever the previous run last left
+    behind."""
+    _reset_progress()
 
     def _notify(message: str) -> None:
         logger.info(message)
-        _write_progress(message)
+        _write_step(message)
         if on_stage:
             on_stage(message)
 
@@ -269,11 +404,33 @@ def run_mega_analysis(
             "No instruments are visible in this FTMO account's MT5 Market Watch."
         )
     positions = get_open_positions()
+    pending_orders = get_pending_orders()
     status = fetch_ftmo_status(account)
 
+    def _notify_instrument_progress(message: str) -> None:
+        # Deliberately writes to current_activity, NOT a new step — one
+        # instrument finishing isn't independently worth a permanent
+        # line the way "Connecting..." or "Running Claude..." are; it's
+        # the same self-superseding-status category as the audit pool's
+        # own per-model countdown (see _notify_audit below), just at a
+        # calmer cadence. Direct user request 2026-08-27, after seeing a
+        # mock-up render each instrument as its own checkmarked line:
+        # "just use one message only dynamically update it 18 times...
+        # and also update the symbol names as well simultaneously" —
+        # one line updates in place through 1/18, 2/18, ... 18/18 with
+        # the current symbol named, instead of the log growing by one
+        # entry per instrument.
+        logger.info(message)
+        _write_current_activity(message)
+        if on_stage:
+            on_stage(message)
+
     _notify(f"Analyzing {len(assets)} instruments...")
-    analyses = analyze_ftmo_assets(assets, on_progress=_notify)
-    summary = build_ftmo_summary(account, assets, status, positions=positions, analyses=analyses)
+    analyses = analyze_ftmo_assets(assets, on_progress=_notify_instrument_progress)
+    _notify(f"Analyzed all {len(assets)} instruments.")
+    summary = build_ftmo_summary(
+        account, assets, status, positions=positions, analyses=analyses, pending_orders=pending_orders
+    )
 
     # config.MEGA_ANALYSIS_MODEL defaults to "sonnet" (the real, intended
     # production model) — overridable via the MEGA_ANALYSIS_MODEL env var
@@ -285,7 +442,7 @@ def run_mega_analysis(
 
     def _notify_audit(text: str) -> None:
         logger.info(text)
-        _write_progress(text)
+        _write_current_activity(text)
         if on_audit_progress:
             on_audit_progress(text)
 

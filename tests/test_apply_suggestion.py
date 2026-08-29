@@ -3,8 +3,8 @@ from datetime import datetime
 import pytest
 
 from ai.portfolio_suggest import AllocationEntry
-from data.mt5_source import AccountSummary, ContractSpec, MarketAsset, Position
-from risk.apply_suggestion import check_execution_safety_gates, compute_rebalance_plan
+from data.mt5_source import AccountSummary, ContractSpec, MarketAsset, PendingOrder, Position
+from risk.apply_suggestion import check_execution_safety_gates, compute_rebalance_plan, pct_for_target_lots
 
 ACCOUNT = AccountSummary(balance=100000.0, equity=100000.0, free_margin=90000.0, currency="USD")
 
@@ -20,15 +20,22 @@ def _get_spec_for(specs: dict):
     return lambda symbol: specs.get(symbol)
 
 
-def _position(symbol="GO10OZ", side="buy", volume=1.0, ticket=1):
+def _position(symbol="GO10OZ", side="buy", volume=1.0, ticket=1, sl=None, tp=None):
     return Position(
         symbol=symbol, volume=volume, side=side, price_open=2000.0,
-        price_current=2000.0, sl=None, profit=0.0, opened_at=datetime.now(), ticket=ticket,
+        price_current=2000.0, sl=sl, profit=0.0, opened_at=datetime.now(), ticket=ticket, tp=tp,
     )
 
 
 def _asset(symbol="GO10OZ", bid=1999.0, ask=2000.0):
     return MarketAsset(symbol=symbol, description=symbol, bid=bid, ask=ask)
+
+
+def _pending_order(symbol="GO10OZ", order_type="buy limit", volume=1.0, price_open=2000.0, sl=None, tp=None, ticket=501):
+    return PendingOrder(
+        symbol=symbol, volume=volume, order_type=order_type, price_open=price_open,
+        sl=sl, tp=tp, ticket=ticket,
+    )
 
 
 def test_opens_a_new_position_with_clamped_price_and_stop():
@@ -189,7 +196,10 @@ def test_held_symbol_missing_from_allocation_is_treated_as_close():
 
 
 def test_hold_when_already_at_target():
-    positions = [_position(volume=1.0, ticket=1)]
+    # sl matches the fresh target's own stop_loss exactly — otherwise
+    # this would now (correctly) resolve to "amend_position" instead,
+    # since the position's real stop no longer matches what's suggested.
+    positions = [_position(volume=1.0, ticket=1, sl=1900.0)]
     # stop 100 points away: 10% of 100k / (100 x 100) = 1 lot target,
     # matching the 1 lot already held.
     allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=2000.0, stop_loss=1900.0)}
@@ -367,7 +377,9 @@ def test_reduce_short_when_target_is_below_current_short_lots():
 
 
 def test_hold_short_when_already_at_target():
-    positions = [_position(side="sell", volume=2.0, ticket=1)]
+    # sl matches the fresh target's own stop_loss — see
+    # test_hold_when_already_at_target's own comment for why this matters now.
+    positions = [_position(side="sell", volume=2.0, ticket=1, sl=2049.0)]
     allocation = {"GO10OZ": AllocationEntry(side="sell", pct=10.0, price=1999.0, stop_loss=2049.0)}
     plan = compute_rebalance_plan(
         positions=positions, account=ACCOUNT, allocation=allocation,
@@ -643,3 +655,317 @@ def test_compute_aggregate_heat_pct_ignores_entries_missing_price_or_stop():
         "XAUUSD": AllocationEntry(pct=2.0, price=2000.0, stop_loss=None),
     }
     assert compute_aggregate_heat_pct(allocation) == 0.0
+
+
+# --- pending-order awareness (added 2026-08-23) ---
+
+
+def test_stale_pending_order_cancelled_when_target_pct_is_zero():
+    order = _pending_order(price_open=2000.0, sl=1900.0, ticket=777)
+    allocation = {"GO10OZ": AllocationEntry(pct=0.0)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+        pending_orders=[order],
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "cancel"
+    assert plan[0].pending_tickets_to_cancel == [777]
+
+
+def test_pending_order_held_when_target_matches_existing_terms_exactly():
+    order = _pending_order(price_open=2000.0, sl=1900.0, tp=None, volume=1.0, ticket=777)
+    allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=2000.0, stop_loss=1900.0)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+        pending_orders=[order],
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "hold"
+
+
+def test_pending_order_amended_when_price_changed():
+    order = _pending_order(price_open=1990.0, sl=1900.0, ticket=777)
+    allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=1995.0, stop_loss=1895.0)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+        pending_orders=[order],
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "amend_pending"
+    assert plan[0].pending_tickets_to_cancel == [777]
+    assert plan[0].price == 1995.0
+
+
+def test_pending_order_amended_when_stop_loss_changed_only():
+    order = _pending_order(price_open=2000.0, sl=1900.0, ticket=777)
+    allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=2000.0, stop_loss=1800.0)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0, volume_min=0.01, volume_step=0.01)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+        pending_orders=[order],
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "amend_pending"
+
+
+def test_pending_order_amended_when_side_flips_while_still_unfilled():
+    order = _pending_order(order_type="buy limit", price_open=2000.0, sl=1900.0, ticket=777)
+    allocation = {"GO10OZ": AllocationEntry(side="sell", pct=10.0, price=1999.0, stop_loss=2099.0)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(bid=1999.0, ask=2000.0)},
+        pending_orders=[order],
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "amend_pending"
+    assert plan[0].side == "sell"
+    assert plan[0].pending_tickets_to_cancel == [777]
+
+
+def test_multiple_resting_pending_orders_on_same_symbol_never_resolve_to_hold():
+    orders = [
+        _pending_order(price_open=2000.0, sl=1900.0, ticket=777),
+        _pending_order(price_open=2000.0, sl=1900.0, ticket=778),
+    ]
+    allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=2000.0, stop_loss=1900.0)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+        pending_orders=orders,
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "amend_pending"
+    assert set(plan[0].pending_tickets_to_cancel) == {777, 778}
+
+
+def test_amend_tolerance_pct_prevents_thrash_on_trivial_price_differences():
+    # price and stop_loss both shift by the same tiny +0.20 amount, so
+    # stop_distance (and therefore lot sizing) is completely unaffected --
+    # isolating this test to the tolerance check itself, not lot-size
+    # rounding drift from a changed stop distance.
+    order = _pending_order(price_open=2000.0, sl=1000.0, volume=1.0, ticket=777)
+    # A 0.01-0.02% difference on each -- well inside the default 0.05%
+    # amend_tolerance_pct.
+    allocation = {"GO10OZ": AllocationEntry(pct=100.0, price=2000.20, stop_loss=1000.20)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0, volume_min=0.01, volume_step=0.01)}),
+        market_prices={"GO10OZ": _asset(ask=2000.20)},
+        pending_orders=[order],
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "hold"
+
+
+def test_position_amend_when_stop_loss_changed_but_size_unchanged():
+    positions = [_position(volume=1.0, ticket=1, sl=1900.0, tp=None)]
+    # pct=5.0 (not 10.0) -- stop distance is now 50 (2000-1950), not the
+    # original 100, so pct must halve too to keep target_lots at the
+    # same 1.0 lot already held; otherwise this resolves to "increase"
+    # instead of testing the amend-in-place path.
+    allocation = {"GO10OZ": AllocationEntry(pct=5.0, price=2000.0, stop_loss=1950.0)}
+    plan = compute_rebalance_plan(
+        positions=positions, account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "amend_position"
+    assert plan[0].stop_loss == 1950.0
+    assert plan[0].take_profit is None
+    assert plan[0].position_tickets_to_amend == [1]
+
+
+def test_position_amend_when_take_profit_changed_but_size_unchanged():
+    positions = [_position(volume=1.0, ticket=1, sl=1900.0, tp=2100.0)]
+    allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=2000.0, stop_loss=1900.0, take_profit=2200.0)}
+    plan = compute_rebalance_plan(
+        positions=positions, account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "amend_position"
+    assert plan[0].stop_loss == 1900.0
+    assert plan[0].take_profit == 2200.0
+
+
+def test_position_amend_carries_forward_live_take_profit_when_entry_omits_it():
+    positions = [_position(volume=1.0, ticket=1, sl=1900.0, tp=2100.0)]
+    # take_profit omitted from the fresh entry entirely -- must not wipe
+    # the position's own already-live target to None. pct=5.0 keeps
+    # target_lots at the already-held 1.0 lot given the new stop distance
+    # (see test_position_amend_when_stop_loss_changed_but_size_unchanged).
+    allocation = {"GO10OZ": AllocationEntry(pct=5.0, price=2000.0, stop_loss=1950.0)}
+    plan = compute_rebalance_plan(
+        positions=positions, account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "amend_position"
+    assert plan[0].take_profit == 2100.0
+
+
+def test_position_amend_never_changes_volume_or_side():
+    positions = [_position(side="buy", volume=1.0, ticket=1, sl=1900.0)]
+    # pct=5.0 keeps target_lots at the already-held 1.0 lot -- see
+    # test_position_amend_when_stop_loss_changed_but_size_unchanged.
+    allocation = {"GO10OZ": AllocationEntry(side="buy", pct=5.0, price=2000.0, stop_loss=1950.0)}
+    plan = compute_rebalance_plan(
+        positions=positions, account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "amend_position"
+    assert plan[0].volume == 1.0
+    assert plan[0].side == "buy"
+
+
+def test_hold_still_fires_when_stop_and_target_genuinely_unchanged():
+    positions = [_position(volume=1.0, ticket=1, sl=1900.0, tp=2100.0)]
+    allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=2000.0, stop_loss=1900.0, take_profit=2100.0)}
+    plan = compute_rebalance_plan(
+        positions=positions, account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "hold"
+
+
+def test_stray_pending_order_cancelled_when_position_already_at_target_size():
+    positions = [_position(volume=1.0, ticket=1, sl=1900.0, tp=2100.0)]
+    stray = _pending_order(price_open=2000.0, sl=1900.0, ticket=999)
+    allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=2000.0, stop_loss=1900.0, take_profit=2100.0)}
+    plan = compute_rebalance_plan(
+        positions=positions, account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+        pending_orders=[stray],
+    )
+    assert len(plan) == 2
+    actions = {o.action for o in plan}
+    assert actions == {"hold", "cancel"}
+    cancel_order = next(o for o in plan if o.action == "cancel")
+    assert cancel_order.pending_tickets_to_cancel == [999]
+
+
+def test_pending_orders_symbol_without_allocation_entry_produces_no_planned_order():
+    # The critical safety-property regression: a symbol whose ONLY
+    # footprint is a resting pending order (no filled position, no
+    # allocation-block key -- exactly what a Pending-Setup-fired order
+    # looks like from compute_rebalance_plan's point of view) must
+    # produce ZERO PlannedOrders. Widening this would self-cancel every
+    # Pending Setup order the instant Copilot places it.
+    order = _pending_order(symbol="EURUSD", price_open=1.09, sl=1.08, ticket=555)
+    allocation = {"CASH": AllocationEntry(pct=100.0)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({}),
+        market_prices={},
+        pending_orders=[order],
+    )
+    assert all(o.symbol != "EURUSD" for o in plan)
+
+
+def test_pct_for_target_lots_basic_correctness():
+    # 100 lots x 50-point stop x contract_size 100 = $500,000 risk, which
+    # is 5% of 10,000,000 equity.
+    pct = pct_for_target_lots(
+        symbol="GO10OZ", target_lots=100.0, entry_price=2000.0, stop_loss=1950.0,
+        account_equity=10_000_000.0, get_spec=_get_spec_for({"GO10OZ": _spec()}),
+    )
+    assert pct == pytest.approx(5.0)
+
+
+def test_pct_for_target_lots_matches_the_hand_derived_value_in_amend_test():
+    # Cross-check against test_position_amend_when_stop_loss_changed_but_
+    # size_unchanged's own hand-derived comment: keeping 1.0 lot held at a
+    # new 50-point stop distance (2000-1950) on a 100k account requires
+    # pct=5.0, not the original pct=10.0 (100-point stop).
+    pct = pct_for_target_lots(
+        symbol="GO10OZ", target_lots=1.0, entry_price=2000.0, stop_loss=1950.0,
+        account_equity=100_000.0, get_spec=_get_spec_for({"GO10OZ": _spec()}),
+    )
+    assert pct == pytest.approx(5.0)
+
+
+def test_pct_for_target_lots_returns_none_for_zero_stop_distance():
+    pct = pct_for_target_lots(
+        symbol="GO10OZ", target_lots=1.0, entry_price=2000.0, stop_loss=2000.0,
+        account_equity=100_000.0, get_spec=_get_spec_for({"GO10OZ": _spec()}),
+    )
+    assert pct is None
+
+
+def test_pct_for_target_lots_returns_none_for_missing_spec():
+    pct = pct_for_target_lots(
+        symbol="UNKNOWN", target_lots=1.0, entry_price=2000.0, stop_loss=1950.0,
+        account_equity=100_000.0, get_spec=_get_spec_for({}),
+    )
+    assert pct is None
+
+
+def test_pct_for_target_lots_returns_zero_for_zero_target_lots():
+    pct = pct_for_target_lots(
+        symbol="GO10OZ", target_lots=0.0, entry_price=2000.0, stop_loss=1950.0,
+        account_equity=100_000.0, get_spec=_get_spec_for({"GO10OZ": _spec()}),
+    )
+    assert pct == 0.0
+
+
+def test_pct_for_target_lots_round_trip_tighter_stop_keeps_same_size():
+    # The real correctness trap this helper exists to close: a DEFEND
+    # action tightening 1900 -> 1950 while holding 1.0 lot must resolve
+    # to "amend_position" at the SAME 1.0 lot, never "increase" (which is
+    # what naively reusing the original pct=10.0 against the now-smaller
+    # 50-point stop distance would silently produce -- 2.0 lots instead
+    # of 1.0).
+    positions = [_position(volume=1.0, ticket=1, sl=1900.0)]
+    new_pct = pct_for_target_lots(
+        symbol="GO10OZ", target_lots=1.0, entry_price=2000.0, stop_loss=1950.0,
+        account_equity=100_000.0, get_spec=_get_spec_for({"GO10OZ": _spec()}),
+    )
+    allocation = {"GO10OZ": AllocationEntry(pct=new_pct, price=2000.0, stop_loss=1950.0)}
+    plan = compute_rebalance_plan(
+        positions=positions, account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec()}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "amend_position"
+    assert plan[0].volume == 1.0
+    assert plan[0].stop_loss == 1950.0
+
+
+def test_pct_for_target_lots_round_trip_partial_close():
+    # A 40% partial-close target (0.6 of the 1.0 held lot) must resolve
+    # to "reduce" at exactly the intended remaining size, not a fresh
+    # "increase"/"hold" from an un-rescaled pct. Fractional volume_step
+    # so 0.6 lots is a legal size for this instrument.
+    spec = _spec(volume_min=0.01, volume_step=0.01)
+    positions = [_position(volume=1.0, ticket=1, sl=1900.0)]
+    new_pct = pct_for_target_lots(
+        symbol="GO10OZ", target_lots=0.6, entry_price=2000.0, stop_loss=1900.0,
+        account_equity=100_000.0, get_spec=_get_spec_for({"GO10OZ": spec}),
+    )
+    allocation = {"GO10OZ": AllocationEntry(pct=new_pct, price=2000.0, stop_loss=1900.0)}
+    plan = compute_rebalance_plan(
+        positions=positions, account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": spec}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "reduce"
+    assert plan[0].volume == pytest.approx(0.4)

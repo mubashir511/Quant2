@@ -20,7 +20,9 @@ from ai.ftmo_suggest import (
     build_ftmo_stage2_instruction,
     build_ftmo_summary,
     classify_long_term_alignment,
+    compute_ftmo_correlation_pairs,
     format_ftmo_asset_context,
+    format_ftmo_correlation_context,
     format_ftmo_status_context,
     format_ftmo_trade_cost,
     format_long_term_alignment,
@@ -32,22 +34,23 @@ from ai.ftmo_suggest import _write_latest_suggestion
 from ai.portfolio_suggest import AssetAnalysis, AuditResult
 from analysis.chart_structure import ChartStructureSnapshot, SRLevel, SRLevelsResult
 from analysis.technical import TechnicalStats, compute_technical_stats
-from data.mt5_source import AccountSummary, ContractSpec, MarketAsset, TradeCost
+from data.mt5_source import AccountSummary, ContractSpec, MarketAsset, PendingOrder, TradeCost
 
 
-def _ts(market_regime=None) -> TechnicalStats:
-    """Minimal TechnicalStats with only market_regime set — everything
+def _ts(market_regime=None, last_price=None, trend=None, momentum_acceleration=None) -> TechnicalStats:
+    """Minimal TechnicalStats with only a few fields set — everything
     format_long_term_alignment/its tests need, without needing a real
     price series shaped to produce a specific regime. Built by keyword,
     not position, specifically to avoid a real off-by-N field-index bug
     (caught while writing this: market_regime is TechnicalStats' 12th
     field, not its 10th, by direct field-order count)."""
     return TechnicalStats(
-        last_price=None, sma20=None, pct_vs_sma20=None, trend=None,
+        last_price=last_price, sma20=None, pct_vs_sma20=None, trend=trend,
         change_1m_pct=None, change_3m_pct=None, change_6m_pct=None,
         volatility_annualized_pct=None, support=None, resistance=None,
         range_width_pct=None, market_regime=market_regime, atr=None,
         atr_pct=None, rsi=None, volume_trend_pct=None,
+        momentum_acceleration=momentum_acceleration,
     )
 
 
@@ -90,6 +93,31 @@ def _make_base_analysis(symbol="EURUSD", description="Euro vs US Dollar", displa
     return AssetAnalysis(
         symbol=symbol, description=description, bid=1.1000, ask=1.1005, display_name=display_name
     )
+
+
+def _make_ftmo_correlated_analysis(symbol, returns, sign=1.0):
+    """Builds an FtmoAssetAnalysis whose base.prices follows a specific
+    return pattern (optionally sign-inverted), so correlation between two
+    such analyses is exactly known/controllable rather than incidental —
+    mirrors tests/test_psx_suggest.py::_make_correlated_analysis exactly,
+    adapted for FtmoAssetAnalysis's nested base.prices/base.symbol shape."""
+    dates = pd.date_range("2026-01-01", periods=len(returns) + 1, freq="D")
+    prices = [100.0]
+    for r in returns:
+        prices.append(prices[-1] * (1 + sign * r))
+    base = _make_base_analysis(symbol=symbol)
+    base.prices = pd.Series(prices, index=dates)
+    return FtmoAssetAnalysis(
+        base=base,
+        h4_stats=_ts(),
+        h1_stats=_ts(),
+        h4_structure=_empty_chart_structure(),
+        h1_structure=_empty_chart_structure(),
+        trade_cost=None,
+    )
+
+
+_CORR_TEST_RETURNS = [((-1) ** i) * 0.01 * (1 + i % 3) for i in range(40)]
 
 
 def _make_status(**overrides):
@@ -597,10 +625,70 @@ def test_format_ftmo_asset_context_includes_d1_and_monthly_chart_structure_and_s
     assert "D1 peaks at 1.2000 and 1.2010" in text
     assert "monthly peaks at 1.3000 and 1.3020" in text
     assert "D1 setup read" in text
-    assert "Monthly setup read" in text
-    # The reversal pattern on each timeframe should surface through that
-    # timeframe's own setup read, same as the existing H4-only test above.
-    assert text.count("reversal_candidate") == 2
+
+
+# --- Candlestick / momentum-acceleration signals actually reach the prompt text ---
+
+
+def test_format_ftmo_asset_context_shows_short_term_momentum_line():
+    base = _make_base_analysis()
+    h4_stats = _ts(last_price=1.1000, momentum_acceleration="accelerating_up")
+    analysis = FtmoAssetAnalysis(
+        base=base, h4_stats=h4_stats, h1_stats=_ts(),
+        h4_structure=_empty_chart_structure(), h1_structure=_empty_chart_structure(),
+        trade_cost=None,
+    )
+    text = format_ftmo_asset_context([analysis])
+    assert "short-term momentum (12-bar): accelerating_up" in text
+
+
+def test_format_ftmo_asset_context_surfaces_in_progress_move_signal():
+    base = _make_base_analysis()
+    h4_stats = _ts(last_price=1.1000, market_regime="sideways", momentum_acceleration="accelerating_up")
+    analysis = FtmoAssetAnalysis(
+        base=base, h4_stats=h4_stats, h1_stats=_ts(),
+        h4_structure=_empty_chart_structure(), h1_structure=_empty_chart_structure(),
+        trade_cost=None,
+    )
+    text = format_ftmo_asset_context([analysis])
+    assert "in_progress_move" in text
+
+
+def test_format_ftmo_asset_context_surfaces_busted_pattern_reversal_signal():
+    from analysis.chart_structure import ChartPattern
+
+    base = _make_base_analysis()
+    h4_stats = _ts(last_price=1.1000, market_regime="trending_up")
+    h4_structure = ChartStructureSnapshot(
+        fibonacci=None, sr_levels=None, trendlines=None,
+        patterns=[ChartPattern(name="double_top", detail="two peaks at 1.2000 and 1.2010")],
+    )
+    analysis = FtmoAssetAnalysis(
+        base=base, h4_stats=h4_stats, h1_stats=_ts(),
+        h4_structure=h4_structure, h1_structure=_empty_chart_structure(),
+        trade_cost=None,
+    )
+    text = format_ftmo_asset_context([analysis])
+    assert "busted_pattern_reversal" in text
+
+
+def test_format_ftmo_asset_context_surfaces_candlestick_reversal_confirmed_signal():
+    from analysis.chart_structure import ChartPattern
+
+    base = _make_base_analysis()
+    h4_stats = _ts(last_price=1.1000, trend="downtrend")
+    h4_structure = ChartStructureSnapshot(
+        fibonacci=None, sr_levels=None, trendlines=None,
+        patterns=[ChartPattern(name="hammer", detail="lower shadow 3x the real body")],
+    )
+    analysis = FtmoAssetAnalysis(
+        base=base, h4_stats=h4_stats, h1_stats=_ts(),
+        h4_structure=h4_structure, h1_structure=_empty_chart_structure(),
+        trade_cost=None,
+    )
+    text = format_ftmo_asset_context([analysis])
+    assert "candlestick_reversal_confirmed" in text
+    assert "hammer" in text
 
 
 def test_format_ftmo_asset_context_reports_conflicting_mtf_trend():
@@ -881,8 +969,27 @@ def test_commission_indices_are_zero_per_ftmo_policy():
         assert "confirmed" in note.lower()
 
 
-def test_commission_unknown_category_returns_none_not_a_fabricated_zero():
+def test_commission_equities_flagged_as_unconfirmed():
+    # Direct user correction 2026-08-26: this account's equities
+    # ("Equities I CFD" in its own Market Watch path) used to have no
+    # rate at all here, which a real mega session then read as "genuine
+    # cost-data gap" and used to exclude the entire category outright.
     pct, note = _ftmo_commission_pct_round_turn("Equities I CFD", contract_size=1.0, price=200.0)
+    assert pct == pytest.approx(config.FTMO_COMMISSION_EQUITIES_PCT_ROUND_TURN)
+    assert "NOT independently confirmed" in note
+
+
+def test_commission_equities_startswith_covers_a_future_second_group():
+    # Mirrors Crypto's own startswith behavior — this account already has
+    # Crypto I/II and Cash II/III groups, so a future "Equities II CFD"
+    # is plausible and should hit the same rate, not fall through to
+    # "unknown".
+    pct, _ = _ftmo_commission_pct_round_turn("Equities II CFD", contract_size=1.0, price=200.0)
+    assert pct == pytest.approx(config.FTMO_COMMISSION_EQUITIES_PCT_ROUND_TURN)
+
+
+def test_commission_unknown_category_returns_none_not_a_fabricated_zero():
+    pct, note = _ftmo_commission_pct_round_turn("Bonds CFD", contract_size=1.0, price=200.0)
     assert pct is None
     assert "unknown" in note.lower()
 
@@ -923,9 +1030,16 @@ def test_real_backtest_execution_kwargs_skips_commission_for_unknown_category():
     # A category _ftmo_commission_pct_round_turn genuinely can't price
     # (returns None) must NOT be silently treated as zero — only the
     # real spread should be netted in.
-    cost = _make_trade_cost(category="Equities I CFD", spread_pct_of_price=0.01)
+    cost = _make_trade_cost(category="Bonds CFD", spread_pct_of_price=0.01)
     kwargs = _real_backtest_execution_kwargs(cost, _make_spec(), 200.0)
     assert kwargs["round_trip_cost_pct"] == pytest.approx(0.01)
+
+
+def test_real_backtest_execution_kwargs_adds_real_commission_for_equities():
+    cost = _make_trade_cost(category="Equities I CFD", spread_pct_of_price=0.01)
+    kwargs = _real_backtest_execution_kwargs(cost, _make_spec(), 200.0)
+    commission_pct, _ = _ftmo_commission_pct_round_turn("Equities I CFD", 1.0, 200.0)
+    assert kwargs["round_trip_cost_pct"] == pytest.approx(0.01 + commission_pct)
 
 
 def test_real_backtest_execution_kwargs_defaults_missing_swap_to_zero():
@@ -1044,7 +1158,7 @@ def test_format_ftmo_trade_cost_flags_unknown_commission_as_a_floor():
         symbol="AAPL", description="Apple Inc", bid=199.5, ask=200.0,
         display_name=None, contract_spec=spec,
     )
-    cost = _make_trade_cost(category="Equities I CFD", spread_pct_of_price=0.25)
+    cost = _make_trade_cost(category="Bonds CFD", spread_pct_of_price=0.25)
     analysis = FtmoAssetAnalysis(
         base=base,
         h4_stats=compute_technical_stats(pd.Series(dtype=float)),
@@ -1056,6 +1170,35 @@ def test_format_ftmo_trade_cost_flags_unknown_commission_as_a_floor():
     text = format_ftmo_trade_cost(analysis)
     assert "unknown" in text.lower()
     assert "floor" in text.lower()
+
+
+def test_format_ftmo_trade_cost_equities_no_longer_flagged_as_unknown():
+    # Direct user correction 2026-08-26 — real bug this guards against:
+    # a real mega session's own final answer excluded MSFT/NVDA/AMD/INTC
+    # entirely, citing exactly this "unconfirmed commission... explicitly
+    # a floor, not the real number" line as its stated reason. Confirms
+    # the fix actually removes that reason from the line equities get.
+    spec = ContractSpec(
+        volume_min=1.0, volume_step=1.0, volume_max=100.0,
+        trade_contract_size=1.0, currency_margin="USD", margin_initial=200.0,
+    )
+    base = AssetAnalysis(
+        symbol="AAPL", description="Apple Inc", bid=199.5, ask=200.0,
+        display_name=None, contract_spec=spec,
+    )
+    cost = _make_trade_cost(category="Equities I CFD", spread_pct_of_price=0.25)
+    analysis = FtmoAssetAnalysis(
+        base=base,
+        h4_stats=compute_technical_stats(pd.Series(dtype=float)),
+        h1_stats=compute_technical_stats(pd.Series(dtype=float)),
+        h4_structure=_empty_chart_structure(),
+        h1_structure=_empty_chart_structure(),
+        trade_cost=cost,
+    )
+    text = format_ftmo_trade_cost(analysis)
+    assert "unknown" not in text.lower()
+    assert "floor" not in text.lower()
+    assert f"{config.FTMO_COMMISSION_EQUITIES_PCT_ROUND_TURN:.4f}%" in text
 
 
 # --- format_ftmo_status_context ---
@@ -1085,6 +1228,63 @@ def test_format_ftmo_status_context_handles_no_best_day_yet():
     status = _make_status()
     text = format_ftmo_status_context(status)
     assert "not yet computable" in text
+
+
+# --- compute_ftmo_correlation_pairs / format_ftmo_correlation_context ---
+
+
+def test_compute_ftmo_correlation_pairs_detects_perfectly_correlated_pair():
+    a1 = _make_ftmo_correlated_analysis("AAA", _CORR_TEST_RETURNS, sign=1.0)
+    a2 = _make_ftmo_correlated_analysis("BBB", _CORR_TEST_RETURNS, sign=1.0)
+    pairs = compute_ftmo_correlation_pairs([a1, a2])
+    assert len(pairs) == 1
+    sym_a, sym_b, corr = pairs[0]
+    assert {sym_a, sym_b} == {"AAA", "BBB"}
+    assert corr == pytest.approx(1.0, abs=1e-6)
+
+
+def test_compute_ftmo_correlation_pairs_detects_negative_correlation():
+    a1 = _make_ftmo_correlated_analysis("AAA", _CORR_TEST_RETURNS, sign=1.0)
+    a2 = _make_ftmo_correlated_analysis("BBB", _CORR_TEST_RETURNS, sign=-1.0)
+    pairs = compute_ftmo_correlation_pairs([a1, a2])
+    assert len(pairs) == 1
+    _, _, corr = pairs[0]
+    assert corr == pytest.approx(-1.0, abs=1e-6)
+
+
+def test_compute_ftmo_correlation_pairs_excludes_series_below_min_observations():
+    short_returns = _CORR_TEST_RETURNS[:5]
+    a1 = _make_ftmo_correlated_analysis("AAA", short_returns, sign=1.0)
+    a2 = _make_ftmo_correlated_analysis("BBB", short_returns, sign=1.0)
+    assert compute_ftmo_correlation_pairs([a1, a2]) == []
+
+
+def test_compute_ftmo_correlation_pairs_sorts_by_magnitude_and_caps_at_15():
+    # 6 symbols -> 15 possible pairs; make them all qualify (>=0.7) with
+    # distinct magnitudes so sort-order and the 15-cap are both provable.
+    analyses = []
+    for i in range(6):
+        # A tiny per-symbol tweak keeps magnitudes distinct without
+        # dropping any pair below the 0.7 threshold.
+        returns = [r * (1.0 - i * 0.02) for r in _CORR_TEST_RETURNS]
+        analyses.append(_make_ftmo_correlated_analysis(f"SYM{i}", returns, sign=1.0))
+    pairs = compute_ftmo_correlation_pairs(analyses)
+    assert len(pairs) == 15  # all 6-choose-2 pairs qualify, capped at 15
+    magnitudes = [abs(c) for _, _, c in pairs]
+    assert magnitudes == sorted(magnitudes, reverse=True)
+
+
+def test_format_ftmo_correlation_context_labels_direction_correctly():
+    a1 = _make_ftmo_correlated_analysis("AAA", _CORR_TEST_RETURNS, sign=1.0)
+    a2 = _make_ftmo_correlated_analysis("BBB", _CORR_TEST_RETURNS, sign=-1.0)
+    text = format_ftmo_correlation_context([a1, a2])
+    assert "AAA & BBB" in text
+    assert "move opposite each other" in text
+
+
+def test_format_ftmo_correlation_context_no_pairs_message_when_none_qualify():
+    solo = _make_ftmo_correlated_analysis("SOLO", _CORR_TEST_RETURNS, sign=1.0)
+    assert "no pair currently has" in format_ftmo_correlation_context([solo])
 
 
 # --- build_ftmo_summary ---
@@ -1129,7 +1329,71 @@ def test_build_ftmo_summary_uses_supplied_analyses_without_refetching(mock_wisdo
     assert "EURUSD" in summary
 
 
+@patch("ai.ftmo_suggest.build_macro_snapshot", return_value="MACRO")
+@patch("ai.ftmo_suggest.format_book_wisdom", return_value="WISDOM")
+def test_build_ftmo_summary_includes_correlation_context_when_analyses_supplied(mock_wisdom, mock_macro):
+    account = AccountSummary(balance=100_000.0, equity=100_000.0, free_margin=90_000.0, currency="USD")
+    status = _make_status()
+    # Real overlapping price series (not the empty pd.Series(dtype=float)
+    # the other supplied-analyses test uses) so the "N pairs found" branch
+    # is genuinely exercised, not just the "no pair currently has" one.
+    analyses = [
+        _make_ftmo_correlated_analysis("AAA", _CORR_TEST_RETURNS, sign=1.0),
+        _make_ftmo_correlated_analysis("BBB", _CORR_TEST_RETURNS, sign=1.0),
+    ]
+    with patch("ai.ftmo_suggest.analyze_ftmo_assets") as mock_analyze:
+        summary = build_ftmo_summary(
+            account,
+            assets=[MarketAsset("AAA", "A", 1.1, 1.1005), MarketAsset("BBB", "B", 1.1, 1.1005)],
+            ftmo_status=status,
+            analyses=analyses,
+        )
+    mock_analyze.assert_not_called()
+    assert "Pairwise correlation among the Market Watch instruments analyzed above" in summary
+    assert "AAA & BBB" in summary
+
+
+@patch("ai.ftmo_suggest.build_macro_snapshot", return_value="MACRO")
+@patch("ai.ftmo_suggest.format_book_wisdom", return_value="WISDOM")
+def test_build_ftmo_summary_includes_pending_orders_section_when_given(mock_wisdom, mock_macro):
+    account = AccountSummary(balance=100_000.0, equity=100_000.0, free_margin=90_000.0, currency="USD")
+    status = _make_status()
+    orders = [
+        PendingOrder(
+            symbol="EURUSD", volume=1.0, order_type="buy limit", price_open=1.09,
+            sl=1.08, tp=1.11, ticket=777, time_setup=None,
+        )
+    ]
+    summary = build_ftmo_summary(
+        account, assets=[], ftmo_status=status, positions=[], analyses=[], pending_orders=orders,
+    )
+    assert "Outstanding Pending Orders" in summary
+    assert "EURUSD" in summary
+
+
+@patch("ai.ftmo_suggest.build_macro_snapshot", return_value="MACRO")
+@patch("ai.ftmo_suggest.format_book_wisdom", return_value="WISDOM")
+def test_build_ftmo_summary_omits_pending_orders_section_when_none(mock_wisdom, mock_macro):
+    account = AccountSummary(balance=100_000.0, equity=100_000.0, free_margin=90_000.0, currency="USD")
+    status = _make_status()
+    summary = build_ftmo_summary(account, assets=[], ftmo_status=status, positions=[], analyses=[])
+    assert "Outstanding Pending Orders" not in summary
+
+
 # --- instruction text content ---
+
+
+def test_instruction_head_mentions_outstanding_pending_orders():
+    from ai.ftmo_suggest import _INSTRUCTION_HEAD
+
+    assert "Outstanding Pending Orders" in _INSTRUCTION_HEAD
+
+
+def test_instruction_tail_requires_reason_and_invalidation_condition_fields():
+    from ai.ftmo_suggest import _INSTRUCTION_TAIL
+
+    assert '"reason"' in _INSTRUCTION_TAIL
+    assert '"invalidation_condition"' in _INSTRUCTION_TAIL
 
 
 def test_ftmo_stage1_instruction_states_the_real_rule_numbers():
@@ -1274,6 +1538,16 @@ def test_ftmo_audit_instruction_covers_pending_setups_scrutiny():
     assert "CONSISTENCY" in AUDIT_INSTRUCTION
 
 
+def test_ftmo_audit_instruction_covers_invalidation_condition_scrutiny():
+    # Real gap found on self-review 2026-08-24: Pending Setups' own
+    # trigger_condition already gets this exact scrutiny (see the test
+    # above) but invalidation_condition -- the sibling field on the main
+    # allocation block, central to Copilot's own watch mechanism -- had
+    # no audit-pool check at all, meaning nothing would catch a lazy or
+    # unfalsifiable one before it shipped.
+    assert "invalidation_condition" in AUDIT_INSTRUCTION
+
+
 def test_ftmo_audit_instruction_requires_recomputing_pending_setups_arithmetic():
     # Real bug found in a live report (2026-08-22): prose claimed one
     # R:R/pip count while the entry's own price/stop_loss/take_profit
@@ -1385,6 +1659,76 @@ def test_write_latest_suggestion_then_read_round_trips():
         "H1 closes above 2000 with RSI turning up"
     )
     assert saved["generated_utc"]
+
+
+def test_write_latest_suggestion_persists_reason_and_invalidation_condition():
+    final_answer = (
+        "## Executive Summary\nSome prose.\n\n"
+        '```json\n{"EURUSD": {"pct": 1.5, "price": 1.09, "stop_loss": 1.08, '
+        '"take_profit": 1.11, "side": "buy", "reason": "Pullback into support.", '
+        '"invalidation_condition": "H4 closes below 1.07"}, "CASH": 98.5}\n```'
+    )
+    _write_latest_suggestion(final_answer)
+    saved = read_latest_suggestion()
+    assert saved["immediate_allocation"]["EURUSD"]["reason"] == "Pullback into support."
+    assert saved["immediate_allocation"]["EURUSD"]["invalidation_condition"] == "H4 closes below 1.07"
+
+
+def test_write_latest_suggestion_backward_compatible_when_new_fields_absent():
+    # _WELL_FORMED_FINAL_ANSWER's own EURUSD entry has neither field —
+    # must still parse and persist cleanly (as "" / None), not fail the
+    # whole write, so an older-style response can never wipe out a prior
+    # valid suggestion just because it predates this feature.
+    _write_latest_suggestion(_WELL_FORMED_FINAL_ANSWER)
+    saved = read_latest_suggestion()
+    assert saved["immediate_allocation"]["EURUSD"]["reason"] == ""
+    assert saved["immediate_allocation"]["EURUSD"]["invalidation_condition"] is None
+
+
+def test_write_latest_suggestion_allows_a_pct_zero_symbol_to_also_be_a_pending_setup():
+    # Real bug found live 2026-08-25: Claude cancelled a stale pending
+    # order via "pct": 0 for a symbol AND separately re-listed that same
+    # symbol in Pending Setups as a fresh watch idea ("cancel the old one,
+    # replace with a cleaner trigger") — a real, unambiguous, valid
+    # instruction. The pre-existing duplicate-symbol check treated ANY
+    # symbol appearing in the allocation block (even at pct: 0) as
+    # off-limits for Pending Setups, so the whole Pending Setups block
+    # failed to parse and the ENTIRE day's suggestion — including every
+    # other symbol's real reason/invalidation_condition — got silently
+    # discarded, leaving Copilot working off a stale, days-old file.
+    final_answer = (
+        "## Executive Summary\nSome prose.\n\n"
+        '```json\n{"BTCUSD": {"side": "buy", "pct": 0, "price": 78555.0, '
+        '"reason": "Cancelling the stale pending order."}, "CASH": 100}\n```\n\n'
+        '```json\n[{"symbol": "BTCUSD", "side": "buy", "pct": 0.5, '
+        '"trigger_condition": "H1 closes back above 77466.31", '
+        '"price": 77500.0, "stop_loss": 76419.0, "take_profit": 79410.0, '
+        '"reason": "Fresh, cleaner watch setup replacing the cancelled order."}]\n```'
+    )
+    _write_latest_suggestion(final_answer)
+    saved = read_latest_suggestion()
+    assert saved["immediate_allocation"]["BTCUSD"]["pct"] == 0
+    assert saved["pending_setups"][0]["symbol"] == "BTCUSD"
+
+
+def test_write_latest_suggestion_still_rejects_a_nonzero_pct_symbol_duplicated_in_pending_setups():
+    # The exclusion rule must still fire for a GENUINE conflict — a
+    # symbol with REAL, nonzero exposure in the allocation block cannot
+    # also appear in Pending Setups, since that's still a real ambiguous
+    # double-instruction, not the pct: 0 cancel-and-replace case above.
+    _write_latest_suggestion(_WELL_FORMED_FINAL_ANSWER)
+    prior = read_latest_suggestion()
+
+    final_answer = (
+        "## Executive Summary\nSome prose.\n\n"
+        '```json\n{"EURUSD": {"side": "buy", "pct": 1.5, "price": 1.09, '
+        '"stop_loss": 1.08}, "CASH": 98.5}\n```\n\n'
+        '```json\n[{"symbol": "EURUSD", "side": "buy", "pct": 0.5, '
+        '"trigger_condition": "H1 closes above 1.10", "reason": "Duplicate, invalid."}]\n```'
+    )
+    _write_latest_suggestion(final_answer)
+
+    assert read_latest_suggestion() == prior
 
 
 def test_write_latest_suggestion_does_not_overwrite_on_malformed_allocation():

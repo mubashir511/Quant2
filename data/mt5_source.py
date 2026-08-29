@@ -55,6 +55,7 @@ class Position:
     profit: float
     opened_at: datetime
     ticket: int = 0  # MT5 position ticket — needed to close/reduce this specific position
+    tp: float | None = None
 
     @property
     def adverse_move_pct(self) -> float:
@@ -79,6 +80,7 @@ class PendingOrder:
     sl: float | None
     tp: float | None
     ticket: int = 0
+    time_setup: datetime | None = None  # when this order was placed — lets callers show/reason about its age
 
 
 @dataclass
@@ -240,6 +242,7 @@ def get_open_positions() -> list[Position]:
                 profit=p.profit,
                 opened_at=datetime.fromtimestamp(p.time),
                 ticket=p.ticket,
+                tp=p.tp if p.tp else None,
             )
         )
     return positions
@@ -279,6 +282,7 @@ def get_pending_orders() -> list[PendingOrder]:
                 sl=o.sl if o.sl else None,
                 tp=o.tp if o.tp else None,
                 ticket=o.ticket,
+                time_setup=datetime.fromtimestamp(o.time_setup) if o.time_setup else None,
             )
         )
     return orders

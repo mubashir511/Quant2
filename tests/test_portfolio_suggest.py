@@ -28,6 +28,7 @@ from ai.portfolio_suggest import (
     build_fx_context,
     build_macro_snapshot,
     build_multi_expiry_context,
+    build_pending_orders_context,
     build_portfolio_summary,
     build_positions_context,
     build_research_directives,
@@ -55,9 +56,9 @@ from analysis.backtest import (
     VolatilityRegimeBacktest,
 )
 from analysis.technical import compute_technical_stats
-from data.macro_source import CountryIndicators, MarketIndicators
+from data.macro_source import CountryIndicators, MacroCycleDiagnostic, MacroCycleLeg, MarketIndicators
 from data.mt5_source import ContractSpec
-from data.mt5_source import AccountSummary, MarketAsset, Position
+from data.mt5_source import AccountSummary, MarketAsset, PendingOrder, Position
 
 
 @pytest.fixture(autouse=True)
@@ -103,10 +104,23 @@ EMPTY_MARKET_INDICATORS = MarketIndicators(
     vix=None,
 )
 
+_EMPTY_CYCLE_LEG = MacroCycleLeg(label="", ticker="", current=None, moving_avg_12m=None, above_ma=None)
+EMPTY_MACRO_CYCLE_DIAGNOSTIC = MacroCycleDiagnostic(
+    yield_3m=_EMPTY_CYCLE_LEG,
+    yield_10y=_EMPTY_CYCLE_LEG,
+    equity_index=_EMPTY_CYCLE_LEG,
+    commodity_index=_EMPTY_CYCLE_LEG,
+    dollar_index=_EMPTY_CYCLE_LEG,
+    stage_label=None,
+    stage_description=None,
+    note="no data available",
+)
 
+
+@patch("ai.portfolio_suggest.fetch_macro_cycle_diagnostic", return_value=EMPTY_MACRO_CYCLE_DIAGNOSTIC)
 @patch("ai.portfolio_suggest.fetch_country_indicators", return_value=[])
 @patch("ai.portfolio_suggest.fetch_market_indicators", return_value=EMPTY_MARKET_INDICATORS)
-def test_build_portfolio_summary_includes_account(mock_market, mock_country):
+def test_build_portfolio_summary_includes_account(mock_market, mock_country, mock_cycle):
     account = AccountSummary(balance=10000.0, equity=9900.0, free_margin=8500.0, currency="USD")
     # Symbol with no resolvable Yahoo ticker, so no network calls are made.
     assets = [MarketAsset("XYZ999", "Unmapped instrument", bid=1.0, ask=1.1)]
@@ -141,9 +155,69 @@ def test_build_positions_context_describes_each_open_position():
     assert "no stop set" in text
 
 
+def test_build_positions_context_shows_current_take_profit():
+    positions = [
+        Position(
+            symbol="GO10OZ", volume=2.0, side="buy", price_open=2000.0,
+            price_current=2050.0, sl=1950.0, tp=2200.0, profit=100.0,
+            opened_at=datetime.now(), ticket=555,
+        ),
+    ]
+    text = build_positions_context(positions)
+    assert "target at 2200" in text
+
+
+def test_build_positions_context_shows_no_target_set_when_tp_none():
+    positions = [
+        Position(
+            symbol="GO10OZ", volume=2.0, side="buy", price_open=2000.0,
+            price_current=2050.0, sl=1950.0, tp=None, profit=100.0,
+            opened_at=datetime.now(), ticket=555,
+        ),
+    ]
+    text = build_positions_context(positions)
+    assert "no target set" in text
+
+
+def test_build_pending_orders_context_empty_when_no_orders():
+    assert build_pending_orders_context([]) == ""
+
+
+def test_build_pending_orders_context_describes_each_order_with_age():
+    orders = [
+        PendingOrder(
+            symbol="GO10OZ", volume=1.0, order_type="buy limit", price_open=1990.0,
+            sl=1950.0, tp=2100.0, ticket=777, time_setup=datetime.now() - pd.Timedelta(hours=5),
+        ),
+    ]
+    text = build_pending_orders_context(orders)
+    assert "Outstanding Pending Orders" in text
+    assert "GO10OZ" in text
+    assert "buy limit" in text
+    assert "1990" in text
+    assert "stop at 1950" in text
+    assert "target at 2100" in text
+    assert "resting" in text and "h" in text
+
+
+def test_build_pending_orders_context_handles_missing_time_setup_gracefully():
+    orders = [
+        PendingOrder(
+            symbol="GO10OZ", volume=1.0, order_type="sell limit", price_open=2010.0,
+            sl=None, tp=None, ticket=778, time_setup=None,
+        ),
+    ]
+    text = build_pending_orders_context(orders)
+    assert "GO10OZ" in text
+    assert "no stop set" in text
+    assert "no target set" in text
+    assert "resting" not in text
+
+
+@patch("ai.portfolio_suggest.fetch_macro_cycle_diagnostic", return_value=EMPTY_MACRO_CYCLE_DIAGNOSTIC)
 @patch("ai.portfolio_suggest.fetch_country_indicators", return_value=[])
 @patch("ai.portfolio_suggest.fetch_market_indicators", return_value=EMPTY_MARKET_INDICATORS)
-def test_build_portfolio_summary_includes_open_positions_when_given(mock_market, mock_country):
+def test_build_portfolio_summary_includes_open_positions_when_given(mock_market, mock_country, mock_cycle):
     account = AccountSummary(balance=10000.0, equity=9900.0, free_margin=8500.0, currency="USD")
     assets = [MarketAsset("XYZ999", "Unmapped instrument", bid=1.0, ask=1.1)]
     positions = [
@@ -158,33 +232,37 @@ def test_build_portfolio_summary_includes_open_positions_when_given(mock_market,
     assert "XYZ999" in summary
 
 
+@patch("ai.portfolio_suggest.fetch_macro_cycle_diagnostic", return_value=EMPTY_MACRO_CYCLE_DIAGNOSTIC)
 @patch("ai.portfolio_suggest.fetch_country_indicators", return_value=[])
 @patch("ai.portfolio_suggest.fetch_market_indicators", return_value=EMPTY_MARKET_INDICATORS)
-def test_build_portfolio_summary_omits_positions_section_when_none_held(mock_market, mock_country):
+def test_build_portfolio_summary_omits_positions_section_when_none_held(mock_market, mock_country, mock_cycle):
     account = AccountSummary(balance=10000.0, equity=9900.0, free_margin=8500.0, currency="USD")
     assets = [MarketAsset("XYZ999", "Unmapped instrument", bid=1.0, ask=1.1)]
     summary = build_portfolio_summary(account, assets)
     assert "Current Open Positions" not in summary
 
 
+@patch("ai.portfolio_suggest.fetch_macro_cycle_diagnostic", return_value=EMPTY_MACRO_CYCLE_DIAGNOSTIC)
 @patch("ai.portfolio_suggest.fetch_country_indicators", return_value=[])
 @patch("ai.portfolio_suggest.fetch_market_indicators", return_value=EMPTY_MARKET_INDICATORS)
-def test_build_portfolio_summary_handles_no_visible_assets(mock_market, mock_country):
+def test_build_portfolio_summary_handles_no_visible_assets(mock_market, mock_country, mock_cycle):
     account = AccountSummary(balance=10000.0, equity=10000.0, free_margin=10000.0, currency="USD")
     summary = build_portfolio_summary(account, [])
     assert "none visible" in summary.lower()
 
 
+@patch("ai.portfolio_suggest.fetch_macro_cycle_diagnostic", return_value=EMPTY_MACRO_CYCLE_DIAGNOSTIC)
 @patch("ai.portfolio_suggest.fetch_country_indicators", return_value=[])
 @patch("ai.portfolio_suggest.fetch_market_indicators", return_value=EMPTY_MARKET_INDICATORS)
-def test_build_macro_snapshot_reports_unavailable_when_all_missing(mock_market, mock_country):
+def test_build_macro_snapshot_reports_unavailable_when_all_missing(mock_market, mock_country, mock_cycle):
     snapshot = build_macro_snapshot()
     assert "unavailable" in snapshot.lower()
 
 
+@patch("ai.portfolio_suggest.fetch_macro_cycle_diagnostic", return_value=EMPTY_MACRO_CYCLE_DIAGNOSTIC)
 @patch("ai.portfolio_suggest.fetch_country_indicators")
 @patch("ai.portfolio_suggest.fetch_market_indicators")
-def test_build_macro_snapshot_includes_yields_and_country_data(mock_market, mock_country):
+def test_build_macro_snapshot_includes_yields_and_country_data(mock_market, mock_country, mock_cycle):
     mock_market.return_value = MarketIndicators(
         yield_3m_pct=3.73,
         yield_10y_pct=4.63,
@@ -203,6 +281,58 @@ def test_build_macro_snapshot_includes_yields_and_country_data(mock_market, mock
     assert "VIX" in snapshot
     assert "United States" in snapshot
     assert "GDP growth 2.2%" in snapshot
+
+
+def _cycle_leg(label, ticker, current, ma):
+    return MacroCycleLeg(label=label, ticker=ticker, current=current, moving_avg_12m=ma, above_ma=current > ma)
+
+
+@patch("ai.portfolio_suggest.fetch_macro_cycle_diagnostic")
+@patch("ai.portfolio_suggest.fetch_country_indicators", return_value=[])
+@patch("ai.portfolio_suggest.fetch_market_indicators", return_value=EMPTY_MARKET_INDICATORS)
+def test_build_macro_snapshot_includes_cycle_diagnostic_section(mock_market, mock_country, mock_cycle):
+    mock_cycle.return_value = MacroCycleDiagnostic(
+        yield_3m=_cycle_leg("3-month T-bill yield", "^IRX", 3.5, 4.0),
+        yield_10y=_cycle_leg("10-year Treasury yield", "^TNX", 3.8, 4.2),
+        equity_index=_cycle_leg("S&P 500", "^GSPC", 6000.0, 5500.0),
+        commodity_index=_cycle_leg("Commodity index (DBC proxy)", "DBC", 25.0, 22.0),
+        dollar_index=_cycle_leg("US Dollar Index (DXY)", "DX-Y.NYB", 100.0, 99.0),
+        stage_label="Stage III",
+        stage_description="Recovery underway.",
+        note='Descriptive read of Pring\'s bond/stock/commodity market-cycle model, not a precise or reliably-timed predictive signal.',
+    )
+    snapshot = build_macro_snapshot()
+    assert "Business-cycle stage diagnostic" in snapshot
+    assert "S&P 500: ABOVE its 12-month MA" in snapshot
+    assert "Best-effort stage read: Stage III" in snapshot
+
+
+@patch("ai.portfolio_suggest.fetch_macro_cycle_diagnostic", return_value=EMPTY_MACRO_CYCLE_DIAGNOSTIC)
+@patch("ai.portfolio_suggest.fetch_country_indicators", return_value=[])
+@patch("ai.portfolio_suggest.fetch_market_indicators", return_value=EMPTY_MARKET_INDICATORS)
+def test_build_macro_snapshot_omits_cycle_section_when_diagnostic_entirely_unavailable(mock_market, mock_country, mock_cycle):
+    snapshot = build_macro_snapshot()
+    assert "Business-cycle stage diagnostic" not in snapshot
+    assert "unavailable" in snapshot.lower()
+
+
+@patch("ai.portfolio_suggest.fetch_macro_cycle_diagnostic")
+@patch("ai.portfolio_suggest.fetch_country_indicators", return_value=[])
+@patch("ai.portfolio_suggest.fetch_market_indicators", return_value=EMPTY_MARKET_INDICATORS)
+def test_build_macro_snapshot_shows_mixed_ambiguous_note_without_forcing_a_stage_label(mock_market, mock_country, mock_cycle):
+    mock_cycle.return_value = MacroCycleDiagnostic(
+        yield_3m=_cycle_leg("3-month T-bill yield", "^IRX", 4.0, 3.5),
+        yield_10y=_cycle_leg("10-year Treasury yield", "^TNX", 4.2, 3.8),
+        equity_index=_cycle_leg("S&P 500", "^GSPC", 5000.0, 5500.0),
+        commodity_index=_cycle_leg("Commodity index (DBC proxy)", "DBC", 20.0, 22.0),
+        dollar_index=_cycle_leg("US Dollar Index (DXY)", "DX-Y.NYB", 100.0, 99.0),
+        stage_label=None,
+        stage_description=None,
+        note="Signals don't cleanly match one of Pring's 6 canonical stage patterns — mixed/ambiguous read.",
+    )
+    snapshot = build_macro_snapshot()
+    assert "mixed/ambiguous" in snapshot
+    assert "Best-effort stage read:" not in snapshot
 
 
 def test_build_enriched_asset_context_lists_unmapped_symbol_plainly():
@@ -401,6 +531,19 @@ def test_format_enriched_asset_context_flags_volatility_regime_contradiction():
     assert "CONTRADICTS the 'coiled spring' reading" in text
 
 
+def test_format_enriched_asset_context_shows_short_term_momentum_line():
+    # Real test-coverage gap found on self-audit: the momentum_
+    # acceleration line added to this function (2026-08-26, so PMEX's
+    # own mega-session prompt gets the signal too, not just FTMO's) had
+    # zero direct test coverage — this is the concrete regression guard
+    # confirming it actually reaches PMEX's real prompt text, not just
+    # FTMO's (already covered separately in tests/test_ftmo_suggest.py).
+    analysis = _analysis_with_stats()
+    assert analysis.stats.momentum_acceleration == "accelerating_up"
+    text = format_enriched_asset_context([analysis])
+    assert "short-term momentum: accelerating_up" in text
+
+
 def test_format_enriched_asset_context_discloses_missing_backtest_evidence():
     analysis = _analysis_with_stats()  # backtest fields default to None
     text = format_enriched_asset_context([analysis])
@@ -515,7 +658,7 @@ def test_suggest_portfolio_passes_audit_block_into_lean_revision_prompt(mock_run
     # session's own history, per the whole point of this design.
     assert "my draft text" not in final_prompt
     mock_audit.assert_called_once_with(
-        "some summary", "my draft text", on_progress=None, past_lessons=""
+        "some summary", "my draft text", on_progress=None, past_lessons="", include_copilot=False
     )
 
 
@@ -993,6 +1136,44 @@ def test_parse_final_allocation_none_when_shape_is_wrong():
 def test_parse_final_allocation_uses_last_block_if_multiple():
     text = '```json\n{"WRONG": 100}\n```\nmore text\n```json\n{"RIGHT": 100}\n```'
     assert parse_final_allocation(text) == {"RIGHT": AllocationEntry(pct=100.0)}
+
+
+def test_parse_final_allocation_extracts_reason_and_invalidation_condition():
+    text = (
+        '```json\n{"GO10OZ": {"pct": 15, "price": 2005.5, "stop_loss": 1950.0, '
+        '"reason": "Pullback into support.", "invalidation_condition": "H4 closes below 1900"}, '
+        '"CASH": 85}\n```'
+    )
+    allocation = parse_final_allocation(text)
+    assert allocation["GO10OZ"].reason == "Pullback into support."
+    assert allocation["GO10OZ"].invalidation_condition == "H4 closes below 1900"
+
+
+def test_parse_final_allocation_tolerates_missing_reason_and_invalidation_condition():
+    # Backward compat: an older saved suggestion (or a model response
+    # that simply omits these two new, optional fields) must still parse
+    # cleanly rather than failing the whole allocation block.
+    text = '```json\n{"GO10OZ": {"pct": 15, "price": 2005.5, "stop_loss": 1950.0}, "CASH": 85}\n```'
+    allocation = parse_final_allocation(text)
+    assert allocation["GO10OZ"].reason == ""
+    assert allocation["GO10OZ"].invalidation_condition is None
+
+
+def test_parse_final_allocation_none_when_reason_wrong_type():
+    text = '```json\n{"GO10OZ": {"pct": 15, "reason": 123}, "CASH": 85}\n```'
+    assert parse_final_allocation(text) is None
+
+
+def test_parse_final_allocation_none_when_invalidation_condition_wrong_type():
+    text = '```json\n{"GO10OZ": {"pct": 15, "invalidation_condition": 123}, "CASH": 85}\n```'
+    assert parse_final_allocation(text) is None
+
+
+def test_parse_final_allocation_bare_number_defaults_reason_and_invalidation_condition():
+    text = '```json\n{"CASH": 100}\n```'
+    allocation = parse_final_allocation(text)
+    assert allocation["CASH"].reason == ""
+    assert allocation["CASH"].invalidation_condition is None
 
 
 def test_strip_allocation_block_removes_json_leaves_prose():

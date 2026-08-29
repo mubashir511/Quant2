@@ -2,12 +2,22 @@
 analysis/chart_structure.py's ChartStructureSnapshot into a small set of
 real, deterministic trade-setup archetypes — reversal, pullback-
 continuation, range-fade, breakout-watch, trend-following, grind-
-continuation. This is a classification LAYER, not a new data source:
-every signal it reasons over was already computed by one of those two
-modules; this module only combines them under well-defined rules, so an
-AI reading the result gets "here is the kind of setup this looks like,
-and exactly why" instead of having to reconstruct that judgment itself
-from a dozen separate numbers every single time.
+continuation, in-progress-move, busted-pattern-reversal, candlestick-
+reversal-confirmed. This is a classification LAYER, not a new data
+source: every signal it reasons over was already computed by one of
+those two modules; this module only combines them under well-defined
+rules, so an AI reading the result gets "here is the kind of setup this
+looks like, and exactly why" instead of having to reconstruct that
+judgment itself from a dozen separate numbers every single time.
+
+`in_progress_move`/`busted_pattern_reversal`/`candlestick_reversal_
+confirmed` (rules 8-10, added 2026-08-26) directly address a real,
+recurring complaint: misreading pump/dump swings and sideways-vs-
+breakout moments, because market_regime's own 60-bar window can let
+several swings cancel out in its own average — see analysis/
+technical.py's MOMENTUM_WINDOW comment for the full root-cause trace,
+and analysis/candlestick_patterns.py for the Nison-sourced shape
+detection rule 10 draws on.
 
 Deliberately does NOT try to be exhaustive — an instrument with no
 confirmed structure just gets "no_clear_setup", which is a normal,
@@ -43,6 +53,12 @@ NEAR_LEVEL_TOLERANCE_PCT = 0.5
 # The classic Fibonacci "buy the dip" / "sell the rally" retracement
 # band — not this project's own invention, the standard convention.
 FIB_GOLDEN_ZONE = (0.382, 0.618)
+
+# Candlestick names (analysis/candlestick_patterns.py) grouped by which
+# direction they argue for, for the candlestick_reversal_confirmed rule
+# below.
+_BULLISH_CANDLES = ("bullish_engulfing", "hammer", "inverted_hammer", "morning_star")
+_BEARISH_CANDLES = ("bearish_engulfing", "hanging_man", "shooting_star", "evening_star")
 
 
 @dataclass
@@ -257,15 +273,133 @@ def classify_setups(stats: TechnicalStats, structure: ChartStructureSnapshot) ->
                 )
             )
 
+    # 8. In-progress move — direct fix for a real, recurring complaint:
+    # "the system wakes up late in the middle of what looks like a
+    # sideways market when a real move is already underway." market_
+    # regime reads sideways over the medium-term (60-bar) window because
+    # several pump/dump swings cancel out in that window's own average,
+    # but analysis/technical.py's own shorter momentum_acceleration
+    # window shows a real, directional push happening right now.
+    if stats.market_regime == "sideways" and stats.momentum_acceleration in (
+        "accelerating_up", "accelerating_down"
+    ):
+        direction_word = "up" if stats.momentum_acceleration == "accelerating_up" else "down"
+        signals.append(
+            SetupSignal(
+                name="in_progress_move",
+                detail=(
+                    "Medium-term regime reads sideways (recent swings are cancelling out in "
+                    f"that window's own average), but the short-term window shows a real, "
+                    f"efficient push {direction_word}ward — a fresh move may already be "
+                    "underway inside what still looks like a flat window; don't dismiss this "
+                    "as noise just because the medium-term regime hasn't caught up yet."
+                ),
+            )
+        )
+
+    # 9. Busted pattern reversal — Bulkowski's own documented concept
+    # (Encyclopedia of Chart Patterns): a pattern that clearly implies
+    # one breakout direction but instead sees price confirm the OPPOSITE
+    # direction is a "busted pattern," and his own statistics show these
+    # often travel FURTHER than the original pattern's own target, since
+    # traders positioned for the expected breakout are forced to exit/
+    # reverse into the move. Needs no new detection — cross-references
+    # the already-computed double_top/double_bottom against market_
+    # regime/momentum_acceleration now confirming the other way. Fires
+    # ALONGSIDE reversal_candidate (rule 1), not instead of it — both are
+    # real, complementary evidence.
+    #
+    # Confirmed 2026-08-27 directly against the user's own copy of
+    # Bulkowski's book via NotebookLM (real cited text/numbers, not
+    # secondhand): his OWN precise definition of a "bust" is narrower
+    # than this rule's heuristic — the initial breakout must travel LESS
+    # THAN 5% before reversing, then price must re-enter the pattern and
+    # break out the OPPOSITE side to count as fully busted. This rule
+    # instead just checks whether CURRENT market_regime/momentum_
+    # acceleration confirm the opposite of what the pattern implied,
+    # with no minimum-penetration/re-entry tracking of the actual post-
+    # pattern price path (chart_structure.py doesn't currently record a
+    # pattern's own breakout point or track price after it). A real,
+    # scoped follow-on, not implemented here. The qualitative claim
+    # below ("busted patterns travel FURTHER") is itself now backed by
+    # real numbers, not just paraphrased: e.g. a busted Eve & Eve double
+    # top averages a 29-70% post-bust rise against the original
+    # pattern's own -18% to -25% average decline; a busted descending
+    # triangle averages a 43-52% post-bust move.
+    if reversal_pattern is not None:
+        implied_down = reversal_pattern.name == "double_top"
+        confirmed_up = stats.market_regime in ("trending_up", "choppy_up") or stats.momentum_acceleration == "accelerating_up"
+        confirmed_down = stats.market_regime in ("trending_down", "choppy_down") or stats.momentum_acceleration == "accelerating_down"
+        if (implied_down and confirmed_up) or (not implied_down and confirmed_down):
+            actual_direction = "up" if confirmed_up else "down"
+            signals.append(
+                SetupSignal(
+                    name="busted_pattern_reversal",
+                    detail=(
+                        f"{reversal_pattern.detail} This pattern implied a break "
+                        f"{'DOWN' if implied_down else 'UP'}, but real subsequent price action "
+                        f"instead confirms a genuine push {actual_direction}ward (market regime/"
+                        "short-term momentum) — a BUSTED pattern per Bulkowski's Encyclopedia of "
+                        "Chart Patterns, whose statistics show busted patterns often travel "
+                        "FURTHER than the original pattern's own target. Treat this as real, "
+                        "stronger directional evidence in the busted direction, not a reason "
+                        "to distrust it."
+                    ),
+                )
+            )
+
+    # 10. Candlestick reversal confirmed — a candlestick pattern
+    # (analysis/candlestick_patterns.py) only counts as an actionable
+    # setup signal when it appears in the context Nison's own definition
+    # requires to be meaningful: a bullish shape after a downtrend or at
+    # a double-bottom; a bearish shape after an uptrend or at a
+    # double-top. Ties the raw candlestick pattern list into an actual
+    # signal rather than leaving it to only ever reach the raw chart-
+    # structure text.
+    candle_bull = _find_pattern(structure, *_BULLISH_CANDLES)
+    candle_bear = _find_pattern(structure, *_BEARISH_CANDLES)
+    if candle_bull is not None and (
+        stats.trend == "downtrend" or (reversal_pattern is not None and reversal_pattern.name == "double_bottom")
+    ):
+        signals.append(
+            SetupSignal(
+                name="candlestick_reversal_confirmed",
+                detail=(
+                    f"{candle_bull.detail} — a bullish candlestick reversal (Nison) confirming "
+                    "an existing bearish context; treat as added weight behind a bullish "
+                    "reversal thesis, not a standalone trigger."
+                ),
+            )
+        )
+    if candle_bear is not None and (
+        stats.trend == "uptrend" or (reversal_pattern is not None and reversal_pattern.name == "double_top")
+    ):
+        signals.append(
+            SetupSignal(
+                name="candlestick_reversal_confirmed",
+                detail=(
+                    f"{candle_bear.detail} — a bearish candlestick reversal (Nison) confirming "
+                    "an existing bullish context; treat as added weight behind a bearish "
+                    "reversal thesis, not a standalone trigger."
+                ),
+            )
+        )
+
     if not signals:
+        # Real gap found on self-audit: this list was already stale
+        # before this round (trend_intact, added 2026-08-22, was never
+        # added here either) — updated to name every archetype now,
+        # not just re-adding the 3 newest ones, so this doesn't need a
+        # third catch next time the list changes.
         signals.append(
             SetupSignal(
                 name="no_clear_setup",
                 detail=(
                     "No specific structural setup (reversal, pullback, range-fade, "
-                    "breakout-watch, trendline re-test, or grind-continuation) currently "
-                    "confirmed on this timeframe — a normal, common result, not a gap to "
-                    "explain away."
+                    "breakout-watch, trend-following, grind-continuation, trend-intact, "
+                    "in-progress-move, busted-pattern-reversal, or candlestick-reversal) "
+                    "currently confirmed on this timeframe — a normal, common result, not a "
+                    "gap to explain away."
                 ),
             )
         )

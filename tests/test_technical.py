@@ -204,3 +204,34 @@ def test_periods_per_year_scales_volatility_correctly_for_a_different_bar_freque
     expected_ratio = (24 * 252) ** 0.5 / 252**0.5
     actual_ratio = hourly_scale.volatility_annualized_pct / daily.volatility_annualized_pct
     assert actual_ratio == pytest.approx(expected_ratio)
+
+
+# --- momentum_acceleration (direct fix for "wakes up late in a sideways market") ---
+
+
+def test_momentum_acceleration_none_below_window():
+    prices = pd.Series([100.0] * 10)  # below MOMENTUM_WINDOW=12
+    stats = compute_technical_stats(prices)
+    assert stats.momentum_acceleration is None
+
+
+def test_momentum_acceleration_accelerating_up_on_a_fresh_sharp_ramp():
+    # A long flat run followed by a short, sharp up-move in just the
+    # last 12 bars — the real scenario this signal exists to catch.
+    flat = [100.0] * 50
+    ramp = [100.0 + i * 1.0 for i in range(1, 13)]
+    stats = compute_technical_stats(pd.Series(flat + ramp))
+    assert stats.momentum_acceleration == "accelerating_up"
+
+
+def test_momentum_acceleration_accelerating_down_on_a_fresh_sharp_drop():
+    flat = [100.0] * 50
+    drop = [100.0 - i * 1.0 for i in range(1, 13)]
+    stats = compute_technical_stats(pd.Series(flat + drop))
+    assert stats.momentum_acceleration == "accelerating_down"
+
+
+def test_momentum_acceleration_stable_when_genuinely_flat():
+    prices = pd.Series([100.0] * 60)
+    stats = compute_technical_stats(prices)
+    assert stats.momentum_acceleration == "stable"

@@ -355,7 +355,10 @@ def compute_trendlines(
 @dataclass
 class ChartPattern:
     name: str  # "double_top" / "double_bottom" / "uptrend_structure" / "downtrend_structure" /
-    #             "ascending_triangle" / "descending_triangle" / "converging_triangle"
+    #             "ascending_triangle" / "descending_triangle" / "converging_triangle" /
+    #             (candlestick, see analysis/candlestick_patterns.py) "doji" / "bullish_engulfing" /
+    #             "bearish_engulfing" / "hammer" / "hanging_man" / "shooting_star" /
+    #             "inverted_hammer" / "morning_star" / "evening_star"
     detail: str  # one plain-language sentence with the real numbers behind the call
 
 
@@ -543,14 +546,26 @@ def compute_chart_structure(history: pd.DataFrame, lookback: int = STRUCTURE_LOO
     trendlines, plus twice more inside detect_chart_patterns's own body
     and its internal compute_trendlines call) — real, multiplied-by-
     every-symbol-and-both-timeframes redundant work for no correctness
-    benefit."""
+    benefit.
+
+    Candlestick patterns (analysis/candlestick_patterns.py, added
+    2026-08-26) are concatenated into the same `patterns` list —
+    imported here, inside the function body rather than at module top,
+    specifically to avoid a circular import: that module imports
+    `ChartPattern` FROM this one, so importing it back at this file's
+    own top level (before `ChartPattern` is even defined) would fail."""
+    from analysis.candlestick_patterns import detect_candlestick_patterns
+
     window = _tail_reset(history, lookback)
     swing_points = find_swing_points(window)
     return ChartStructureSnapshot(
         fibonacci=compute_fibonacci_levels(window, lookback=lookback, swing_points=swing_points),
         sr_levels=compute_sr_levels(window, lookback=lookback, swing_points=swing_points),
         trendlines=compute_trendlines(window, lookback=lookback, swing_points=swing_points),
-        patterns=detect_chart_patterns(window, lookback=lookback, swing_points=swing_points),
+        patterns=(
+            detect_chart_patterns(window, lookback=lookback, swing_points=swing_points)
+            + detect_candlestick_patterns(window)
+        ),
     )
 
 

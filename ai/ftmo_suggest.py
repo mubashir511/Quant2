@@ -18,6 +18,7 @@ from ai.portfolio_suggest import (
     build_fx_context,
     build_macro_snapshot,
     build_past_lessons,
+    build_pending_orders_context,
     build_positions_context,
     format_enriched_asset_context,
     parse_final_allocation,
@@ -33,12 +34,13 @@ from analysis.backtest import (
 from analysis.chart_structure import ChartStructureSnapshot, compute_chart_structure, find_mtf_confluence
 from analysis.setup_classifier import SetupSignal, classify_setups
 from analysis.technical import TRADING_DAYS_PER_YEAR, TechnicalStats, compute_technical_stats
-from data.book_wisdom import format_book_wisdom
+from data.book_wisdom import format_book_wisdom, format_trend_wisdom
 from data.mt5_source import (
     AccountSummary,
     ContractSpec,
     HistoricalDeal,
     MarketAsset,
+    PendingOrder,
     Position,
     TradeCost,
     fetch_mt5_price_history,
@@ -210,6 +212,28 @@ _INSTRUCTION_HEAD = (
     "exist. When no such section appears, the account currently holds "
     "nothing and you're proposing a mix from a clean slate."
     "\n\n"
+    "If an 'Outstanding Pending Orders' section appears below, this "
+    "account also has one or more real, not-yet-filled GTC limit orders "
+    "resting in MT5 alongside (or instead of) any open positions — each "
+    "already committed to entering at a specific level if price reaches "
+    "it, not a hypothetical you're free to ignore. Every one of them "
+    "must be reconciled explicitly in your final mix, using the exact "
+    "same rule as an open position: keep it (restate the same side and "
+    "\"pct\", and the same price/stop_loss/take_profit if nothing about "
+    "it should change), update it (restate it with a NEW price, "
+    "stop_loss, and/or take_profit — same side, same symbol — if "
+    "today's data now calls for different terms while the underlying "
+    "idea still holds), or cancel it (give it \"pct\": 0 in the final "
+    "mix, exactly like closing a currently-held instrument) — never "
+    "omit a symbol with an outstanding pending order from the final "
+    "allocation block. A pending order that's been resting a long time "
+    "(its own age is given below) without filling is not automatically "
+    "wrong, but IS worth a genuine, explicit judgment call: has enough "
+    "changed since it was placed that its entry level, stop, or target "
+    "no longer reflect the current real technical picture, or is the "
+    "original thesis still intact and simply still waiting for price to "
+    "arrive?"
+    "\n\n"
     "You're also given: a macro snapshot (US Treasury yield curve, "
     "dollar index, VIX, and GDP growth/inflation/unemployment for 10 "
     "major economies), and per-instrument technical context on FOUR "
@@ -316,8 +340,13 @@ _INSTRUCTION_HEAD = (
     "direction and where price sits relative to them; and a small set "
     "of conservatively-detected chart patterns (double top/bottom, "
     "uptrend/downtrend structure from real higher-highs/higher-lows or "
-    "lower-highs/lower-lows, and triangle/wedge from converging "
-    "trendlines) — 'not enough confirmed swing points yet' or no "
+    "lower-highs/lower-lows, triangle/wedge from converging trendlines, "
+    "and Nison's own candlestick shapes on the LATEST closed bar — doji "
+    "(indecision, never directional on its own), bullish/bearish "
+    "engulfing, hammer/hanging man, shooting star/inverted hammer, and "
+    "morning/evening star, each only surfaced when the exact mechanical "
+    "shape/context Nison defines is genuinely met, never a loose visual "
+    "impression) — 'not enough confirmed swing points yet' or no "
     "patterns listed is a normal, common result, not a gap to explain "
     "away. The H4/H1 touch-count-ranked S/R levels and Fibonacci levels "
     "remain your PRIMARY candidate stop/target anchors (per the DEBATE "
@@ -346,9 +375,11 @@ _INSTRUCTION_HEAD = (
     "monthly, D1, H4, and H1 separately — a small set of real, "
     "rule-based trade archetypes (reversal_candidate, pullback_continuation, "
     "range_fade_candidate, breakout_watch, trend_following, trend_intact, "
-    "grind_continuation, or no_clear_setup) synthesized from everything "
-    "above: trend structure, RSI, market regime, chart patterns, and "
-    "proximity to the real touch-count-ranked S/R and Fibonacci levels. "
+    "grind_continuation, in_progress_move, busted_pattern_reversal, "
+    "candlestick_reversal_confirmed, or no_clear_setup) synthesized from "
+    "everything above: trend structure, RSI, market regime, momentum "
+    "acceleration, chart/candlestick patterns, and proximity to the real "
+    "touch-count-ranked S/R and Fibonacci levels. "
     "grind_continuation specifically means the instrument HAS made a "
     "real net directional move over the medium-term window, just via a "
     "noisy/choppy path rather than a clean trend — genuine directional "
@@ -361,7 +392,28 @@ _INSTRUCTION_HEAD = (
     "still genuine directional evidence to lean with, not a weaker read "
     "than trend_following just because there's no fresh entry trigger "
     "this exact moment; a clean trend spends most of its own life exactly "
-    "here, between retest moments. Each "
+    "here, between retest moments. in_progress_move means the medium-term "
+    "market type reads 'sideways' (several recent swings cancelling out in "
+    "that window's own average) but a much shorter window shows a real, "
+    "efficient push already underway right now — don't dismiss this as "
+    "noise just because the medium-term regime hasn't caught up yet; a "
+    "fresh move can be genuinely underway inside what still looks like a "
+    "flat window. busted_pattern_reversal means a double-top/double-bottom "
+    "implied one breakout direction but real subsequent price action "
+    "instead confirms the OPPOSITE direction — per Bulkowski's own "
+    "documented statistics, a busted pattern often travels FURTHER than "
+    "the original pattern's own target (traders positioned for the "
+    "expected breakout are forced to reverse into the move), so treat "
+    "this as stronger directional evidence in the busted direction, not a "
+    "reason to distrust the underlying data. candlestick_reversal_"
+    "confirmed means a real candlestick reversal shape (e.g. a hammer, "
+    "engulfing, or star pattern) appeared in the specific context that "
+    "makes it meaningful (a bullish shape after a downtrend or at a "
+    "double-bottom; bearish after an uptrend or at a double-top) — added "
+    "weight behind that reversal thesis, not a standalone trigger on its "
+    "own; a bare 'doji' appearing in the chart-structure list below (not "
+    "a setup read on its own) means genuine indecision, not a directional "
+    "signal either way. Each "
     "comes with the specific real numbers behind the call, and more than "
     "one can legitimately apply at once (e.g. a pullback happening inside "
     "a converging triangle). Use this as a genuine STARTING characterization "
@@ -612,8 +664,8 @@ _STAGE1_DRAFT_INSTRUCTION = (
     "cost/swap terms (see HOLDING HORIZON above — never a multi-day "
     "swing by default), and should genuinely diversify across the "
     "distinct asset categories actually tradable here (forex, metals, "
-    "commodities/agriculturals, indices, crypto where offered) — aim for "
-    "roughly 1-2 instruments per represented category, favoring the most "
+    "commodities/agriculturals, indices, equities, crypto where offered) "
+    "— aim for roughly 1-2 instruments per represented category, favoring the most "
     "liquid/widely-traded name in each unless a specific, well-researched "
     "secondary name earns its own place. Before including any "
     "instrument, check its feasibility line — only include it if the "
@@ -799,7 +851,7 @@ _INSTRUCTION_TAIL = (
     "genuinely spread risk across the distinct asset categories actually "
     "tradable in the Market Watch instruments below (typically: forex "
     "majors/crosses, metals, energies/agricultural commodities, indices, "
-    "and crypto where offered). Group the mix's positions by category "
+    "equities, and crypto where offered). Group the mix's positions by category "
     "and state each category's total % explicitly; since pct is now risk "
     "(not notional) and total risk is already capped around 10-15% by "
     "item g, judge concentration as a SHARE of that risk budget, not of "
@@ -964,13 +1016,47 @@ _INSTRUCTION_TAIL = (
     "field that actually gets sent to FTMO as the position's real take-"
     "profit order, not just prose, so it must be the same real, cost-"
     "netted number your DEBATE THE STOP AND TARGET reasoning used, not a "
-    "rounded-off or re-guessed one). If an "
+    "rounded-off or re-guessed one), \"reason\" (one or two sentences: "
+    "the specific thesis for THIS target right now — required whenever "
+    "\"pct\" is above 0; may be a short, honest one-liner like \"No "
+    "change from yesterday's thesis\" when a still-held or still-pending "
+    "position's own case genuinely hasn't changed, but must still be a "
+    "real, current statement, not a placeholder), and "
+    "\"invalidation_condition\" (a SPECIFIC, mechanically-checkable "
+    "condition — the exact same style already required for a Pending "
+    "Setup's own \"trigger_condition\" below: an exact price level plus "
+    "an indicator threshold and the timeframe it's read on, e.g. \"H4 "
+    "closes below 1.0900\" or \"RSI(14) breaks above 75 on H1\" — a "
+    "separate automated process re-checks this every 5-15 minutes "
+    "against fresh live technicals for as long as this position stays "
+    "open or pending, and treats it firing as a signal to exit/cancel "
+    "this position immediately, without waiting for the next mega "
+    "analysis; vague language like \"if it stops looking good\" cannot "
+    "be mechanically checked and must not be used. Required whenever "
+    "\"pct\" is above 0; omit it, or set it to null, for \"pct\": 0/CASH, "
+    "since there's nothing left to invalidate). To close an already-held "
+    "position or cancel an already-outstanding pending order RIGHT NOW "
+    "rather than wait for its invalidation_condition, simply give it "
+    "\"pct\": 0 here and explain why in \"reason\" — no different from "
+    "dropping any other instrument from the mix. To update the "
+    "stop-loss and/or take-profit of an already-held position or an "
+    "already-outstanding pending order while keeping the same side and "
+    "the same size, restate it here with the SAME \"pct\" and \"side\" "
+    "but the NEW \"stop_loss\"/\"take_profit\" values — the account's "
+    "own automated execution layer applies the change directly to the "
+    "existing position/order rather than closing and reopening it, so "
+    "this is the correct way to revise a stop or target without "
+    "disturbing an already-committed entry. If an "
     "instrument is currently held (see Current Open Positions above) but "
     "you're not including it in the final mix, it must still appear here "
     "with \"pct\": 0 — never omit a currently-held instrument:\n"
     "```json\n"
-    '{"EXAMPLE_LONG": {"side": "buy", "pct": 1.5, "price": 82.50, "stop_loss": 78.00, "take_profit": 94.00}, '
-    '"EXAMPLE_SHORT": {"side": "sell", "pct": 1.5, "price": 145.00, "stop_loss": 149.50, "take_profit": 133.00}, '
+    '{"EXAMPLE_LONG": {"side": "buy", "pct": 1.5, "price": 82.50, "stop_loss": 78.00, "take_profit": 94.00, '
+    '"reason": "Pullback into a well-tested H4 support zone within an intact uptrend.", '
+    '"invalidation_condition": "H4 closes below 76.00"}, '
+    '"EXAMPLE_SHORT": {"side": "sell", "pct": 1.5, "price": 145.00, "stop_loss": 149.50, "take_profit": 133.00, '
+    '"reason": "Fading a rejection at a heavily-touched H4 resistance level.", '
+    '"invalidation_condition": "H1 RSI(14) breaks above 70"}, '
     '"CASH": 97.0}\n'
     "```"
     "\n\n"
@@ -1072,7 +1158,7 @@ AUDIT_INSTRUCTION = (
     "sign, is a real gap to flag.\n"
     "- Check ASSET-CATEGORY DIVERSIFICATION: does the mix genuinely "
     "spread across the distinct categories actually tradable (forex, "
-    "metals, commodities/agriculturals, indices, crypto where offered), "
+    "metals, commodities/agriculturals, indices, equities, crypto where offered), "
     "roughly 1-2 instruments per represented category, favoring liquid "
     "names by default? Flag over-concentration in one category, an "
     "unjustified total absence of an available category, or 3+ thinly-"
@@ -1099,13 +1185,19 @@ AUDIT_INSTRUCTION = (
     "computed on all four timeframes (monthly, D1, H4, H1) — did the "
     "draft actually engage with each position's computed setup read "
     "(reversal, pullback, range-fade, breakout-watch, trend-following, "
-    "trend-intact, or grind-continuation — trend-intact means a real "
-    "'trending_up'/'trending_down' regime with no more specific trigger "
-    "active right now, grind-continuation means a real net directional "
-    "move over the medium-term window reached via a noisy/choppy path "
-    "rather than a clean trend; BOTH are genuine directional evidence, "
-    "treat a draft dismissing either as 'no real setup' as UNDER-"
-    "weighing real evidence, not a correct caution) rather than ignore it, and does "
+    "trend-intact, grind-continuation, in-progress-move, busted-pattern-"
+    "reversal, or candlestick-reversal-confirmed — trend-intact means a "
+    "real 'trending_up'/'trending_down' regime with no more specific "
+    "trigger active right now, grind-continuation means a real net "
+    "directional move over the medium-term window reached via a noisy/"
+    "choppy path rather than a clean trend, in-progress-move means the "
+    "medium-term regime reads sideways but a shorter window shows a real "
+    "push already underway, busted-pattern-reversal means a double-top/"
+    "bottom's implied direction got contradicted by real subsequent "
+    "price action (Bulkowski's own statistics say these often travel "
+    "FURTHER than the original target); ALL are genuine directional "
+    "evidence, treat a draft dismissing any of them as 'no real setup' "
+    "as UNDER-weighing real evidence, not a correct caution) rather than ignore it, and does "
     "its stated thesis genuinely match that characterization rather "
     "than contradict it (e.g. calling something a trend-following entry "
     "when the H4/H1 setup read says range_fade_candidate)? The monthly/"
@@ -1206,6 +1298,20 @@ AUDIT_INSTRUCTION = (
     "timeframe), not vague language an automated hourly check couldn't "
     "evaluate.\n"
     "\n"
+    "Every non-CASH entry in the main allocation block above should also "
+    "carry its own \"reason\" and, whenever \"pct\" is above 0, its own "
+    "\"invalidation_condition\" — check both the same way you already "
+    "check a Pending Setup's trigger_condition: is invalidation_condition "
+    "genuinely specific and mechanically checkable (a real price level "
+    "plus an indicator threshold and timeframe), not vague language like "
+    "\"if it stops looking good\" that a separate automated process "
+    "checking every 5-15 minutes couldn't actually evaluate? Is "
+    "\"reason\" a real, current statement about THIS target rather than "
+    "an empty string or an obviously copy-pasted placeholder? A missing "
+    "or unusable invalidation_condition on a real position is a genuine "
+    "gap worth flagging — it means nothing will catch a real disaster on "
+    "that position before the next mega session.\n"
+    "\n"
     "Produce a structured audit report — agreements, flaws, gaps, the "
     "backtest scorecard from above, and specific suggested improvements "
     "— not a rewritten competing allocation. Keep your response focused "
@@ -1286,7 +1392,7 @@ class FtmoAssetAnalysis:
     h4_structure: ChartStructureSnapshot
     h1_structure: ChartStructureSnapshot
     trade_cost: TradeCost | None
-    mn1_stats: TechnicalStats = field(default_factory=lambda: TechnicalStats(*([None] * 16)))
+    mn1_stats: TechnicalStats = field(default_factory=lambda: TechnicalStats(*([None] * 17)))
     d1_structure: ChartStructureSnapshot = field(
         default_factory=lambda: ChartStructureSnapshot(fibonacci=None, sr_levels=None, trendlines=None, patterns=[])
     )
@@ -1642,6 +1748,18 @@ def _ftmo_commission_pct_round_turn(
     if category.startswith("Crypto"):
         pct = config.FTMO_COMMISSION_CRYPTO_PCT_ROUND_TURN
         return pct, f"{pct:.4f}% round-turn, user-reported (NOT independently confirmed)"
+    if category.startswith("Equities"):
+        # Direct user correction 2026-08-26: this account's equity
+        # symbols (path category "Equities I CFD", confirmed live) had
+        # no rate at all before this, which read to the model as a real
+        # cost-data gap rather than a genuinely small, known cost — see
+        # config.py's own comment on FTMO_COMMISSION_EQUITIES_PCT_
+        # ROUND_TURN for the exact instruction. startswith (not an exact
+        # match), mirroring Crypto above, in case this account is ever
+        # given a second equities group (e.g. "Equities II CFD") the
+        # same way it already has Crypto I/II and Cash II/III.
+        pct = config.FTMO_COMMISSION_EQUITIES_PCT_ROUND_TURN
+        return pct, f"{pct:.4f}% round-turn, user-reported (NOT independently confirmed)"
     if category == "Agriculture":
         return 0.0, "zero commission, confirmed"
     if category in ("Cash CFD", "Cash II CFD"):
@@ -1723,6 +1841,15 @@ def format_timeframe_stats(symbol: str, label: str, stats: TechnicalStats, *, lo
         # the same way the D1 read's "market type" line already works via
         # ai/portfolio_suggest.py::format_enriched_asset_context.
         bits.append(f"market type: {stats.market_regime}")
+    if stats.momentum_acceleration is not None:
+        # Direct fix for a real, recurring complaint: a medium-term
+        # market_regime of "sideways" can hide several pump/dump swings
+        # cancelling out in its own 60-bar average — this short-window
+        # sibling (see analysis/technical.py's own MOMENTUM_WINDOW
+        # comment) catches a fresh move already underway even when the
+        # line above still reads sideways. Shown unconditionally,
+        # including "stable" — itself useful confirmation, not noise.
+        bits.append(f"short-term momentum (12-bar): {stats.momentum_acceleration}")
     if stats.rsi is not None:
         bits.append(f"RSI {stats.rsi:.0f}")
     if stats.atr_pct is not None:
@@ -2116,16 +2243,98 @@ def format_ftmo_status_context(status: FtmoStatus) -> str:
     return "\n".join(lines)
 
 
+# Real numeric pairwise correlation for FTMO's own candidate instruments —
+# added 2026-08-27, "Phase 2" of the book-wisdom initiative, direct user
+# request: risk management and diverse portfolio creation "within the
+# broker limitations." Mirrors ai.psx_suggest.compute_correlation_pairs/
+# format_correlation_context exactly (same algorithm, same thresholds) —
+# deliberately an FTMO-local copy rather than a shared helper: when PSX's
+# own version was built, it was written directly in ai/psx_suggest.py
+# rather than added to the ai.portfolio_suggest kernel both FTMO and PSX
+# already import shared protocol pieces from (build_audit_block,
+# build_past_lessons, AUDIT_MODELS) — that kernel holds the shared
+# 3-stage draft/audit/revise PROTOCOL, not per-market numeric/enrichment
+# logic, which has consistently stayed local to each market's own module.
+# Reads FtmoAssetAnalysis's nested `.base.symbol`/`.base.prices` (FTMO
+# wraps a PMEX-shape AssetAnalysis under `.base` — see FtmoAssetAnalysis's
+# own docstring — unlike PSX's flat `.symbol`/`.prices`). Needs ZERO new
+# network calls: `.base.prices` already holds a real ~6-year D1 series
+# (_D1_BACKTEST_BARS=1500), fetched once per symbol during
+# analyze_ftmo_assets()'s own existing batch pass.
+_HIGH_CORRELATION_THRESHOLD = 0.7
+_MIN_CORRELATION_OBSERVATIONS = 30  # ~6 trading weeks — mirrors ai.psx_suggest's own threshold
+_MAX_CORRELATION_PAIRS_SHOWN = 15
+
+
+def compute_ftmo_correlation_pairs(analyses: list[FtmoAssetAnalysis]) -> list[tuple[str, str, float]]:
+    """Pairwise correlation of daily returns among the Market Watch pool
+    analyzed this poll. Returns only pairs with |correlation| >=
+    _HIGH_CORRELATION_THRESHOLD, sorted by magnitude descending and
+    capped at _MAX_CORRELATION_PAIRS_SHOWN — see this module's own
+    comment just above for the full rationale (mirrors ai.psx_suggest's
+    identical function)."""
+    returns = {}
+    for a in analyses:
+        prices = a.base.prices.dropna()
+        if len(prices) < _MIN_CORRELATION_OBSERVATIONS:
+            continue
+        returns[a.base.symbol] = prices.pct_change().dropna()
+
+    pairs = []
+    symbols = list(returns.keys())
+    for i, sym_a in enumerate(symbols):
+        for sym_b in symbols[i + 1 :]:
+            aligned = pd.DataFrame({"a": returns[sym_a], "b": returns[sym_b]}).dropna()
+            if len(aligned) < _MIN_CORRELATION_OBSERVATIONS:
+                continue
+            corr = aligned["a"].corr(aligned["b"])
+            if corr is not None and not pd.isna(corr) and abs(corr) >= _HIGH_CORRELATION_THRESHOLD:
+                pairs.append((sym_a, sym_b, float(corr)))
+
+    pairs.sort(key=lambda p: abs(p[2]), reverse=True)
+    return pairs[:_MAX_CORRELATION_PAIRS_SHOWN]
+
+
+def format_ftmo_correlation_context(analyses: list[FtmoAssetAnalysis]) -> str:
+    pairs = compute_ftmo_correlation_pairs(analyses)
+    if not pairs:
+        return (
+            "Pairwise correlation among the Market Watch instruments analyzed "
+            f"above: no pair currently has |correlation| >= {_HIGH_CORRELATION_THRESHOLD} "
+            "— no strong diversification-limiting pairs detected from this data "
+            "alone (this does not rule out correlation building during a shared "
+            "market-wide stress scenario; reason about that separately)."
+        )
+    lines = [
+        "Pairwise correlation among the Market Watch instruments analyzed above "
+        f"(daily returns, only pairs with |r| >= {_HIGH_CORRELATION_THRESHOLD} shown) "
+        "— holding both sides of a strongly positive pair adds concentrated risk "
+        "rather than real diversification; a strongly negative pair can offset "
+        "risk if held together:"
+    ]
+    for sym_a, sym_b, corr in pairs:
+        direction = "move together" if corr > 0 else "move opposite each other"
+        lines.append(f"- {sym_a} & {sym_b}: r={corr:.2f} ({direction})")
+    return "\n".join(lines)
+
+
 def build_ftmo_summary(
     account: AccountSummary,
     assets: list[MarketAsset],
     ftmo_status: FtmoStatus,
     positions: list[Position] | None = None,
     analyses: list[FtmoAssetAnalysis] | None = None,
+    pending_orders: list[PendingOrder] | None = None,
 ) -> str:
     """`analyses` lets a caller (app.py, for charting) compute
     analyze_ftmo_assets(assets) once and reuse it here, instead of this
-    function re-fetching the same H4/H1/contract-spec data internally."""
+    function re-fetching the same H4/H1/contract-spec data internally.
+
+    `pending_orders` (added 2026-08-23, direct user request) surfaces
+    outstanding, not-yet-filled GTC limit orders the same way `positions`
+    already surfaces filled ones — previously invisible to this prompt
+    entirely, even though this account's own suggested trades are placed
+    as pending limit orders that can rest unfilled for hours or days."""
     lines = [
         f"Account: balance {account.balance:.2f} {account.currency}, "
         f"equity {account.equity:.2f}, free margin {account.free_margin:.2f}",
@@ -2134,12 +2343,18 @@ def build_ftmo_summary(
         "",
         format_book_wisdom(),
         "",
+        format_trend_wisdom(),
+        "",
         build_macro_snapshot(),
     ]
 
     positions_context = build_positions_context(positions or [])
     if positions_context:
         lines += ["", positions_context]
+
+    pending_orders_context = build_pending_orders_context(pending_orders or [])
+    if pending_orders_context:
+        lines += ["", pending_orders_context]
 
     fx_context = build_fx_context(account)
     if fx_context:
@@ -2151,6 +2366,8 @@ def build_ftmo_summary(
     else:
         resolved_analyses = analyze_ftmo_assets(assets) if analyses is None else analyses
         lines.append(format_ftmo_asset_context(resolved_analyses, account_equity=account.equity))
+        lines.append("")
+        lines.append(format_ftmo_correlation_context(resolved_analyses))
 
     return "\n".join(lines)
 
@@ -2223,7 +2440,21 @@ def _write_latest_suggestion(final_answer: str) -> None:
             "— leaving the prior latest-suggestion file untouched."
         )
         return
-    immediate_symbols = frozenset(allocation.keys())
+    # Real bug found live 2026-08-25: this used to be frozenset(allocation.
+    # keys()) — ALL symbols, regardless of pct. That's too strict now that
+    # a symbol can legitimately get "pct": 0 specifically to CANCEL/close
+    # it while being separately re-listed in Pending Setups as a fresh
+    # watch idea (e.g. "cancel this stale pending order, replace it with a
+    # cleaner trigger once conditions cool") — Claude did exactly this on
+    # a real run the same day for BTCUSD, and the pre-existing "already in
+    # the allocation block at all" exclusion rejected it as a false
+    # duplicate, failing the WHOLE Pending Setups parse and silently
+    # discarding that day's entire suggestion (including every other
+    # symbol's real reason/invalidation_condition). Only symbols still
+    # carrying REAL, nonzero exposure in the allocation block are still
+    # off-limits for Pending Setups — a pct: 0 entry has nothing left to
+    # conflict with a fresh idea for the same symbol.
+    immediate_symbols = frozenset(sym for sym, entry in allocation.items() if entry.pct > 0)
     pending_setups = parse_pending_setups(final_answer, immediate_symbols=immediate_symbols)
     if pending_setups is None:
         logger.warning(
@@ -2241,6 +2472,8 @@ def _write_latest_suggestion(final_answer: str) -> None:
                 "stop_loss": entry.stop_loss,
                 "take_profit": entry.take_profit,
                 "side": entry.side,
+                "reason": entry.reason,
+                "invalidation_condition": entry.invalidation_condition,
             }
             for symbol, entry in allocation.items()
         },
@@ -2285,17 +2518,19 @@ def suggest_ftmo_portfolio(
     other markets' failure modes don't meaningfully transfer here.
 
     `include_copilot` defaults to False — direct user request: Copilot
-    has a separate, dedicated role for FTMO now (the hourly clerk/
+    has a separate, dedicated role for FTMO now (the 15-minute clerk/
     executioner, see ai/copilot_execution.py) and must not also
     double as an FTMO auditor, whether this is called from the manual
     "Suggest Portfolio Mix" button (app.py) or the unattended scheduled
     run (ai.mega_analysis.run_mega_analysis) — an earlier fix only
     scoped this to the scheduled path, which was too narrow; both FTMO
-    call sites now agree. This is FTMO-specific: PMEX's own
-    ai.portfolio_suggest.suggest_portfolio and PSX's own suggestion
-    pipeline are untouched and still include Copilot in their audit pool
-    by default via build_audit_block's own (unchanged) default of True
-    — only FTMO's relationship with Copilot has changed.
+    call sites now agree. As of 2026-08-25 this is no longer FTMO-
+    specific: PMEX's ai.portfolio_suggest.suggest_portfolio and PSX's
+    suggest_psx_portfolio now also pass include_copilot=False at their
+    own build_audit_block call sites, direct user request — Copilot has
+    no auditor role anywhere in this app for now. build_audit_block's
+    own default parameter is still True (see its own docstring); only
+    every real caller's explicit override changed.
 
     On any genuine (non-CLI-failure) result, ALSO parses it into the
     derived MEGA_ANALYSIS_LATEST_SUGGESTION_FILE artifact (see

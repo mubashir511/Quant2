@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import MetaTrader5 as mt5
 
-from data.mt5_execution import cancel_pending_order, close_position, open_position
+from data.mt5_execution import cancel_pending_order, close_position, modify_position_sltp, open_position
 from data.mt5_source import MT5ConnectionError, Position
 
 
@@ -184,6 +184,70 @@ def test_cancel_pending_order_reports_rejection_without_raising(mock_order_send)
 def test_cancel_pending_order_raises_connection_error_when_order_send_returns_none(mock_order_send):
     try:
         cancel_pending_order(555)
+        assert False, "expected MT5ConnectionError"
+    except MT5ConnectionError:
+        pass
+
+
+@patch("MetaTrader5.order_send")
+def test_modify_position_sltp_sends_correct_sltp_request(mock_order_send):
+    mock_result = MagicMock()
+    mock_result.retcode = 10009
+    mock_result.comment = "Request executed"
+    mock_order_send.return_value = mock_result
+
+    position = _make_position(symbol="GO10OZ", ticket=888)
+    result = modify_position_sltp(position, stop_loss=1950.0, take_profit=2100.0)
+
+    assert result.success is True
+    assert result.ticket == 888
+    request = mock_order_send.call_args.args[0]
+    assert request["action"] == mt5.TRADE_ACTION_SLTP
+    assert request["symbol"] == "GO10OZ"
+    assert request["position"] == 888
+    assert request["sl"] == 1950.0
+    assert request["tp"] == 2100.0
+
+
+@patch("MetaTrader5.order_send")
+def test_modify_position_sltp_always_sends_both_sl_and_tp_even_when_only_one_given(mock_order_send):
+    # TRADE_ACTION_SLTP is not additive -- an omitted key clears that
+    # value to 0 rather than leaving it unchanged, so this function must
+    # never send a request missing either key.
+    mock_result = MagicMock()
+    mock_result.retcode = 10009
+    mock_result.comment = "Request executed"
+    mock_order_send.return_value = mock_result
+
+    position = _make_position(ticket=889)
+    modify_position_sltp(position, stop_loss=1950.0, take_profit=None)
+
+    request = mock_order_send.call_args.args[0]
+    assert request["sl"] == 1950.0
+    assert request["tp"] == 0.0
+    assert "tp" in request
+
+
+@patch("MetaTrader5.order_send")
+def test_modify_position_sltp_reports_rejection_without_raising(mock_order_send):
+    mock_result = MagicMock()
+    mock_result.retcode = 10006  # TRADE_RETCODE_REJECT
+    mock_result.comment = "Rejected"
+    mock_order_send.return_value = mock_result
+
+    position = _make_position(ticket=890)
+    result = modify_position_sltp(position, stop_loss=1950.0, take_profit=2100.0)
+
+    assert result.success is False
+    assert result.ticket is None
+    assert result.comment == "Rejected"
+
+
+@patch("MetaTrader5.order_send", return_value=None)
+def test_modify_position_sltp_raises_connection_error_when_order_send_returns_none(mock_order_send):
+    position = _make_position(ticket=891)
+    try:
+        modify_position_sltp(position, stop_loss=1950.0, take_profit=2100.0)
         assert False, "expected MT5ConnectionError"
     except MT5ConnectionError:
         pass

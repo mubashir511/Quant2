@@ -2,13 +2,13 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from ai.portfolio_suggest import AllocationEntry
-from data.mt5_source import AccountSummary, ContractSpec, MarketAsset, Position
+from data.mt5_source import AccountSummary, ContractSpec, MarketAsset, PendingOrder, Position
 
 
 @dataclass
 class PlannedOrder:
     symbol: str
-    action: str  # "open" | "increase" | "reduce" | "close" | "hold" | "infeasible"
+    action: str  # "open" | "increase" | "reduce" | "close" | "hold" | "infeasible" | "cancel" | "amend_pending" | "amend_position"
     side: str  # "buy" or "sell"
     volume: float
     order_type: str  # "limit" | "market" | "none"
@@ -17,6 +17,8 @@ class PlannedOrder:
     take_profit: float | None = None
     tickets_to_close: list[tuple[int, float]] = field(default_factory=list)
     reason: str = ""
+    pending_tickets_to_cancel: list[int] = field(default_factory=list)  # for "cancel" / "amend_pending"
+    position_tickets_to_amend: list[int] = field(default_factory=list)  # for "amend_position"
 
 
 def _round_down_to_step(value: float, step: float) -> float:
@@ -26,6 +28,19 @@ def _round_down_to_step(value: float, step: float) -> float:
     return round(steps * step, 8)
 
 
+def _pending_order_side(order: PendingOrder) -> str:
+    return "buy" if order.order_type.startswith("buy") else "sell"
+
+
+def _within_tolerance(a: float | None, b: float | None, tolerance_pct: float) -> bool:
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    reference = max(abs(a), abs(b), 1e-9)
+    return abs(a - b) / reference * 100 <= tolerance_pct
+
+
 def compute_rebalance_plan(
     positions: list[Position],
     account: AccountSummary,
@@ -33,6 +48,8 @@ def compute_rebalance_plan(
     get_spec: Callable[[str], ContractSpec | None],
     market_prices: dict[str, MarketAsset],
     price_sanity_band_pct: float = 5.0,
+    pending_orders: list[PendingOrder] | None = None,
+    amend_tolerance_pct: float = 0.05,
 ) -> list[PlannedOrder]:
     """Pure, deterministic diff between what's currently held and the
     AI's target allocation — no network calls, no AI reasoning here, only
@@ -81,6 +98,36 @@ def compute_rebalance_plan(
     something to quietly paper over. A take-profit on the wrong side of
     entry (below entry for a buy, above for a sell) is still just
     dropped (noted in `reason`), since it doesn't affect sizing or risk.
+
+    `pending_orders` (added 2026-08-23, direct user request — letting
+    both Claude and Copilot re-assess an already-suggested position, not
+    just propose fresh ones) makes this function aware of outstanding,
+    not-yet-filled GTC limit orders, which it was completely blind to
+    before: a stale one the fresh target no longer wants gets cancelled
+    (`action="cancel"`), one whose price/stop/target changed gets
+    replaced (`action="amend_pending"` — cancel + reopen, safe since an
+    unfilled order has no realized exposure yet). `amend_tolerance_pct`
+    is how close (as a %) an existing pending order's or position's own
+    numbers must be to the fresh target before treating them as
+    unchanged, rather than thrashing on trivial/rounding differences.
+    An already-HELD position whose stop/target changed while its size
+    didn't gets `action="amend_position"` instead of `"hold"` — a true
+    in-place amend, deliberately never a close-then-reopen (see
+    data/mt5_execution.py::modify_position_sltp's own docstring for why:
+    FTMO's own daily-loss/max-loss tracking keys off REALIZED P&L, so a
+    close purely to re-stamp a stop would prematurely realize floating
+    P&L and distort those exact compliance numbers).
+
+    IMPORTANT invariant this function must never break: `all_symbols`
+    below stays EXACTLY `set(by_symbol) | allocation keys` — pending-
+    order symbols are never added to it. A symbol whose only footprint
+    is a still-unfilled Pending-Setup order (fired by Copilot mid-cycle,
+    deliberately excluded from the allocation dict — see
+    ai/copilot_execution.py::_build_carried_forward_allocation's own
+    docstring) must stay completely invisible here, exactly as before;
+    widening `all_symbols` to include it would give it `entry=None ->
+    pct=0`, and the new "no longer wanted -> cancel" rule would then
+    self-cancel that Pending Setup order the instant Copilot places it.
     """
     plans: list[PlannedOrder] = []
 
@@ -88,10 +135,15 @@ def compute_rebalance_plan(
     for p in positions:
         by_symbol.setdefault(p.symbol, []).append(p)
 
+    pending_by_symbol: dict[str, list[PendingOrder]] = {}
+    for o in (pending_orders or []):
+        pending_by_symbol.setdefault(o.symbol, []).append(o)
+
     all_symbols = set(by_symbol) | {s for s in allocation if s.upper() != "CASH"}
 
     for symbol in sorted(all_symbols):
         symbol_positions = by_symbol.get(symbol, [])
+        symbol_pending = pending_by_symbol.get(symbol, [])
         entry = allocation.get(symbol)
         pct = entry.pct if entry is not None else 0.0
 
@@ -283,17 +335,133 @@ def compute_rebalance_plan(
             )
             continue
 
+        if held_side is None and symbol_pending:
+            # Nothing is filled yet for this symbol, but at least one
+            # pending order already rests on it. `entry` is guaranteed
+            # non-None here per this function's own invariant above
+            # (all_symbols only ever contains held or allocation-key
+            # symbols) — a symbol reached with held_side is None can
+            # only be here via a real allocation key.
+            all_tickets = [o.ticket for o in symbol_pending]
+
+            if pct <= 0:
+                plans.append(
+                    PlannedOrder(
+                        symbol=symbol, action="cancel",
+                        side=_pending_order_side(symbol_pending[0]),
+                        volume=sum(o.volume for o in symbol_pending),
+                        order_type="none", price=None, stop_loss=None,
+                        pending_tickets_to_cancel=all_tickets,
+                        reason=(
+                            "Mega session no longer wants this instrument "
+                            "(pct: 0) — cancelling the outstanding pending order."
+                        ),
+                    )
+                )
+                continue
+
+            # More than one resting order on the same symbol is an
+            # anomaly this pipeline's own code never intentionally
+            # creates — never resolve that to "hold"; always collapse it
+            # to one clean, freshly-sized order at the target's terms.
+            single_order = symbol_pending[0] if len(symbol_pending) == 1 else None
+            unchanged = (
+                single_order is not None
+                and _pending_order_side(single_order) == target_side
+                and abs(single_order.volume - target_lots) < spec.volume_step / 2
+                and _within_tolerance(single_order.price_open, clamped_price, amend_tolerance_pct)
+                and _within_tolerance(single_order.sl, stop_loss, amend_tolerance_pct)
+                and _within_tolerance(single_order.tp, take_profit, amend_tolerance_pct)
+            )
+            if unchanged:
+                plans.append(
+                    PlannedOrder(
+                        symbol=symbol, action="hold", side=target_side, volume=single_order.volume,
+                        order_type="none", price=None, stop_loss=None,
+                        reason="Outstanding pending order already matches today's target — nothing to change.",
+                    )
+                )
+            else:
+                plans.append(
+                    PlannedOrder(
+                        symbol=symbol, action="amend_pending", side=target_side, volume=target_lots,
+                        order_type="limit", price=clamped_price, stop_loss=stop_loss, take_profit=take_profit,
+                        pending_tickets_to_cancel=all_tickets,
+                        reason=(
+                            f"Mega session updated this pending order's terms — "
+                            f"cancelling ticket(s) {all_tickets} and replacing "
+                            f"with the new price/stop/target.{price_note}"
+                        ),
+                    )
+                )
+            continue
+
         delta = target_lots - held_lots
 
         if abs(delta) < spec.volume_step / 2:
-            plans.append(
-                PlannedOrder(
-                    symbol=symbol, action="hold",
-                    side=held_side or target_side or "buy", volume=held_lots,
-                    order_type="none", price=None, stop_loss=None,
-                    reason="Already at target allocation.",
+            # Compares only held_positions[0]'s own sl/tp, not every
+            # ticket individually — a KNOWN, named limitation (found on
+            # self-review 2026-08-24): if this symbol ever accumulates
+            # multiple tickets on the same side (e.g. an original open
+            # plus a later top-up), a PARTIAL amend failure below could
+            # leave one ticket un-amended forever, since a later poll's
+            # aggregate check here would see whichever ticket MT5 happens
+            # to return first and, if THAT one already matches, stop
+            # retrying — never separately verifying the others. Still a
+            # net improvement over the pre-existing behavior (which
+            # never checked sl/tp consistency here AT ALL), and this
+            # multi-ticket-per-symbol case is rare in practice for how
+            # this pipeline actually opens positions; a full per-ticket
+            # amend-and-verify would need real design work, not a quick
+            # fix bolted on here.
+            if held_lots > 0 and pct > 0 and (
+                not _within_tolerance(held_positions[0].sl, stop_loss, amend_tolerance_pct)
+                or not _within_tolerance(held_positions[0].tp, take_profit, amend_tolerance_pct)
+            ):
+                resolved_stop = stop_loss if stop_loss is not None else held_positions[0].sl
+                resolved_target = take_profit if take_profit is not None else held_positions[0].tp
+                plans.append(
+                    PlannedOrder(
+                        symbol=symbol, action="amend_position", side=held_side, volume=held_lots,
+                        order_type="none", price=None,
+                        stop_loss=resolved_stop, take_profit=resolved_target,
+                        position_tickets_to_amend=[p.ticket for p in held_positions],
+                        reason=(
+                            f"Stop/target updated per today's mega session: {entry.reason}"
+                            if entry is not None and entry.reason
+                            else "Stop/target updated per today's mega session."
+                        ),
+                    )
                 )
-            )
+            else:
+                plans.append(
+                    PlannedOrder(
+                        symbol=symbol, action="hold",
+                        side=held_side or target_side or "buy", volume=held_lots,
+                        order_type="none", price=None, stop_loss=None,
+                        reason="Already at target allocation.",
+                    )
+                )
+
+            if symbol_pending:
+                # A stray/superseded pending order (e.g. a leftover
+                # top-up attempt) resting on a symbol that's already at
+                # its target size — cancel it as its own separate entry,
+                # same "two PlannedOrders per symbol" pattern the
+                # genuine-flip branch above already establishes.
+                plans.append(
+                    PlannedOrder(
+                        symbol=symbol, action="cancel",
+                        side=_pending_order_side(symbol_pending[0]),
+                        volume=sum(o.volume for o in symbol_pending),
+                        order_type="none", price=None, stop_loss=None,
+                        pending_tickets_to_cancel=[o.ticket for o in symbol_pending],
+                        reason=(
+                            "Position is already at target size — cancelling a "
+                            "stray/superseded pending order for the same symbol."
+                        ),
+                    )
+                )
             continue
 
         if delta > 0:
@@ -333,6 +501,53 @@ def compute_rebalance_plan(
             )
 
     return plans
+
+
+def pct_for_target_lots(
+    symbol: str,
+    target_lots: float,
+    entry_price: float,
+    stop_loss: float,
+    account_equity: float,
+    get_spec: Callable[[str], ContractSpec | None],
+) -> float | None:
+    """The exact mathematical inverse of compute_rebalance_plan's own
+    risk-based sizing formula above (`target_lots =
+    risk_dollars / (stop_distance * spec.trade_contract_size)`, where
+    `risk_dollars = pct / 100 * account.equity`) — solved here for the
+    `pct` that reproduces a given `target_lots` at a given stop distance.
+
+    Exists for the Execution Clerk's tactical-defense check (added
+    2026-08-27): tightening a position's stop while reusing its OLD `pct`
+    would silently change its lot size, since the same risk-% divided by
+    a SMALLER stop distance yields MORE lots — the opposite of "same
+    size, tighter stop." Calling this with the position's own currently-
+    held lot count (or a fraction of it, for a partial close) and the
+    NEW stop distance recovers the `pct` that actually reproduces the
+    intended lot count once compute_rebalance_plan sizes it.
+
+    `entry_price` must be the same reference price compute_rebalance_plan
+    will itself clamp-and-reuse as `clamped_price` for this symbol (its
+    own suggested/held entry price, not a fresh live market price) —
+    passing a different price here would solve for a `pct` that no
+    longer reproduces `target_lots` once the real sizing pass runs.
+
+    Returns None (never zero or a guess) when there's nothing sound to
+    divide by: no usable spec, a non-positive stop distance, or non-
+    positive equity — mirrors compute_rebalance_plan's own refusal to
+    silently size against a broken input."""
+    if target_lots <= 0:
+        return 0.0
+    if account_equity <= 0:
+        return None
+    spec = get_spec(symbol)
+    if spec is None or spec.trade_contract_size <= 0:
+        return None
+    stop_distance = abs(entry_price - stop_loss)
+    if stop_distance <= 0:
+        return None
+    risk_dollars = target_lots * stop_distance * spec.trade_contract_size
+    return risk_dollars / account_equity * 100
 
 
 def compute_aggregate_heat_pct(allocation: dict[str, AllocationEntry]) -> float:

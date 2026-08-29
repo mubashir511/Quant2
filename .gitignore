@@ -22,4 +22,6 @@ copilot_execution_progress.json
 copilot_execution_enabled.json
 copilot_execution_interval.json
 copilot_execution.lock
+copilot_tactical_defense_enabled.json
 records/
+*.lnk

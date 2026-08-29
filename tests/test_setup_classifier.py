@@ -40,7 +40,7 @@ def _stats(**overrides) -> TechnicalStats:
         change_1m_pct=None, change_3m_pct=None, change_6m_pct=None,
         volatility_annualized_pct=None, support=None, resistance=None,
         range_width_pct=None, market_regime=None, atr=None, atr_pct=None,
-        rsi=None, volume_trend_pct=None,
+        rsi=None, volume_trend_pct=None, momentum_acceleration=None,
     )
     return TechnicalStats(**{**defaults, **overrides})
 
@@ -331,3 +331,159 @@ def test_trend_intact_suppressed_when_pullback_continuation_already_fired():
     ]
     assert "pullback_continuation" in names
     assert "trend_intact" not in names
+
+
+# --- in_progress_move (rule 8) ---
+
+
+def test_in_progress_move_fires_on_sideways_regime_with_accelerating_momentum():
+    signals = classify_setups(
+        _stats(market_regime="sideways", momentum_acceleration="accelerating_up"), _empty_structure()
+    )
+    assert "in_progress_move" in [s.name for s in signals]
+
+    signals_down = classify_setups(
+        _stats(market_regime="sideways", momentum_acceleration="accelerating_down"), _empty_structure()
+    )
+    assert "in_progress_move" in [s.name for s in signals_down]
+
+
+def test_in_progress_move_does_not_fire_when_momentum_is_stable_or_unknown():
+    assert "in_progress_move" not in [
+        s.name
+        for s in classify_setups(
+            _stats(market_regime="sideways", momentum_acceleration="stable"), _empty_structure()
+        )
+    ]
+    assert "in_progress_move" not in [
+        s.name
+        for s in classify_setups(
+            _stats(market_regime="sideways", momentum_acceleration=None), _empty_structure()
+        )
+    ]
+
+
+def test_in_progress_move_does_not_fire_outside_sideways_regime():
+    signals = classify_setups(
+        _stats(market_regime="trending_up", momentum_acceleration="accelerating_up"), _empty_structure()
+    )
+    assert "in_progress_move" not in [s.name for s in signals]
+
+
+# --- busted_pattern_reversal (rule 9) ---
+
+
+def test_busted_pattern_reversal_fires_when_double_top_but_price_confirms_up():
+    structure = _empty_structure(
+        patterns=[ChartPattern(name="double_top", detail="two comparable highs")]
+    )
+    signals = classify_setups(_stats(market_regime="trending_up"), structure)
+    names = [s.name for s in signals]
+    assert "busted_pattern_reversal" in names
+    assert "reversal_candidate" in names  # fires alongside, not instead of
+
+
+def test_busted_pattern_reversal_fires_when_double_bottom_but_price_confirms_down():
+    structure = _empty_structure(
+        patterns=[ChartPattern(name="double_bottom", detail="two comparable lows")]
+    )
+    signals = classify_setups(_stats(market_regime="trending_down"), structure)
+    assert "busted_pattern_reversal" in [s.name for s in signals]
+
+
+def test_busted_pattern_reversal_does_not_fire_when_price_confirms_the_implied_direction():
+    # A double top implies DOWN — price actually confirming down is the
+    # pattern working as intended, not a bust.
+    structure = _empty_structure(
+        patterns=[ChartPattern(name="double_top", detail="two comparable highs")]
+    )
+    signals = classify_setups(_stats(market_regime="trending_down"), structure)
+    names = [s.name for s in signals]
+    assert "busted_pattern_reversal" not in names
+    assert "reversal_candidate" in names
+
+
+def test_busted_pattern_reversal_can_fire_from_momentum_acceleration_alone():
+    structure = _empty_structure(
+        patterns=[ChartPattern(name="double_top", detail="two comparable highs")]
+    )
+    signals = classify_setups(
+        _stats(market_regime=None, momentum_acceleration="accelerating_up"), structure
+    )
+    assert "busted_pattern_reversal" in [s.name for s in signals]
+
+
+def test_busted_pattern_reversal_does_not_fire_without_a_reversal_pattern():
+    signals = classify_setups(_stats(market_regime="trending_up"), _empty_structure())
+    assert "busted_pattern_reversal" not in [s.name for s in signals]
+
+
+# --- candlestick_reversal_confirmed (rule 10) ---
+
+
+def test_candlestick_reversal_confirmed_fires_for_bullish_candle_after_downtrend():
+    structure = _empty_structure(
+        patterns=[ChartPattern(name="hammer", detail="lower shadow 3x the real body")]
+    )
+    signals = classify_setups(_stats(trend="downtrend"), structure)
+    assert "candlestick_reversal_confirmed" in [s.name for s in signals]
+
+
+def test_candlestick_reversal_confirmed_fires_for_bearish_candle_after_uptrend():
+    structure = _empty_structure(
+        patterns=[ChartPattern(name="shooting_star", detail="upper shadow 3x the real body")]
+    )
+    signals = classify_setups(_stats(trend="uptrend"), structure)
+    assert "candlestick_reversal_confirmed" in [s.name for s in signals]
+
+
+def test_candlestick_reversal_confirmed_fires_for_bullish_candle_at_double_bottom():
+    structure = _empty_structure(
+        patterns=[
+            ChartPattern(name="hammer", detail="lower shadow 3x the real body"),
+            ChartPattern(name="double_bottom", detail="two comparable lows"),
+        ]
+    )
+    signals = classify_setups(_stats(trend=None), structure)
+    assert "candlestick_reversal_confirmed" in [s.name for s in signals]
+
+
+def test_candlestick_reversal_confirmed_does_not_fire_in_the_wrong_context():
+    # A bullish candle after an UPtrend has no reversal context to
+    # confirm — not a signal.
+    structure = _empty_structure(
+        patterns=[ChartPattern(name="hammer", detail="lower shadow 3x the real body")]
+    )
+    signals = classify_setups(_stats(trend="uptrend"), structure)
+    assert "candlestick_reversal_confirmed" not in [s.name for s in signals]
+
+
+def test_candlestick_reversal_confirmed_does_not_fire_without_a_candlestick_pattern():
+    signals = classify_setups(_stats(trend="downtrend"), _empty_structure())
+    assert "candlestick_reversal_confirmed" not in [s.name for s in signals]
+
+
+# --- end-to-end: the user's exact original complaint ---
+
+
+def test_end_to_end_in_progress_move_detected_despite_sideways_medium_term_regime():
+    # The user's own exact complaint, reconstructed: 3 pump/dump cycles
+    # (net-zero over the 60-bar window, so market_regime reads sideways
+    # — real swings cancelling out in the window's own average) followed
+    # by a fresh, short 12-bar ramp (small enough not to tip the 60-bar
+    # regime call, but clean/steep enough relative to its own short
+    # window to trip momentum_acceleration) — run through the REAL
+    # compute_technical_stats pipeline, not hand-built TechnicalStats.
+    cycle: list[float] = []
+    for _ in range(3):
+        cycle += [0.5 * i for i in range(8)]
+        cycle += [4.0 - 0.5 * i for i in range(8)]
+    base = [100.0 + c for c in cycle]  # 48 bars, back to ~100 after 3 real swings
+    ramp = [base[-1] + i * 0.25 for i in range(1, 13)]  # 12-bar fresh push, still underway
+    prices = pd.Series(base + ramp)
+    stats = compute_technical_stats(prices)
+    assert stats.market_regime == "sideways"
+    assert stats.momentum_acceleration == "accelerating_up"
+
+    signals = classify_setups(stats, _empty_structure())
+    assert "in_progress_move" in [s.name for s in signals]

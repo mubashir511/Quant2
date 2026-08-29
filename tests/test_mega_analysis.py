@@ -6,9 +6,11 @@ import pytest
 import config
 from ai.claude_cli import CLI_MISSING_MESSAGE
 from ai.mega_analysis import (
-    _write_progress,
+    _write_current_activity,
     _write_state,
+    _write_step,
     is_due,
+    mega_session_is_live,
     next_run_utc,
     read_mega_analysis_enabled,
     read_mega_analysis_trigger,
@@ -228,24 +230,72 @@ def test_run_scheduled_mega_analysis_records_timeout_not_success(_fixed_schedule
     assert "last_run_date_utc" not in state or state["last_run_date_utc"] is None
 
 
-# --- read_progress / _write_progress (live status while a run is happening) ---
+# --- read_progress / _write_step / _write_current_activity (live status while a run is happening) ---
 
 
 def test_read_progress_empty_dict_when_file_missing(_fixed_schedule):
     assert read_progress() == {}
 
 
-def test_write_progress_then_read_progress_round_trips(_fixed_schedule):
-    _write_progress("Analyzing 5/18 — USDCAD")
+def test_write_step_then_read_progress_round_trips(_fixed_schedule):
+    _write_step("Analyzing 5/18 — USDCAD")
     progress = read_progress()
-    assert progress["message"] == "Analyzing 5/18 — USDCAD"
+    assert progress["steps"] == ["Analyzing 5/18 — USDCAD"]
+    assert progress["current_activity"] is None
     assert progress["updated_utc"]  # a real timestamp was recorded
 
 
-def test_write_progress_overwrites_the_previous_message(_fixed_schedule):
-    _write_progress("first message")
-    _write_progress("second message")
-    assert read_progress()["message"] == "second message"
+def test_write_step_appends_rather_than_overwrites(_fixed_schedule):
+    # Direct user request 2026-08-25: the live display should show every
+    # discrete step so far, not just the latest one replacing the last —
+    # this is the behavior that makes that possible.
+    _write_step("first message")
+    _write_step("second message")
+    assert read_progress()["steps"] == ["first message", "second message"]
+
+
+def test_write_current_activity_overwrites_rather_than_appends(_fixed_schedule):
+    # Real bug found live 2026-08-27: the audit-model pool's own
+    # per-second retry/countdown status was being appended as a brand
+    # new entry every tick, ballooning one real run's progress log to
+    # 246+ near-duplicate lines within minutes. current_activity must
+    # replace, not accumulate, no matter how many times it's called.
+    _write_current_activity("0/10 models completed, 10 retrying, 0 gave up")
+    _write_current_activity("0/10 models completed, 1 in progress, 9 retrying, 0 gave up")
+    progress = read_progress()
+    assert progress["current_activity"] == "0/10 models completed, 1 in progress, 9 retrying, 0 gave up"
+
+
+def test_write_current_activity_does_not_touch_steps(_fixed_schedule):
+    _write_step("Running Claude sonnet + the full audit-model pool...")
+    _write_current_activity("3/10 models completed, 2 in progress, 5 gave up")
+    progress = read_progress()
+    assert progress["steps"] == ["Running Claude sonnet + the full audit-model pool..."]
+    assert progress["current_activity"] == "3/10 models completed, 2 in progress, 5 gave up"
+
+
+def test_write_step_clears_stale_current_activity(_fixed_schedule):
+    # Real bug caught before shipping (2026-08-27): once a noisy phase
+    # (the instrument scan, or the audit pool) hands off to a new
+    # discrete milestone, its last current_activity value must not
+    # linger and keep rendering as "live" — the new step is what's live
+    # now.
+    _write_current_activity("Analyzing 18/18 — ETHUSD (D1/H4/H1/monthly + chart structure + trading cost)")
+    _write_step("Analyzed all 18 instruments.")
+    progress = read_progress()
+    assert progress["current_activity"] is None
+    assert progress["steps"] == ["Analyzed all 18 instruments."]
+
+
+def test_reset_progress_clears_a_prior_runs_state(_fixed_schedule):
+    from ai.mega_analysis import _reset_progress
+
+    _write_step("leftover from a previous run")
+    _write_current_activity("leftover activity")
+    _reset_progress()
+    progress = read_progress()
+    assert progress["steps"] == []
+    assert progress["current_activity"] is None
 
 
 def test_read_progress_empty_dict_on_corrupt_file(_fixed_schedule, tmp_path):
@@ -255,16 +305,58 @@ def test_read_progress_empty_dict_on_corrupt_file(_fixed_schedule, tmp_path):
         assert read_progress() == {}
 
 
+# --- mega_session_is_live ---
+
+
+def test_mega_session_is_live_true_when_progress_is_fresh_and_newer_than_last_attempt():
+    now = datetime.now(timezone.utc).isoformat()
+    progress = {"updated_utc": now}
+    state = {"last_attempt_utc": "2020-01-01T00:00:00+00:00"}
+    assert mega_session_is_live(progress, state) is True
+
+
+def test_mega_session_is_live_false_when_no_progress():
+    assert mega_session_is_live({}, {}) is False
+
+
+def test_mega_session_is_live_false_when_progress_is_stale():
+    old = "2020-01-01T00:00:00+00:00"
+    progress = {"updated_utc": old}
+    assert mega_session_is_live(progress, {}) is False
+
+
+def test_mega_session_is_live_false_when_progress_is_older_than_last_completed_attempt():
+    now = datetime.now(timezone.utc).isoformat()
+    progress = {"updated_utc": now}
+    state = {"last_attempt_utc": now}  # a completed attempt at least as new as the progress marker
+    assert mega_session_is_live(progress, state) is False
+
+
+def test_mega_session_is_live_true_after_a_long_silent_gap_under_the_real_run_ceiling():
+    # Real bug found live 2026-08-27: a flat 5-minute staleness cutoff
+    # wrongly marked a genuinely still-running session as dead, because
+    # a single step (e.g. Claude's own multi-minute web-research call)
+    # can go quiet for longer than that with nothing new to report. 20
+    # minutes of silence must still read as live — well past the old
+    # 300-second cutoff, comfortably under the real _RUN_TIMEOUT_SECONDS
+    # ceiling.
+    old_but_within_run_budget = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+    progress = {"updated_utc": old_but_within_run_budget}
+    state = {"last_attempt_utc": "2020-01-01T00:00:00+00:00"}
+    assert mega_session_is_live(progress, state) is True
+
+
 @patch("ai.mega_analysis.suggest_ftmo_portfolio", return_value="a real suggestion")
 @patch("ai.mega_analysis.build_ftmo_summary", return_value="summary text")
 @patch("ai.mega_analysis.analyze_ftmo_assets", return_value=[])
 @patch("ai.mega_analysis.fetch_ftmo_status")
+@patch("ai.mega_analysis.get_pending_orders", return_value=[])
 @patch("ai.mega_analysis.get_open_positions", return_value=[])
 @patch("ai.mega_analysis.get_market_watch", return_value=["EURUSD"])
 @patch("ai.mega_analysis.get_account_summary")
 @patch("ai.mega_analysis.connect")
 def test_run_mega_analysis_broadcasts_live_progress_without_a_caller_supplied_callback(
-    mock_connect, mock_account, mock_watch, mock_positions, mock_status,
+    mock_connect, mock_account, mock_watch, mock_positions, mock_pending_orders, mock_status,
     mock_analyze, mock_summary, mock_suggest, _fixed_schedule,
 ):
     # Direct user request 2026-08-22: the unattended run (which never
@@ -278,19 +370,88 @@ def test_run_mega_analysis_broadcasts_live_progress_without_a_caller_supplied_ca
     run_mega_analysis()
 
     progress = read_progress()
-    assert progress["message"] == "Running Claude sonnet + the full audit-model pool..."
+    assert "Running Claude sonnet + the full audit-model pool..." in progress["steps"]
+
+
+@patch("ai.mega_analysis.suggest_ftmo_portfolio", return_value="a real suggestion")
+@patch("ai.mega_analysis.build_ftmo_summary", return_value="summary text")
+@patch("ai.mega_analysis.analyze_ftmo_assets")
+@patch("ai.mega_analysis.fetch_ftmo_status")
+@patch("ai.mega_analysis.get_pending_orders", return_value=[])
+@patch("ai.mega_analysis.get_open_positions", return_value=[])
+@patch("ai.mega_analysis.get_market_watch", return_value=["EURUSD", "GBPUSD"])
+@patch("ai.mega_analysis.get_account_summary")
+@patch("ai.mega_analysis.connect")
+def test_run_mega_analysis_reports_per_instrument_progress_as_current_activity_not_steps(
+    mock_connect, mock_account, mock_watch, mock_positions, mock_pending_orders, mock_status,
+    mock_analyze, mock_summary, mock_suggest, _fixed_schedule,
+):
+    # Direct user request 2026-08-27, after seeing a mock-up render each
+    # instrument as its own permanent checkmarked line: "just use one
+    # message only dynamically update it 18 times... and also update
+    # the symbol names as well simultaneously" — per-instrument progress
+    # must overwrite current_activity, the same self-superseding-status
+    # category as the audit pool, not grow the permanent steps list by
+    # one entry per instrument.
+    from ai.mega_analysis import run_mega_analysis
+
+    def _fake_analyze(assets, on_progress=None):
+        on_progress("Analyzing 1/2 — EURUSD (D1/H4/H1/monthly + chart structure + trading cost)")
+        on_progress("Analyzing 2/2 — GBPUSD (D1/H4/H1/monthly + chart structure + trading cost)")
+        return []
+
+    mock_analyze.side_effect = _fake_analyze
+
+    run_mega_analysis()
+
+    progress = read_progress()
+    assert not any("EURUSD" in step or "GBPUSD" in step for step in progress["steps"])
+    assert "Analyzed all 2 instruments." in progress["steps"]
+    # The last per-instrument message must not linger as a stale
+    # current_activity once the scan hands off to the next milestone.
+    assert progress["current_activity"] is None
 
 
 @patch("ai.mega_analysis.suggest_ftmo_portfolio", return_value="a real suggestion")
 @patch("ai.mega_analysis.build_ftmo_summary", return_value="summary text")
 @patch("ai.mega_analysis.analyze_ftmo_assets", return_value=[])
 @patch("ai.mega_analysis.fetch_ftmo_status")
+@patch("ai.mega_analysis.get_pending_orders")
+@patch("ai.mega_analysis.get_open_positions", return_value=[])
+@patch("ai.mega_analysis.get_market_watch", return_value=["EURUSD"])
+@patch("ai.mega_analysis.get_account_summary")
+@patch("ai.mega_analysis.connect")
+def test_run_mega_analysis_fetches_and_passes_pending_orders_into_build_ftmo_summary(
+    mock_connect, mock_account, mock_watch, mock_positions, mock_pending_orders, mock_status,
+    mock_analyze, mock_summary, mock_suggest, _fixed_schedule,
+):
+    # Real gap this proves closed: build_ftmo_summary previously had zero
+    # visibility into outstanding pending limit orders at all.
+    from ai.mega_analysis import run_mega_analysis
+    from data.mt5_source import PendingOrder
+
+    sentinel_orders = [
+        PendingOrder(symbol="EURUSD", volume=1.0, order_type="buy limit", price_open=1.09, sl=1.08, tp=None, ticket=777)
+    ]
+    mock_pending_orders.return_value = sentinel_orders
+
+    run_mega_analysis()
+
+    mock_summary.assert_called_once()
+    assert mock_summary.call_args.kwargs["pending_orders"] == sentinel_orders
+
+
+@patch("ai.mega_analysis.suggest_ftmo_portfolio", return_value="a real suggestion")
+@patch("ai.mega_analysis.build_ftmo_summary", return_value="summary text")
+@patch("ai.mega_analysis.analyze_ftmo_assets", return_value=[])
+@patch("ai.mega_analysis.fetch_ftmo_status")
+@patch("ai.mega_analysis.get_pending_orders", return_value=[])
 @patch("ai.mega_analysis.get_open_positions", return_value=[])
 @patch("ai.mega_analysis.get_market_watch", return_value=["EURUSD"])
 @patch("ai.mega_analysis.get_account_summary")
 @patch("ai.mega_analysis.connect")
 def test_run_mega_analysis_excludes_copilot_from_the_audit_pool(
-    mock_connect, mock_account, mock_watch, mock_positions, mock_status,
+    mock_connect, mock_account, mock_watch, mock_positions, mock_pending_orders, mock_status,
     mock_analyze, mock_summary, mock_suggest, _fixed_schedule,
 ):
     # Direct user request 2026-08-22: Copilot has a separate, dedicated
@@ -309,12 +470,13 @@ def test_run_mega_analysis_excludes_copilot_from_the_audit_pool(
 @patch("ai.mega_analysis.build_ftmo_summary", return_value="summary text")
 @patch("ai.mega_analysis.analyze_ftmo_assets", return_value=[])
 @patch("ai.mega_analysis.fetch_ftmo_status")
+@patch("ai.mega_analysis.get_pending_orders", return_value=[])
 @patch("ai.mega_analysis.get_open_positions", return_value=[])
 @patch("ai.mega_analysis.get_market_watch", return_value=["EURUSD"])
 @patch("ai.mega_analysis.get_account_summary")
 @patch("ai.mega_analysis.connect")
 def test_run_mega_analysis_broadcasts_audit_progress_too(
-    mock_connect, mock_account, mock_watch, mock_positions, mock_status,
+    mock_connect, mock_account, mock_watch, mock_positions, mock_pending_orders, mock_status,
     mock_analyze, mock_summary, mock_suggest, _fixed_schedule,
 ):
     from ai.mega_analysis import run_mega_analysis
@@ -327,4 +489,4 @@ def test_run_mega_analysis_broadcasts_audit_progress_too(
 
     run_mega_analysis()
 
-    assert read_progress()["message"] == "gpt-4: analyzing..."
+    assert read_progress()["current_activity"] == "gpt-4: analyzing..."

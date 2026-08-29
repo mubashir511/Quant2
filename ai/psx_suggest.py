@@ -1595,6 +1595,7 @@ def suggest_psx_portfolio(
         on_progress=on_audit_progress,
         audit_instruction=AUDIT_INSTRUCTION,
         past_lessons=past_lessons,
+        include_copilot=False,
     )
     _notify(
         "Audit received — Claude is revising its suggestion..."

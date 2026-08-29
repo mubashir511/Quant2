@@ -9,11 +9,16 @@ import config
 from ai.copilot_cli import CLI_FAILED_PREFIX as COPILOT_FAILED_PREFIX
 from ai.copilot_cli import CLI_MISSING_MESSAGE as COPILOT_MISSING_MESSAGE
 from ai.copilot_execution import (
+    COPILOT_BACKUP_MODELS,
     SymbolSettlement,
     _build_carried_forward_allocation,
+    _is_copilot_unavailable,
+    _is_openrouter_unavailable,
     _mega_session_is_live,
     _reconcile_settlement,
     _reset_settlement_for_new_session,
+    _run_clerk_prompt,
+    execution_check_is_live,
     is_execution_due,
     next_execution_check_utc,
     parse_copilot_verdict,
@@ -21,10 +26,13 @@ from ai.copilot_execution import (
     read_copilot_execution_interval_minutes,
     read_execution_progress,
     read_execution_state,
+    read_settlement,
     run_copilot_execution_check,
     set_copilot_execution_enabled,
     set_copilot_execution_interval_minutes,
 )
+from ai.openrouter_client import FAILED_MESSAGE as OPENROUTER_FAILED_MESSAGE
+from ai.openrouter_client import MISSING_KEY_MESSAGE as OPENROUTER_MISSING_KEY_MESSAGE
 from ai.portfolio_suggest import AllocationEntry, PendingSetup
 from data.mt5_execution import OrderResult
 from data.mt5_source import PendingOrder, Position
@@ -42,6 +50,8 @@ def _fixed_files(tmp_path):
         patch.object(config, "COPILOT_EXECUTION_CHECK_INTERVAL_MINUTES", 15),
         patch.object(config, "COPILOT_EXECUTION_GRACE_MINUTES", 10),
         patch.object(config, "COPILOT_EXECUTION_MAX_PENDING_SETUPS", 10),
+        patch.object(config, "COPILOT_EXECUTION_MAX_WATCHED_POSITIONS", 10),
+        patch.object(config, "AMEND_TOLERANCE_PCT", 0.05),
         # Isolated proactively (2026-08-23) — the mega-analysis enabled
         # toggle already caused a real collision the same day where the
         # live app's own genuine use of a brand-new toggle broke tests
@@ -204,6 +214,45 @@ def test_carried_forward_allocation_excludes_cash():
     immediate_allocation_raw = {"CASH": {"pct": 98.5, "side": "buy"}}
     carried = _build_carried_forward_allocation(immediate_allocation_raw, {})
     assert carried == {}
+
+
+def test_carried_forward_allocation_preserves_reason_and_invalidation_condition():
+    # Real bug found on self-review 2026-08-24: _allocation_entry_from_dict
+    # silently dropped reason/invalidation_condition, so a symbol's own
+    # thesis/watch-condition disappeared the moment it was carried forward
+    # across a poll — no safety impact (watched_positions reads straight
+    # from immediate_allocation_raw, not through this path), but it did
+    # mean the amend_position reason text always fell back to a generic
+    # message instead of the real thesis.
+    immediate_allocation_raw = {
+        "EURUSD": {
+            "pct": 1.5, "side": "buy", "price": 1.09, "stop_loss": 1.08,
+            "reason": "Pullback into H4 support.", "invalidation_condition": "H4 closes below 1.07",
+        }
+    }
+    carried = _build_carried_forward_allocation(immediate_allocation_raw, {})
+    assert carried["EURUSD"].reason == "Pullback into H4 support."
+    assert carried["EURUSD"].invalidation_condition == "H4 closes below 1.07"
+
+
+def test_filled_symbol_carry_forward_preserves_reason_and_invalidation_condition():
+    # The settlement-entry path (the second loop) must ALSO preserve
+    # these fields, since a filled Pending-Setup-originated symbol is
+    # carried forward from settlement["settled"][symbol]["entry"], not
+    # from immediate_allocation_raw.
+    settled = {
+        "XAUUSD": {
+            "origin": "pending_setup", "state": "filled",
+            "entry": {
+                "pct": 1.0, "side": "buy", "price": 2000.0, "stop_loss": 1980.0,
+                "reason": "Trigger fired.", "invalidation_condition": "H1 RSI below 30",
+            },
+            "order_ticket": 100,
+        }
+    }
+    carried = _build_carried_forward_allocation({}, settled)
+    assert carried["XAUUSD"].reason == "Trigger fired."
+    assert carried["XAUUSD"].invalidation_condition == "H1 RSI below 30"
 
 
 # --- settlement reset: cancels unfilled orders, resets tracking ---
@@ -471,6 +520,51 @@ def test_mega_session_is_live_false_when_progress_is_older_than_last_completed_a
     assert _mega_session_is_live(progress, state) is False
 
 
+# --- execution_check_is_live ---
+
+
+def test_execution_check_is_live_true_when_progress_is_fresh_and_newer_than_last_attempt():
+    now = datetime.now(timezone.utc).isoformat()
+    progress = {"updated_utc": now}
+    state = {"last_attempt_utc": "2020-01-01T00:00:00+00:00"}
+    assert execution_check_is_live(progress, state) is True
+
+
+def test_execution_check_is_live_false_when_no_progress():
+    assert execution_check_is_live({}, {}) is False
+
+
+def test_execution_check_is_live_false_when_progress_is_stale():
+    old = "2020-01-01T00:00:00+00:00"
+    progress = {"updated_utc": old}
+    assert execution_check_is_live(progress, {}) is False
+
+
+def test_execution_check_is_live_false_when_progress_is_older_than_last_completed_attempt():
+    now = datetime.now(timezone.utc).isoformat()
+    progress = {"updated_utc": now}
+    state = {"last_attempt_utc": now}
+    assert execution_check_is_live(progress, state) is False
+
+
+def test_execution_check_is_live_true_within_the_real_run_ceiling_past_the_old_5_minute_cutoff():
+    # Real bug found live 2026-08-27 (the same day, and the same root
+    # cause, as ai.mega_analysis.mega_session_is_live's own equivalent
+    # fix): a flat 5-minute cutoff wrongly hid this panel's live-status
+    # banner mid-run whenever a verdict check ran long — e.g. via the
+    # OpenRouter backup chain retrying, which was independently
+    # confirmed live the same day to sometimes take several minutes
+    # across all of its models at once. 8 minutes must still read as
+    # live — past the old 300-second cutoff, comfortably under the real
+    # config.COPILOT_EXECUTION_RUN_TIMEOUT_SECONDS ceiling (600s default).
+    from datetime import timedelta
+
+    old_but_within_run_budget = (datetime.now(timezone.utc) - timedelta(minutes=8)).isoformat()
+    progress = {"updated_utc": old_but_within_run_budget}
+    state = {"last_attempt_utc": "2020-01-01T00:00:00+00:00"}
+    assert execution_check_is_live(progress, state) is True
+
+
 # --- run_copilot_execution_check: end-to-end with everything mocked ---
 
 
@@ -633,6 +727,101 @@ def test_run_copilot_execution_check_never_executes_when_safety_gate_blocks(
     assert state["last_status"] == "blocked"
 
 
+# --- Copilot backup chain (_run_clerk_prompt) ---
+
+
+def test_copilot_backup_models_has_five_entries_in_priority_order():
+    assert COPILOT_BACKUP_MODELS == [
+        ("Nvidia Nemotron-Ultra-550B", "nvidia/nemotron-3-ultra-550b-a55b:free"),
+        ("Nvidia Nemotron-Super-120B", "nvidia/nemotron-3-super-120b-a12b:free"),
+        ("Dots Studio Dots3-Note Preview", "dots-studio/dots-3-note-preview:free"),
+        ("Nvidia Nemotron-Nano-Omni-30B-Reasoning", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"),
+        ("Poolside Laguna S 2.1", "poolside/laguna-s-2.1:free"),
+    ]
+
+
+def test_is_copilot_unavailable_true_for_missing_and_failed_sentinels():
+    assert _is_copilot_unavailable(COPILOT_MISSING_MESSAGE) is True
+    assert _is_copilot_unavailable(f"{COPILOT_FAILED_PREFIX} (quota exceeded).") is True
+
+
+def test_is_copilot_unavailable_false_for_a_real_response():
+    assert _is_copilot_unavailable("Some real reasoning.\nFINAL_VERDICT: NOT_CONFIRMED") is False
+
+
+def test_is_openrouter_unavailable_true_for_missing_and_failed_sentinels():
+    assert _is_openrouter_unavailable(OPENROUTER_MISSING_KEY_MESSAGE) is True
+    assert _is_openrouter_unavailable(OPENROUTER_FAILED_MESSAGE) is True
+
+
+def test_is_openrouter_unavailable_false_for_a_real_response():
+    assert _is_openrouter_unavailable("Some real reasoning.\nFINAL_VERDICT: CONFIRMED") is False
+
+
+@patch("ai.copilot_execution.run_openrouter")
+@patch("ai.copilot_execution.run_copilot", return_value="Real reasoning.\nFINAL_VERDICT: NOT_CONFIRMED")
+def test_run_clerk_prompt_uses_copilot_when_available(mock_copilot, mock_openrouter):
+    result = _run_clerk_prompt("some prompt", timeout=240)
+    assert result == "Real reasoning.\nFINAL_VERDICT: NOT_CONFIRMED"
+    mock_openrouter.assert_not_called()
+
+
+@patch("ai.copilot_execution.run_openrouter", return_value="Backup reasoning.\nFINAL_VERDICT: CONFIRMED")
+@patch("ai.copilot_execution.run_copilot", return_value=f"{COPILOT_FAILED_PREFIX} (quota exceeded).")
+def test_run_clerk_prompt_falls_back_to_first_backup_on_copilot_failure(mock_copilot, mock_openrouter):
+    result = _run_clerk_prompt("some prompt", timeout=240)
+    assert "Nvidia Nemotron-Ultra-550B" in result
+    assert "Backup reasoning.\nFINAL_VERDICT: CONFIRMED" in result
+    mock_openrouter.assert_called_once()
+    _, kwargs = mock_openrouter.call_args
+    assert kwargs["model"] == "nvidia/nemotron-3-ultra-550b-a55b:free"
+
+
+@patch("ai.copilot_execution.run_copilot", return_value=COPILOT_MISSING_MESSAGE)
+def test_run_clerk_prompt_treats_cli_missing_message_as_unavailable_too(mock_copilot):
+    with patch(
+        "ai.copilot_execution.run_openrouter", return_value="Backup reasoning.\nFINAL_VERDICT: CONFIRMED"
+    ) as mock_openrouter:
+        result = _run_clerk_prompt("some prompt", timeout=240)
+    assert "FINAL_VERDICT: CONFIRMED" in result
+    mock_openrouter.assert_called_once()
+
+
+@patch("ai.copilot_execution.run_copilot", return_value=f"{COPILOT_FAILED_PREFIX} (quota exceeded).")
+def test_run_clerk_prompt_tries_backups_in_order_until_one_succeeds(mock_copilot):
+    with patch(
+        "ai.copilot_execution.run_openrouter",
+        side_effect=[OPENROUTER_FAILED_MESSAGE, OPENROUTER_FAILED_MESSAGE, "Third backup answered.\nFINAL_VERDICT: CONFIRMED"],
+    ) as mock_openrouter:
+        result = _run_clerk_prompt("some prompt", timeout=240)
+    assert "Dots Studio Dots3-Note Preview" in result
+    assert "Third backup answered." in result
+    assert mock_openrouter.call_count == 3
+    models_tried = [call.kwargs["model"] for call in mock_openrouter.call_args_list]
+    assert models_tried == [
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "dots-studio/dots-3-note-preview:free",
+    ]
+
+
+@patch("ai.copilot_execution.run_openrouter", return_value=OPENROUTER_FAILED_MESSAGE)
+@patch("ai.copilot_execution.run_copilot", return_value=f"{COPILOT_FAILED_PREFIX} (quota exceeded).")
+def test_run_clerk_prompt_returns_original_copilot_failure_when_all_backups_fail(mock_copilot, mock_openrouter):
+    result = _run_clerk_prompt("some prompt", timeout=240)
+    assert result == f"{COPILOT_FAILED_PREFIX} (quota exceeded)."
+    assert mock_openrouter.call_count == len(COPILOT_BACKUP_MODELS)
+    assert parse_copilot_verdict(result) is False
+
+
+def test_parse_copilot_verdict_still_works_on_a_backup_attributed_response():
+    text = (
+        "[Copilot unavailable — backup reviewer Nvidia Nemotron-Ultra-550B responded]\n\n"
+        "Some reasoning about the condition.\nFINAL_VERDICT: CONFIRMED"
+    )
+    assert parse_copilot_verdict(text) is True
+
+
 @patch("ai.copilot_execution._run_copilot_verdict")
 @patch("ai.copilot_execution._fetch_technical_context", return_value="fake technical context")
 @patch("ai.copilot_execution.open_position")
@@ -721,6 +910,381 @@ def test_run_copilot_execution_check_does_not_execute_an_unconfirmed_pending_set
     mock_open.assert_not_called()
     state = read_execution_state()
     assert state["last_verdicts"]["XAUUSD"]["confirmed"] is False
+
+
+# --- watched positions: Copilot's own invalidation-condition check (2026-08-23) ---
+
+
+def _seed_settled(fixed_files, symbol, state, generated_utc, entry=None):
+    Path(config.COPILOT_EXECUTION_SETTLEMENT_FILE).write_text(json.dumps({
+        "generated_utc": generated_utc,
+        "settled": {
+            symbol: {
+                "origin": "immediate", "state": state,
+                "entry": entry or {"pct": 1.0, "price": 1.09, "stop_loss": 1.08, "take_profit": None, "side": "buy"},
+                "order_ticket": 100,
+            }
+        },
+    }))
+
+
+@patch("ai.copilot_execution._run_copilot_invalidation_check")
+@patch("ai.copilot_execution._fetch_technical_context", return_value="fake technical context")
+@patch("ai.copilot_execution.close_position")
+@patch("ai.copilot_execution.is_trading_permitted", return_value=(True, ""))
+@patch("ai.copilot_execution.fetch_ftmo_status")
+@patch("ai.copilot_execution.get_market_watch")
+@patch("ai.copilot_execution.get_pending_orders", return_value=[])
+@patch("ai.copilot_execution.get_open_positions")
+@patch("ai.copilot_execution.get_account_summary")
+@patch("ai.copilot_execution.connect")
+def test_confirmed_invalidation_forces_pct_zero_and_closes_the_position(
+    mock_connect, mock_account, mock_positions, mock_pending, mock_watch,
+    mock_status, mock_permitted, mock_close, mock_fetch_ctx, mock_invalidation, _fixed_files,
+):
+    from data.mt5_source import AccountSummary, ContractSpec, MarketAsset
+    from risk.ftmo_rules import FtmoStatus
+
+    mock_account.return_value = AccountSummary(balance=100000.0, equity=100000.0, free_margin=90000.0, currency="USD")
+    mock_positions.return_value = [_position(symbol="EURUSD", side="buy", volume=1.0, ticket=200)]
+    mock_watch.return_value = [MarketAsset(symbol="EURUSD", description="Euro", bid=1.0899, ask=1.0900)]
+    mock_status.return_value = FtmoStatus(
+        daily_loss_limit_pct=3.0, today_realized_pl=0.0, today_floating_pl=0.0, today_total_pl=0.0,
+        daily_loss_headroom_pct=3.0, trailing_max_loss_floor=90000.0, max_loss_headroom_pct=10.0,
+        best_day_pl=None, total_positive_days_pl=None, best_day_rule_pct=None,
+    )
+    mock_close.return_value = OrderResult(success=True, retcode=10009, comment="ok", ticket=200)
+    mock_invalidation.return_value = ("EURUSD", True, "FINAL_VERDICT: CONFIRMED")
+
+    generated_utc = datetime.now(timezone.utc).isoformat()
+    entry = {
+        "pct": 1.0, "price": 1.0900, "stop_loss": 1.0850, "take_profit": None,
+        "side": "buy", "reason": "r", "invalidation_condition": "H1 closes below 1.0800",
+    }
+    _write_suggestion(_fixed_files, immediate_allocation={"EURUSD": entry}, generated_utc=generated_utc)
+    _seed_settled(_fixed_files, "EURUSD", "filled", generated_utc, entry=entry)
+
+    with patch("ai.copilot_execution.get_contract_spec") as mock_spec:
+        mock_spec.return_value = ContractSpec(
+            volume_min=0.01, volume_step=0.01, volume_max=100.0,
+            trade_contract_size=100000.0, currency_margin="USD", margin_initial=1000.0,
+        )
+        run_copilot_execution_check()
+
+    mock_invalidation.assert_called_once()
+    mock_close.assert_called_once()
+    state = read_execution_state()
+    assert state["last_verdicts"]["EURUSD"]["confirmed"] is True
+
+
+@patch("ai.copilot_execution._run_copilot_invalidation_check")
+@patch("ai.copilot_execution._fetch_technical_context", return_value="fake technical context")
+@patch("ai.copilot_execution.close_position")
+@patch("ai.copilot_execution.is_trading_permitted", return_value=(True, ""))
+@patch("ai.copilot_execution.fetch_ftmo_status")
+@patch("ai.copilot_execution.get_market_watch")
+@patch("ai.copilot_execution.get_pending_orders", return_value=[])
+@patch("ai.copilot_execution.get_open_positions")
+@patch("ai.copilot_execution.get_account_summary")
+@patch("ai.copilot_execution.connect")
+def test_not_confirmed_invalidation_leaves_merged_allocation_unchanged(
+    mock_connect, mock_account, mock_positions, mock_pending, mock_watch,
+    mock_status, mock_permitted, mock_close, mock_fetch_ctx, mock_invalidation, _fixed_files,
+):
+    from data.mt5_source import AccountSummary, ContractSpec, MarketAsset
+    from risk.ftmo_rules import FtmoStatus
+
+    mock_account.return_value = AccountSummary(balance=100000.0, equity=100000.0, free_margin=90000.0, currency="USD")
+    mock_positions.return_value = [_position(symbol="EURUSD", side="buy", volume=1.0, ticket=200)]
+    mock_watch.return_value = [MarketAsset(symbol="EURUSD", description="Euro", bid=1.0899, ask=1.0900)]
+    mock_status.return_value = FtmoStatus(
+        daily_loss_limit_pct=3.0, today_realized_pl=0.0, today_floating_pl=0.0, today_total_pl=0.0,
+        daily_loss_headroom_pct=3.0, trailing_max_loss_floor=90000.0, max_loss_headroom_pct=10.0,
+        best_day_pl=None, total_positive_days_pl=None, best_day_rule_pct=None,
+    )
+    mock_invalidation.return_value = ("EURUSD", False, "FINAL_VERDICT: NOT_CONFIRMED")
+
+    generated_utc = datetime.now(timezone.utc).isoformat()
+    entry = {
+        "pct": 1.0, "price": 1.0900, "stop_loss": 1.0850, "take_profit": None,
+        "side": "buy", "reason": "r", "invalidation_condition": "H1 closes below 1.0800",
+    }
+    _write_suggestion(_fixed_files, immediate_allocation={"EURUSD": entry}, generated_utc=generated_utc)
+    _seed_settled(_fixed_files, "EURUSD", "filled", generated_utc, entry=entry)
+
+    with patch("ai.copilot_execution.get_contract_spec") as mock_spec:
+        mock_spec.return_value = ContractSpec(
+            volume_min=0.01, volume_step=0.01, volume_max=100.0,
+            trade_contract_size=100000.0, currency_margin="USD", margin_initial=1000.0,
+        )
+        run_copilot_execution_check()
+
+    mock_invalidation.assert_called_once()
+    mock_close.assert_not_called()
+    state = read_execution_state()
+    assert state["last_verdicts"]["EURUSD"]["confirmed"] is False
+
+
+@patch("ai.copilot_execution._run_copilot_invalidation_check")
+@patch("ai.copilot_execution.is_trading_permitted", return_value=(True, ""))
+@patch("ai.copilot_execution.fetch_ftmo_status")
+@patch("ai.copilot_execution.get_market_watch")
+@patch("ai.copilot_execution.get_pending_orders", return_value=[])
+@patch("ai.copilot_execution.get_open_positions")
+@patch("ai.copilot_execution.get_account_summary")
+@patch("ai.copilot_execution.connect")
+def test_watched_positions_excludes_symbols_without_invalidation_condition(
+    mock_connect, mock_account, mock_positions, mock_pending, mock_watch,
+    mock_status, mock_permitted, mock_invalidation, _fixed_files,
+):
+    from data.mt5_source import AccountSummary, ContractSpec, MarketAsset
+    from risk.ftmo_rules import FtmoStatus
+
+    mock_account.return_value = AccountSummary(balance=100000.0, equity=100000.0, free_margin=90000.0, currency="USD")
+    mock_positions.return_value = [_position(symbol="EURUSD", side="buy", volume=1.0, ticket=200)]
+    mock_watch.return_value = [MarketAsset(symbol="EURUSD", description="Euro", bid=1.0899, ask=1.0900)]
+    mock_status.return_value = FtmoStatus(
+        daily_loss_limit_pct=3.0, today_realized_pl=0.0, today_floating_pl=0.0, today_total_pl=0.0,
+        daily_loss_headroom_pct=3.0, trailing_max_loss_floor=90000.0, max_loss_headroom_pct=10.0,
+        best_day_pl=None, total_positive_days_pl=None, best_day_rule_pct=None,
+    )
+
+    generated_utc = datetime.now(timezone.utc).isoformat()
+    # No invalidation_condition key at all -- must never be watched.
+    entry = {"pct": 1.0, "price": 1.0900, "stop_loss": 1.0850, "take_profit": None, "side": "buy", "reason": "r"}
+    _write_suggestion(_fixed_files, immediate_allocation={"EURUSD": entry}, generated_utc=generated_utc)
+    _seed_settled(_fixed_files, "EURUSD", "filled", generated_utc, entry=entry)
+
+    with patch("ai.copilot_execution.get_contract_spec") as mock_spec, patch("ai.copilot_execution.close_position"):
+        mock_spec.return_value = ContractSpec(
+            volume_min=0.01, volume_step=0.01, volume_max=100.0,
+            trade_contract_size=100000.0, currency_margin="USD", margin_initial=1000.0,
+        )
+        run_copilot_execution_check()
+
+    mock_invalidation.assert_not_called()
+
+
+@patch("ai.copilot_execution._run_copilot_invalidation_check")
+@patch("ai.copilot_execution.is_trading_permitted", return_value=(True, ""))
+@patch("ai.copilot_execution.fetch_ftmo_status")
+@patch("ai.copilot_execution.get_market_watch")
+@patch("ai.copilot_execution.get_pending_orders", return_value=[])
+@patch("ai.copilot_execution.get_open_positions", return_value=[])
+@patch("ai.copilot_execution.get_account_summary")
+@patch("ai.copilot_execution.connect")
+def test_watched_positions_excludes_closed_after_fill_symbols(
+    mock_connect, mock_account, mock_positions, mock_pending, mock_watch,
+    mock_status, mock_permitted, mock_invalidation, _fixed_files,
+):
+    from data.mt5_source import AccountSummary, MarketAsset
+    from risk.ftmo_rules import FtmoStatus
+
+    mock_account.return_value = AccountSummary(balance=100000.0, equity=100000.0, free_margin=90000.0, currency="USD")
+    mock_watch.return_value = [MarketAsset(symbol="EURUSD", description="Euro", bid=1.0899, ask=1.0900)]
+    mock_status.return_value = FtmoStatus(
+        daily_loss_limit_pct=3.0, today_realized_pl=0.0, today_floating_pl=0.0, today_total_pl=0.0,
+        daily_loss_headroom_pct=3.0, trailing_max_loss_floor=90000.0, max_loss_headroom_pct=10.0,
+        best_day_pl=None, total_positive_days_pl=None, best_day_rule_pct=None,
+    )
+
+    generated_utc = datetime.now(timezone.utc).isoformat()
+    entry = {
+        "pct": 1.0, "price": 1.0900, "stop_loss": 1.0850, "take_profit": None,
+        "side": "buy", "reason": "r", "invalidation_condition": "H1 closes below 1.0800",
+    }
+    _write_suggestion(_fixed_files, immediate_allocation={"EURUSD": entry}, generated_utc=generated_utc)
+    _seed_settled(_fixed_files, "EURUSD", "closed_after_fill", generated_utc, entry=entry)
+
+    run_copilot_execution_check()
+
+    mock_invalidation.assert_not_called()
+
+
+@patch("ai.copilot_execution._run_copilot_invalidation_check")
+@patch("ai.copilot_execution._fetch_technical_context", return_value="fake technical context")
+@patch("ai.copilot_execution.is_trading_permitted", return_value=(True, ""))
+@patch("ai.copilot_execution.fetch_ftmo_status")
+@patch("ai.copilot_execution.get_market_watch")
+@patch("ai.copilot_execution.get_pending_orders", return_value=[])
+@patch("ai.copilot_execution.get_open_positions")
+@patch("ai.copilot_execution.get_account_summary")
+@patch("ai.copilot_execution.connect")
+def test_watched_positions_capped_at_max_watched_positions_config_value(
+    mock_connect, mock_account, mock_positions, mock_pending, mock_watch,
+    mock_status, mock_permitted, mock_fetch_ctx, mock_invalidation, _fixed_files,
+):
+    from data.mt5_source import AccountSummary, ContractSpec, MarketAsset
+    from risk.ftmo_rules import FtmoStatus
+
+    mock_account.return_value = AccountSummary(balance=100000.0, equity=100000.0, free_margin=90000.0, currency="USD")
+    mock_positions.return_value = [
+        _position(symbol="EURUSD", side="buy", volume=1.0, ticket=200),
+        _position(symbol="GBPUSD", side="buy", volume=1.0, ticket=201),
+    ]
+    mock_watch.return_value = [
+        MarketAsset(symbol="EURUSD", description="Euro", bid=1.0899, ask=1.0900),
+        MarketAsset(symbol="GBPUSD", description="Pound", bid=1.2699, ask=1.2700),
+    ]
+    mock_status.return_value = FtmoStatus(
+        daily_loss_limit_pct=3.0, today_realized_pl=0.0, today_floating_pl=0.0, today_total_pl=0.0,
+        daily_loss_headroom_pct=3.0, trailing_max_loss_floor=90000.0, max_loss_headroom_pct=10.0,
+        best_day_pl=None, total_positive_days_pl=None, best_day_rule_pct=None,
+    )
+    mock_invalidation.return_value = ("EURUSD", False, "FINAL_VERDICT: NOT_CONFIRMED")
+
+    generated_utc = datetime.now(timezone.utc).isoformat()
+    entry_eur = {
+        "pct": 1.0, "price": 1.0900, "stop_loss": 1.0850, "take_profit": None,
+        "side": "buy", "reason": "r", "invalidation_condition": "H1 closes below 1.0800",
+    }
+    entry_gbp = {
+        "pct": 1.0, "price": 1.2700, "stop_loss": 1.2650, "take_profit": None,
+        "side": "buy", "reason": "r", "invalidation_condition": "H1 closes below 1.2600",
+    }
+    _write_suggestion(
+        _fixed_files, immediate_allocation={"EURUSD": entry_eur, "GBPUSD": entry_gbp}, generated_utc=generated_utc,
+    )
+    Path(config.COPILOT_EXECUTION_SETTLEMENT_FILE).write_text(json.dumps({
+        "generated_utc": generated_utc,
+        "settled": {
+            "EURUSD": {"origin": "immediate", "state": "filled", "entry": entry_eur, "order_ticket": 200},
+            "GBPUSD": {"origin": "immediate", "state": "filled", "entry": entry_gbp, "order_ticket": 201},
+        },
+    }))
+
+    with (
+        patch.object(config, "COPILOT_EXECUTION_MAX_WATCHED_POSITIONS", 1),
+        patch("ai.copilot_execution.get_contract_spec") as mock_spec,
+        patch("ai.copilot_execution.close_position"),
+    ):
+        mock_spec.return_value = ContractSpec(
+            volume_min=0.01, volume_step=0.01, volume_max=100.0,
+            trade_contract_size=100000.0, currency_margin="USD", margin_initial=1000.0,
+        )
+        run_copilot_execution_check()
+
+    mock_invalidation.assert_called_once()
+
+
+@patch("ai.copilot_execution._run_copilot_invalidation_check")
+@patch("ai.copilot_execution._run_copilot_verdict")
+@patch("ai.copilot_execution._fetch_technical_context", return_value="fake technical context")
+@patch("ai.copilot_execution.open_position")
+@patch("ai.copilot_execution.is_trading_permitted", return_value=(True, ""))
+@patch("ai.copilot_execution.fetch_ftmo_status")
+@patch("ai.copilot_execution.get_market_watch")
+@patch("ai.copilot_execution.get_pending_orders", return_value=[])
+@patch("ai.copilot_execution.get_open_positions")
+@patch("ai.copilot_execution.get_account_summary")
+@patch("ai.copilot_execution.connect")
+def test_pending_setup_verdicts_and_invalidation_verdicts_both_processed_in_one_poll(
+    mock_connect, mock_account, mock_positions, mock_pending, mock_watch,
+    mock_status, mock_permitted, mock_open, mock_fetch_ctx, mock_verdict, mock_invalidation, _fixed_files,
+):
+    from data.mt5_source import AccountSummary, ContractSpec, MarketAsset
+    from risk.ftmo_rules import FtmoStatus
+
+    mock_account.return_value = AccountSummary(balance=100000.0, equity=100000.0, free_margin=90000.0, currency="USD")
+    mock_positions.return_value = [_position(symbol="EURUSD", side="buy", volume=1.0, ticket=200)]
+    mock_watch.return_value = [
+        MarketAsset(symbol="EURUSD", description="Euro", bid=1.0899, ask=1.0900),
+        MarketAsset(symbol="XAUUSD", description="Gold", bid=1999.0, ask=2000.0),
+    ]
+    mock_status.return_value = FtmoStatus(
+        daily_loss_limit_pct=3.0, today_realized_pl=0.0, today_floating_pl=0.0, today_total_pl=0.0,
+        daily_loss_headroom_pct=3.0, trailing_max_loss_floor=90000.0, max_loss_headroom_pct=10.0,
+        best_day_pl=None, total_positive_days_pl=None, best_day_rule_pct=None,
+    )
+    mock_open.return_value = OrderResult(success=True, retcode=10009, comment="ok", ticket=777)
+    setup = PendingSetup(symbol="XAUUSD", side="buy", pct=1.0, trigger_condition="cond")
+    mock_verdict.return_value = (setup, True, "FINAL_VERDICT: CONFIRMED")
+    mock_invalidation.return_value = ("EURUSD", False, "FINAL_VERDICT: NOT_CONFIRMED")
+
+    generated_utc = datetime.now(timezone.utc).isoformat()
+    entry = {
+        "pct": 1.0, "price": 1.0900, "stop_loss": 1.0850, "take_profit": None,
+        "side": "buy", "reason": "r", "invalidation_condition": "H1 closes below 1.0800",
+    }
+    _write_suggestion(
+        _fixed_files,
+        immediate_allocation={"EURUSD": entry},
+        pending_setups=[
+            {"symbol": "XAUUSD", "side": "buy", "pct": 1.0, "trigger_condition": "cond",
+             "price": 2000.0, "stop_loss": 1980.0, "take_profit": 2050.0, "reason": "r"}
+        ],
+        generated_utc=generated_utc,
+    )
+    _seed_settled(_fixed_files, "EURUSD", "filled", generated_utc, entry=entry)
+
+    with patch("ai.copilot_execution.get_contract_spec") as mock_spec:
+        mock_spec.return_value = ContractSpec(
+            volume_min=0.01, volume_step=0.01, volume_max=100.0,
+            trade_contract_size=100.0, currency_margin="USD", margin_initial=1000.0,
+        )
+        run_copilot_execution_check()
+
+    mock_verdict.assert_called_once()
+    mock_invalidation.assert_called_once()
+    state = read_execution_state()
+    assert state["last_verdicts"]["XAUUSD"]["confirmed"] is True
+    assert state["last_verdicts"]["EURUSD"]["confirmed"] is False
+
+
+# --- regression: cancelling a STRAY pending order must never wipe the ---
+# settlement record for an unrelated, still-held "filled" position on the
+# same symbol (real bug found on self-review 2026-08-24)
+
+
+@patch("ai.copilot_execution.cancel_pending_order")
+@patch("ai.copilot_execution.is_trading_permitted", return_value=(True, ""))
+@patch("ai.copilot_execution.fetch_ftmo_status")
+@patch("ai.copilot_execution.get_market_watch")
+@patch("ai.copilot_execution.get_pending_orders")
+@patch("ai.copilot_execution.get_open_positions")
+@patch("ai.copilot_execution.get_account_summary")
+@patch("ai.copilot_execution.connect")
+def test_cancelling_a_stray_pending_order_never_wipes_the_filled_settlement_record(
+    mock_connect, mock_account, mock_positions, mock_pending, mock_watch,
+    mock_status, mock_permitted, mock_cancel, _fixed_files,
+):
+    from data.mt5_source import AccountSummary, ContractSpec, MarketAsset
+    from risk.ftmo_rules import FtmoStatus
+
+    mock_account.return_value = AccountSummary(balance=100000.0, equity=100000.0, free_margin=90000.0, currency="USD")
+    # A real, already-held position that already exactly matches today's
+    # target (same side/size/sl/tp) -- resolves to "hold", NOT
+    # amend_position -- with a separate, stray pending order also
+    # resting on the same symbol (e.g. a leftover from an earlier poll).
+    mock_positions.return_value = [_position(symbol="EURUSD", side="buy", volume=1.0, ticket=200)]
+    mock_pending.return_value = [_pending_order(symbol="EURUSD", ticket=999)]
+    mock_watch.return_value = [MarketAsset(symbol="EURUSD", description="Euro", bid=1.0799, ask=1.0800)]
+    mock_status.return_value = FtmoStatus(
+        daily_loss_limit_pct=3.0, today_realized_pl=0.0, today_floating_pl=0.0, today_total_pl=0.0,
+        daily_loss_headroom_pct=3.0, trailing_max_loss_floor=90000.0, max_loss_headroom_pct=10.0,
+        best_day_pl=None, total_positive_days_pl=None, best_day_rule_pct=None,
+    )
+    mock_cancel.return_value = OrderResult(success=True, retcode=10009, comment="ok", ticket=999)
+
+    generated_utc = datetime.now(timezone.utc).isoformat()
+    # _position's own defaults are side="buy", price_open=1.09, sl=1.08 —
+    # match the target exactly so this resolves to "hold", isolating the
+    # test to the stray-cancel behavior specifically.
+    entry = {"pct": 1.0, "price": 1.09, "stop_loss": 1.08, "take_profit": None, "side": "buy"}
+    _write_suggestion(_fixed_files, immediate_allocation={"EURUSD": entry}, generated_utc=generated_utc)
+    _seed_settled(_fixed_files, "EURUSD", "filled", generated_utc, entry=entry)
+
+    with patch("ai.copilot_execution.get_contract_spec") as mock_spec:
+        mock_spec.return_value = ContractSpec(
+            volume_min=0.01, volume_step=0.01, volume_max=100.0,
+            trade_contract_size=100000.0, currency_margin="USD", margin_initial=1000.0,
+        )
+        run_copilot_execution_check()
+
+    mock_cancel.assert_called_once_with(999)
+    settled = read_settlement()["settled"]
+    assert "EURUSD" in settled
+    assert settled["EURUSD"]["state"] == "filled"
 
 
 # --- regression: an outstanding "increase" order must never force-close ---

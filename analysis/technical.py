@@ -74,6 +74,34 @@ RANGE_DIRECTION_Z = 0.5
 # (see RANGE_DIRECTION_Z above), this threshold only decides how cleanly.
 TRENDING_EFFICIENCY_RATIO = 0.08
 
+# Momentum-acceleration: a SHORT-window sibling to market_regime's own
+# direction check above, added 2026-08-26 direct user request after a
+# real, recurring complaint (misreading pump/dump swings and sideways-
+# vs-breakout moments) was traced to a genuine gap: RANGE_WINDOW=60 is
+# wide enough that 3-5 pump/dump swings inside it can cancel out in the
+# window's own first-half/second-half average, reading "sideways" even
+# while a real, sharp new leg is actively underway right now — there was
+# no shorter-window signal layered on top to catch that in-progress
+# move. Deliberately reuses the EXACT same first-half-mean/second-half-
+# mean-shift-over-std design as RANGE_DIRECTION_Z above (same statistical
+# idea, just over a much shorter window) rather than a different
+# approach, so the two stay conceptually consistent.
+#
+# MOMENTUM_WINDOW=12 is short enough to catch a fresh leg while still
+# giving a clean 6/6 half-split. MOMENTUM_DIRECTION_Z is a principled
+# placeholder, NOT yet validated against real live data the way
+# RANGE_DIRECTION_Z/TRENDING_EFFICIENCY_RATIO were (see their own
+# comments above for that process) — standard error of a mean scales as
+# sigma/sqrt(n), so a threshold carrying roughly the same statistical
+# stringency as RANGE_DIRECTION_Z=0.5 at n=30-per-half, scaled down to
+# this window's n=6-per-half, is 0.5 * sqrt(30/6) ~= 1.1. Recalibrate
+# this against real recent H1/H4 data for the specific instrument(s)
+# this was built for before fully trusting it live — same "ship a
+# principled first value, then check it against real data" process this
+# file's other thresholds already went through.
+MOMENTUM_WINDOW = 12
+MOMENTUM_DIRECTION_Z = 1.1
+
 # Average True Range window — the standard 14-period convention (Wilder's
 # original), used here as a simple rolling mean rather than Wilder's
 # smoothing for consistency with this file's other stats (plain windowed
@@ -110,6 +138,7 @@ class TechnicalStats:
     atr_pct: float | None  # atr / last_price * 100 — comparable across instruments
     rsi: float | None  # 0-100, momentum — conventionally overbought >70, oversold <30
     volume_trend_pct: float | None  # recent-vs-baseline average volume, %
+    momentum_acceleration: str | None  # "accelerating_up" / "accelerating_down" / "stable" — a SHORT-window (MOMENTUM_WINDOW) sibling to market_regime, NOT a 4th market_regime value (see MOMENTUM_WINDOW's own comment); None only means insufficient history
 
 
 def _compute_rsi(prices: pd.Series) -> float | None:
@@ -205,7 +234,7 @@ def compute_technical_stats(
     real number of bars per year for its own timeframe here."""
     prices = prices.dropna()
     if prices.empty:
-        return TechnicalStats(*([None] * 16))
+        return TechnicalStats(*([None] * 17))
 
     last_price = float(prices.iloc[-1])
 
@@ -307,6 +336,26 @@ def compute_technical_stats(
             else:
                 market_regime = "trending_down" if is_efficient else "choppy_down"
 
+    # Direct fix for the "wakes up late in a sideways market" complaint
+    # — see MOMENTUM_WINDOW's own module-level comment for the full
+    # rationale. Independent of RANGE_WINDOW's own gate above (this can
+    # compute fine even when the 60-bar window can't).
+    momentum_acceleration = None
+    if len(prices) >= MOMENTUM_WINDOW:
+        momentum_window = prices.tail(MOMENTUM_WINDOW)
+        momentum_half = MOMENTUM_WINDOW // 2
+        momentum_shift = float(momentum_window.iloc[momentum_half:].mean()) - float(
+            momentum_window.iloc[:momentum_half].mean()
+        )
+        momentum_std = float(momentum_window.std())
+        momentum_z = momentum_shift / momentum_std if momentum_std > 0 else 0.0
+        if momentum_z > MOMENTUM_DIRECTION_Z:
+            momentum_acceleration = "accelerating_up"
+        elif momentum_z < -MOMENTUM_DIRECTION_Z:
+            momentum_acceleration = "accelerating_down"
+        else:
+            momentum_acceleration = "stable"
+
     atr = atr_pct = None
     if history is not None and not history.empty:
         atr = _compute_atr(history)
@@ -336,4 +385,5 @@ def compute_technical_stats(
         atr_pct=atr_pct,
         rsi=rsi,
         volume_trend_pct=volume_trend_pct,
+        momentum_acceleration=momentum_acceleration,
     )

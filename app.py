@@ -1,3 +1,4 @@
+import time
 from datetime import datetime, time as dt_time, timezone
 from pathlib import Path
 
@@ -22,19 +23,23 @@ from ai.ftmo_suggest import (
 from ai.copilot_execution import (
     EXECUTION_LOCK_PATH,
     EXECUTION_LOCK_STALE_AFTER_SECONDS,
+    execution_check_is_live,
     next_execution_check_utc,
     read_copilot_execution_enabled,
     read_copilot_execution_interval_minutes,
     read_execution_progress,
     read_execution_state,
     read_settlement,
+    read_tactical_defense_enabled,
     run_copilot_execution_check,
     set_copilot_execution_enabled,
     set_copilot_execution_interval_minutes,
+    set_tactical_defense_enabled,
 )
 from job_lock import acquire_lock, release_lock
 from utils import run_with_timeout
 from ai.mega_analysis import (
+    mega_session_is_live,
     next_run_utc,
     read_latest_suggestion,
     read_mega_analysis_enabled,
@@ -64,7 +69,13 @@ from ai.psx_suggest import (
     suggest_psx_portfolio,
 )
 from analysis.setup_classifier import classify_setups
-from data.mt5_execution import OrderResult, close_position, open_position
+from data.mt5_execution import (
+    OrderResult,
+    cancel_pending_order,
+    close_position,
+    modify_position_sltp,
+    open_position,
+)
 from data.mt5_source import (
     MT5ConnectionError,
     get_contract_spec,
@@ -78,7 +89,6 @@ from risk.apply_suggestion import (
     compute_rebalance_plan,
 )
 from risk.ftmo_rules import DEFAULT_HEADROOM_FRACTION, FtmoStatus, would_breach_daily_loss_headroom
-from risk.rebalance import evaluate_positions
 
 # A fixed-order categorical palette (validated colorblind-safe adjacent
 # pairs, per this project's dataviz conventions) — used everywhere a
@@ -175,32 +185,18 @@ def _render_mega_analysis_countdown() -> None:
     best-effort) purely for display, per the user's explicit request to
     stay aware of both clocks alongside UTC.
 
-    Also shows the run's own LIVE progress while one is actually
-    happening (see ai.mega_analysis::_write_progress) — direct user
-    request 2026-08-22: the unattended run should be visible the same
-    way the manual "Suggest Portfolio Mix" button already is, the only
-    real difference being WHAT triggers it. "Live" is detected purely
-    from timestamps (progress fresher than 5 minutes old AND newer than
-    the last COMPLETED attempt) rather than an explicit start/stop flag
-    — once run_scheduled_mega_analysis finishes and writes real state,
-    that naturally becomes the newer of the two again, turning this back
-    off with no separate cleanup step needed."""
+    The run's own LIVE step-by-step progress log (see
+    ai.mega_analysis::_write_step/_write_current_activity) is rendered separately, by
+    _render_mega_analysis_progress_log — direct user request 2026-08-25:
+    it used to live here as a single-line st.info() right under this
+    heading, but showing only the LATEST message (replacing the last one
+    every second) read as messages randomly appearing and disappearing
+    rather than a run steadily progressing. Moved to the bottom of the
+    shared controls box, after the "Suggest Portfolio Mix" button, and
+    changed to render the full accumulated list every tick instead of
+    just the latest entry — see that function's own docstring."""
     now_utc = datetime.now(timezone.utc)
     state = read_state()
-    progress = read_progress()
-    live_message = None
-    progress_ts = progress.get("updated_utc")
-    if progress_ts:
-        try:
-            progress_dt = datetime.fromisoformat(progress_ts)
-        except ValueError:
-            progress_dt = None
-        if progress_dt is not None:
-            age_seconds = (now_utc - progress_dt).total_seconds()
-            last_attempt = state.get("last_attempt_utc")
-            newer_than_last_attempt = last_attempt is None or progress_ts > last_attempt
-            if 0 <= age_seconds < 300 and newer_than_last_attempt:
-                live_message = progress.get("message")
     target = next_run_utc(now_utc, state=state)
     remaining_seconds = max(0, int((target - now_utc).total_seconds()))
     hours, rem = divmod(remaining_seconds, 3600)
@@ -221,8 +217,6 @@ def _render_mega_analysis_countdown() -> None:
     # shared box) — the caller supplies the surrounding
     # st.container(border=True) instead.
     st.subheader(":material/schedule: Next Mega Market Analysis")
-    if live_message:
-        st.info(f":material/autorenew: Running now — {live_message}")
     # Direct user request 2026-08-23: significantly shortened (2-3 lines,
     # not the full design rationale — kept in this module's own docstring
     # above instead), and no longer names a specific model or trigger
@@ -249,14 +243,31 @@ def _render_mega_analysis_countdown() -> None:
     # 1-second fragment tick) so this widget's own interaction is never
     # clobbered by re-reading the file; the countdown above catches up on
     # the very next tick since this whole function reruns every second.
+    #
+    # Real bug found live 2026-08-24 (user: changed this to 14:00, it
+    # reverted to 23:16): comparing the widget's value against the
+    # FILE's CURRENT value is wrong once more than one browser tab/
+    # session can be open at once. A second, stale tab's own widget
+    # value never changed from ITS perspective, but this fragment reruns
+    # every second regardless of interaction — so on its very next tick,
+    # it would see "my widget value differs from the file" (because the
+    # OTHER tab just updated the file) and "helpfully" write its own
+    # stale value straight back, undoing the real change within a
+    # second. Fixed by tracking what THIS session itself last wrote/saw
+    # separately from the file's live value — a session only ever writes
+    # when its OWN widget value changed relative to what IT last knew,
+    # never merely because the file diverged from under it.
     _trigger_hour, _trigger_minute = read_mega_analysis_trigger()
     if "mega_analysis_trigger_time" not in st.session_state:
         st.session_state["mega_analysis_trigger_time"] = dt_time(_trigger_hour, _trigger_minute)
+        st.session_state["_mega_analysis_trigger_last_synced"] = (_trigger_hour, _trigger_minute)
     _new_trigger_time = st.time_input(
         "Change daily trigger time (UTC)", key="mega_analysis_trigger_time", step=300
     )
-    if (_new_trigger_time.hour, _new_trigger_time.minute) != (_trigger_hour, _trigger_minute):
-        set_mega_analysis_trigger(_new_trigger_time.hour, _new_trigger_time.minute)
+    _new_trigger_pair = (_new_trigger_time.hour, _new_trigger_time.minute)
+    if _new_trigger_pair != st.session_state["_mega_analysis_trigger_last_synced"]:
+        set_mega_analysis_trigger(*_new_trigger_pair)
+        st.session_state["_mega_analysis_trigger_last_synced"] = _new_trigger_pair
 
     last_status = state.get("last_status")
     last_attempt = state.get("last_attempt_utc")
@@ -273,6 +284,82 @@ def _render_mega_analysis_countdown() -> None:
 
 
 _render_mega_analysis_countdown = st.fragment(run_every=1)(_render_mega_analysis_countdown)
+
+
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _spinner_frame() -> str:
+    """One animated frame, chosen from the wall clock — this function is
+    called from a fragment that reruns every second (see the st.fragment
+    wrapper below), so indexing by whole seconds is enough to make the
+    glyph visibly cycle without needing any state of its own."""
+    return _SPINNER_FRAMES[int(time.time()) % len(_SPINNER_FRAMES)]
+
+
+def _render_mega_analysis_progress_log() -> None:
+    """FTMO-only: renders the unattended mega session's own live status —
+    direct user request 2026-08-25, moved here (the bottom of the shared
+    controls box, right after the "Suggest Portfolio Mix" button) from a
+    single-line st.info() that used to sit at the TOP of the box.
+
+    Redesigned 2026-08-27 after two real bugs found live in the same
+    session:
+
+    1. The whole log used to VANISH mid-run once 5 minutes passed with
+       no new write — but a single step (e.g. Claude's own multi-minute
+       web-research call) can legitimately run that long with nothing
+       new to report. Fixed by switching to the shared
+       ai.mega_analysis.mega_session_is_live check, whose real "still
+       running" signal is comparing against the last COMPLETED attempt
+       in state.json, not a short fixed age — see its own docstring.
+    2. The display used to number every message 1, 2, 3... and one real
+       run reached 246+ entries within minutes, because the audit-
+       model-pool's own per-second retry/countdown status was being
+       APPENDED as a new entry on every tick instead of overwritten.
+       Fixed at the source (ai.mega_analysis._write_current_activity)
+       by splitting the progress file into a small, bounded `steps`
+       list (genuinely one-time milestones) plus a single
+       `current_activity` slot that's replaced in place, mirroring the
+       manual "Suggest Portfolio Mix" button's own st.status()/
+       st.empty() pattern, which never had either bug.
+
+    Renders like a CLI installer: completed steps get a plain checkmark
+    (no numbering), and exactly one line — the current step if nothing
+    more granular is available, or the live current_activity text once
+    it exists — gets an animated spinner glyph in front of it, so
+    there's always a visibly-moving indicator instead of a static list.
+    Renders nothing at all (not even an empty container) when no run is
+    currently live."""
+    state = read_state()
+    progress = read_progress()
+    if not mega_session_is_live(progress, state):
+        return
+
+    steps: list[str] = progress.get("steps", [])
+    if not isinstance(steps, list) or not steps:
+        return
+    current_activity = progress.get("current_activity")
+
+    st.divider()
+    st.caption(":material/autorenew: Mega analysis running now — live progress")
+
+    spinner = _spinner_frame()
+    done_steps = steps if current_activity else steps[:-1]
+    for step in done_steps:
+        st.write(f":green[✓] {step}")
+
+    if current_activity:
+        lines = current_activity.split("\n", 1)
+        st.write(f"{spinner} {lines[0]}")
+        if len(lines) > 1 and lines[1].strip():
+            with st.expander("Details"):
+                st.text(lines[1])
+    else:
+        st.write(f"{spinner} {steps[-1]}")
+
+
+_render_mega_analysis_progress_log = st.fragment(run_every=1)(_render_mega_analysis_progress_log)
 
 
 def _render_copilot_execution_panel() -> None:
@@ -305,37 +392,59 @@ def _render_copilot_execution_panel() -> None:
     exec_state = read_execution_state()
     exec_progress = read_execution_progress()
     live_message = None
-    progress_ts = exec_progress.get("updated_utc")
-    if progress_ts:
-        try:
-            progress_dt = datetime.fromisoformat(progress_ts)
-        except ValueError:
-            progress_dt = None
-        if progress_dt is not None:
-            age_seconds = (now_utc - progress_dt).total_seconds()
-            last_attempt = exec_state.get("last_attempt_utc")
-            newer_than_last_attempt = last_attempt is None or progress_ts > last_attempt
-            if 0 <= age_seconds < 300 and newer_than_last_attempt:
-                live_message = exec_progress.get("message")
+    if execution_check_is_live(exec_progress, exec_state):
+        live_message = exec_progress.get("message")
 
     with st.container(border=True):
-        heading_col, toggle_col = st.columns([3, 1])
+        heading_col, toggle_col, tactical_toggle_col = st.columns([3, 1, 1.3])
         with heading_col:
-            st.subheader(":material/support_agent: Copilot Execution Clerk")
+            st.subheader(":material/support_agent: Execution Clerk")
         with toggle_col:
+            # Same multi-tab race fixed for the mega-analysis trigger-
+            # time picker above (see its own comment for the full
+            # explanation) — this panel is ALSO a run_every fragment, so
+            # a second, stale tab would otherwise flip this back within
+            # seconds of a real change made elsewhere. Compare against
+            # this session's own last-synced value, never the file's.
             if "copilot_execution_enabled_toggle" not in st.session_state:
                 st.session_state["copilot_execution_enabled_toggle"] = read_copilot_execution_enabled()
+                st.session_state["_copilot_execution_enabled_last_synced"] = (
+                    st.session_state["copilot_execution_enabled_toggle"]
+                )
             copilot_enabled = st.toggle("Enabled", key="copilot_execution_enabled_toggle")
-            if copilot_enabled != read_copilot_execution_enabled():
+            if copilot_enabled != st.session_state["_copilot_execution_enabled_last_synced"]:
                 set_copilot_execution_enabled(copilot_enabled)
+                st.session_state["_copilot_execution_enabled_last_synced"] = copilot_enabled
+        with tactical_toggle_col:
+            # New, separately-staged authority (added 2026-08-27, direct
+            # user request after a real gold position went from +$28 to
+            # -$61 while the mega session hadn't run in days and the
+            # clerk had zero authority to react — see ai/copilot_
+            # execution.py's own docstring). Defaults OFF, unlike the
+            # toggle above — this is fresh unattended authority over real
+            # money, not yet proven live; the full pipeline still runs
+            # and reports every poll even while off (shadow mode, see the
+            # Tactical columns below), it just never touches a real
+            # order until switched on. Same multi-tab-race-safe pattern.
+            if "tactical_defense_enabled_toggle" not in st.session_state:
+                st.session_state["tactical_defense_enabled_toggle"] = read_tactical_defense_enabled()
+                st.session_state["_tactical_defense_enabled_last_synced"] = (
+                    st.session_state["tactical_defense_enabled_toggle"]
+                )
+            tactical_enabled = st.toggle("Tactical defense (DEFEND/EXIT)", key="tactical_defense_enabled_toggle")
+            if tactical_enabled != st.session_state["_tactical_defense_enabled_last_synced"]:
+                set_tactical_defense_enabled(tactical_enabled)
+                st.session_state["_tactical_defense_enabled_last_synced"] = tactical_enabled
 
-        if live_message:
-            st.info(f":material/autorenew: Running now — {live_message}")
         st.caption(
-            "Unattended: reads the mega session's own guidance, checks each Pending "
-            "Setup against fresh live technicals via GitHub Copilot, and executes a "
+            "Checks each Pending Setup against fresh live technicals and executes a "
             "confirmed one immediately — no human confirmation step."
         )
+        if not tactical_enabled:
+            st.caption(
+                ":gray[Tactical defense off — still checks every open position and reports "
+                "what it WOULD do (see the Tactical columns below), but never acts.]"
+            )
 
         interval_minutes = read_copilot_execution_interval_minutes()
         next_check = next_execution_check_utc(now_utc, state=exec_state)
@@ -350,16 +459,27 @@ def _render_copilot_execution_panel() -> None:
             )
         with freq_col:
             # Range starts at 1 min (direct user request 2026-08-23).
-            # Always includes the CURRENT value too (whatever it is) so a
-            # custom/hand-edited interval never breaks this selectbox —
-            # st.selectbox requires its key's stored value to be one of
-            # the options offered.
-            _freq_options = sorted({1, 2, 5, 10, 15, 30, 60, interval_minutes})
+            # Same multi-tab race fixed for the mega-analysis
+            # trigger-time picker (see its own comment) — compare
+            # against this session's own last-synced value, never the
+            # file's current one, so a second stale tab can't flip this
+            # back within seconds of a real change made elsewhere.
             if "copilot_execution_interval_select" not in st.session_state:
                 st.session_state["copilot_execution_interval_select"] = interval_minutes
+                st.session_state["_copilot_execution_interval_last_synced"] = interval_minutes
+            # Always includes the CURRENT file value AND this session's
+            # own last-synced value (they can differ if another tab
+            # changed it) so a custom/hand-edited interval never breaks
+            # this selectbox — st.selectbox requires its key's stored
+            # value to be one of the options offered.
+            _freq_options = sorted({
+                1, 2, 5, 10, 15, 30, 60, interval_minutes,
+                st.session_state["_copilot_execution_interval_last_synced"],
+            })
             new_interval = st.selectbox("Review every (min)", _freq_options, key="copilot_execution_interval_select")
-            if new_interval != interval_minutes:
+            if new_interval != st.session_state["_copilot_execution_interval_last_synced"]:
                 set_copilot_execution_interval_minutes(new_interval)
+                st.session_state["_copilot_execution_interval_last_synced"] = new_interval
         if interval_minutes < 5:
             st.caption(
                 ":gray[The Windows Scheduled Task itself only polls every 5 min, so anything "
@@ -375,6 +495,7 @@ def _render_copilot_execution_panel() -> None:
 
         settled = read_settlement().get("settled", {})
         last_verdicts = exec_state.get("last_verdicts", {})
+        last_tactical_verdicts = exec_state.get("last_tactical_verdicts", {})
         # Added 2026-08-23 direct user request ("I see position in 5
         # assets but only 2 assets are showing up in the clerk section")
         # — this table previously only ever showed pending_setups; the
@@ -402,13 +523,144 @@ def _render_copilot_execution_panel() -> None:
                     status = "placed" if result.get("success") else "failed"
                 else:
                     status = "not yet checked"
+                # Watch condition / verdict: added 2026-08-23 direct user
+                # request — Claude's daily mega session can now write an
+                # invalidation_condition per already-suggested position,
+                # and Copilot mechanically re-checks it every poll; since
+                # this executes with no human confirmation, "why did this
+                # fire" must be visible here, not just the log.
+                invalidation_condition = entry.get("invalidation_condition")
+                # Real bug found live 2026-08-25: last_verdicts is a flat
+                # symbol-keyed dict shared with the UNRELATED Pending
+                # Setups verdict mechanism — a symbol like BTCUSD that's
+                # BOTH an immediate_allocation entry (pct: 0, no
+                # invalidation_condition) AND separately re-listed as a
+                # fresh Pending Setup gets a real last_verdicts entry from
+                # THAT check, which then leaked into this row as if it
+                # were an invalidation-check result for the immediate
+                # allocation entry — misleading, since this entry was
+                # never actually checked for invalidation at all. Only
+                # show verdict/reasoning here when this symbol genuinely
+                # HAS an invalidation_condition (i.e. was actually a
+                # watched_positions candidate this poll).
+                verdict = last_verdicts.get(symbol, {}) if invalidation_condition else {}
+                if invalidation_condition:
+                    verdict_text = (
+                        ("INVALIDATED" if verdict.get("confirmed") else "still holds")
+                        if symbol in last_verdicts else "not yet checked"
+                    )
+                elif entry.get("pct", 0) == 0:
+                    # Real user question 2026-08-25: a pct: 0 row has no
+                    # invalidation_condition (there's nothing left to
+                    # watch once the mega session is closing/cancelling
+                    # it) — this column used to just show "—" here, which
+                    # read as an empty/broken entry rather than the real
+                    # close/cancel instruction it is. `rec`'s state (still
+                    # present in settlement, so its ORIGINAL nature is
+                    # known) gives the precise wording when available;
+                    # most closes/cancels were never Copilot-tracked in
+                    # settlement to begin with (e.g. a manually-opened
+                    # position, or one settled by an earlier mega-session
+                    # cycle), so this falls back to an equally accurate,
+                    # just less specific, description in that case.
+                    if rec is not None and rec.get("state") == "order_placed":
+                        verdict_text = "Cancelled pending order"
+                    elif rec is not None and rec.get("state") in ("filled", "closed_after_fill"):
+                        verdict_text = "Closed existing position"
+                    else:
+                        verdict_text = "Closed/cancelled by mega session"
+                else:
+                    verdict_text = "—"
+                raw_text = verdict.get("raw_text", "") or ""
+                reasoning = raw_text[:300] + ("…" if len(raw_text) > 300 else "") if raw_text else ""
+                # Real user question 2026-08-25: a pct: 0 row (Claude
+                # closing/cancelling an already-suggested position, see
+                # AllocationEntry.reason) had every other column blank
+                # (no watch condition/verdict — there's nothing to watch
+                # once it's closing) and this table never showed `reason`
+                # at all, so the row looked like a garbage/empty entry
+                # rather than the real, deliberate instruction it is.
+                mega_reason = entry.get("reason", "") or ""
+                mega_reason_display = (
+                    mega_reason[:300] + ("…" if len(mega_reason) > 300 else "") if mega_reason else "—"
+                )
+                # Tactical defense (DEFEND/EXIT) — added 2026-08-27, the
+                # Clerk's own new short-term/"trend" authority, checked
+                # independently of the invalidation-condition trip-wire
+                # above (see ai/copilot_execution.py's own docstring for
+                # the real gold-trade incident that motivated it). Every
+                # already-filled position gets checked every poll, on or
+                # off — the toggle above only gates whether a verdict is
+                # actually ACTED on, so this stays visible even in shadow
+                # mode, the same "as visible as a manual click" principle
+                # this whole panel already follows for everything else.
+                tactical = last_tactical_verdicts.get(symbol)
+                if tactical is None:
+                    tactical_verdict_display = "not yet checked" if status in ("filled",) else "—"
+                    tactical_action_display = "—"
+                    tactical_justification_display = "—"
+                else:
+                    tier = tactical.get("tier", "hold")
+                    shadow_prefix = "[SHADOW] " if tactical.get("shadow_mode") else ""
+                    skipped_reason = tactical.get("skipped_reason") or ""
+                    if skipped_reason:
+                        tactical_verdict_display = f"{shadow_prefix}{tier.upper()} (skipped)"
+                    else:
+                        tactical_verdict_display = f"{shadow_prefix}{tier.upper()}"
+                    if skipped_reason:
+                        # Found on audit: a genuine guardrail REJECTION
+                        # (cooldown, never-widen-stop, wrong-side-of-
+                        # price, sizing failure — see ai/copilot_
+                        # execution.py::_validate_and_apply_tactical_
+                        # verdict's own rejected_reason) and a VALID
+                        # action merely pending on the disabled toggle
+                        # used to look identical here ("Would: ..." for
+                        # both) — during exactly the shadow-mode
+                        # observation window this feature's rollout plan
+                        # depends on, that could mask a DEFEND that would
+                        # NEVER actually fire as if it were healthy and
+                        # waiting. Show the real reason instead.
+                        tactical_action_display = (
+                            skipped_reason[:200] + ("…" if len(skipped_reason) > 200 else "")
+                        )
+                    elif tier == "exit":
+                        tactical_action_display = "Full close" if tactical.get("applied") else "Would: full close"
+                    elif tier == "defend":
+                        parts = []
+                        new_stop = tactical.get("new_stop_loss")
+                        fraction = tactical.get("partial_close_fraction")
+                        verb = "" if tactical.get("applied") else "Would: "
+                        if new_stop is not None:
+                            parts.append(f"Stop → {new_stop:g}")
+                        if fraction is not None:
+                            parts.append(f"{fraction:.0%} closed")
+                        tactical_action_display = verb + ", ".join(parts) if parts else "—"
+                    else:
+                        tactical_action_display = "—"
+                    tactical_justification = (
+                        f"{tactical.get('rule_citation', '')} — {tactical.get('numbers_citation', '')}"
+                        if tier in ("defend", "exit")
+                        else ""
+                    )
+                    tactical_justification_display = (
+                        tactical_justification[:300] + ("…" if len(tactical_justification) > 300 else "")
+                        if tactical_justification.strip(" —")
+                        else "—"
+                    )
                 imm_rows.append(
                     {
                         "Symbol": symbol,
                         "Side": entry.get("side"),
                         "Target %": entry.get("pct"),
+                        "Reason": mega_reason_display,
                         "Status": status,
                         "Detail": result.get("detail", "") if result is not None else "",
+                        "Watch condition": invalidation_condition or "—",
+                        "Last invalidation verdict": verdict_text,
+                        "Copilot's reasoning": reasoning,
+                        "Tactical verdict": tactical_verdict_display,
+                        "Tactical action": tactical_action_display,
+                        "Tactical justification": tactical_justification_display,
                     }
                 )
             st.dataframe(pd.DataFrame(imm_rows), hide_index=True)
@@ -450,10 +702,30 @@ def _render_copilot_execution_panel() -> None:
 
         last_status = exec_state.get("last_status")
         last_attempt = exec_state.get("last_attempt_utc")
-        if last_status == "success" and last_attempt:
-            st.success(f"Last check ({last_attempt} UTC): {exec_state.get('last_detail', 'succeeded')}.")
+        # Compact caption-styled status instead of a full st.success/
+        # st.warning alert box — direct user request 2026-08-25, same
+        # "shrink this and squeeze the box" treatment already applied to
+        # the Mega Market Analysis section's own last-run status above.
+        #
+        # Direct user request 2026-08-25: this used to be a SEPARATE blue
+        # st.info() banner at the TOP of the box (right under the
+        # heading) while a check was running, alongside this green/
+        # orange status line at the bottom staying frozen on the
+        # PREVIOUS result the whole time — two different messages in two
+        # different places. Now there's exactly one status line, always
+        # in this same spot: it shows the live blue "running now"
+        # message in place of the last-check line while a check is
+        # actually in progress, and automatically reverts to the normal
+        # green/orange/gray line the moment exec_state's own
+        # last_attempt_utc catches up (the same freshness check already
+        # used above to compute live_message, so no separate state is
+        # needed).
+        if live_message:
+            st.caption(f":blue[↻ Running now — {live_message}]")
+        elif last_status == "success" and last_attempt:
+            st.caption(f":green[✓ Last check ({last_attempt} UTC): {exec_state.get('last_detail', 'succeeded')}.]")
         elif last_status == "blocked" and last_attempt:
-            st.warning(f"Last check ({last_attempt} UTC) executed nothing: {exec_state.get('last_detail', '')}")
+            st.caption(f":orange[⚠ Last check ({last_attempt} UTC) executed nothing: {exec_state.get('last_detail', '')}]")
         elif last_status == "disabled" and last_attempt:
             st.caption(f"Last check ({last_attempt} UTC): skipped — the clerk was disabled.")
 
@@ -462,8 +734,20 @@ _render_copilot_execution_panel = st.fragment(run_every=5)(_render_copilot_execu
 
 
 def _render_allocation_chart(allocation: dict[str, AllocationEntry]) -> None:
+    # Real user question 2026-08-25: a symbol Claude is explicitly
+    # closing/cancelling (FTMO's position-reassessment feature — pct: 0
+    # with a real `reason`, see ai/portfolio_suggest.py::AllocationEntry)
+    # was showing up as a 0%-slice legend entry here, which reads as a
+    # garbage/empty row since a pie chart has nothing meaningful to draw
+    # for 0% and this chart never showed `reason` anyway. That data is
+    # real and intentional — it belongs in the Immediate Allocation
+    # table (now with its own Reason column), not in a proportional
+    # chart, which only makes sense for what's actually held right now.
+    held = {symbol: entry for symbol, entry in allocation.items() if entry.pct > 0}
+    if not held:
+        return
     _render_pie(
-        list(allocation.keys()), [e.pct for e in allocation.values()], "Allocation by Instrument"
+        list(held.keys()), [e.pct for e in held.values()], "Allocation by Instrument"
     )
 
 
@@ -843,6 +1127,7 @@ selected_exchange = st.selectbox("Exchange", ["PMEX", "PSX", "FTMO"], index=2)
 _execution_state_prefix = "ftmo_" if selected_exchange == "FTMO" else ""
 
 positions = []
+pending_orders = []
 account = None
 ftmo_status = None
 if selected_exchange in ("PMEX", "FTMO"):
@@ -873,6 +1158,7 @@ if selected_exchange in ("PMEX", "FTMO"):
             else:
                 connect()
         positions = get_open_positions()
+        pending_orders = get_pending_orders()
         if selected_exchange == "FTMO":
             account = get_account_summary()
             ftmo_status = fetch_ftmo_status(account)
@@ -913,8 +1199,8 @@ def _render_live_positions(selected_exchange: str) -> None:
     live and simply reading fresh data doesn't need it.
 
     Deliberately independent of the top-level positions/account/
-    ftmo_status variables that feed Rebalance Suggestions/Portfolio
-    Suggestion/execution below — this is a display-only section, so a
+    ftmo_status variables that feed Portfolio Suggestion/execution below
+    — this is a display-only section, so a
     periodic refetch here can never cause those higher-stakes sections to
     act on a stale-vs-fresh data mismatch. Renders inside the "Account
     Overview" bordered container established above — a fragment's
@@ -1407,6 +1693,17 @@ _SETUP_BADGE_COLORS = {
     # (trend_following = a fresh trendline retest, trend_intact = the
     # broader trend itself, no specific trigger active right now).
     "trend_intact": "green",
+    # 3 new archetypes added 2026-08-26 (analysis/setup_classifier.py
+    # rules 8-10) — same lesson as grind_continuation/trend_intact
+    # above, added proactively this time rather than needing a second
+    # user catch. in_progress_move is the direct fix for a real
+    # complaint ("wakes up late in a sideways market") so it gets an
+    # attention-grabbing color; busted_pattern_reversal shares
+    # reversal_candidate's own color since it's explicitly a stronger
+    # variant of that same signal, firing alongside it.
+    "in_progress_move": "red",
+    "busted_pattern_reversal": "orange",
+    "candlestick_reversal_confirmed": "yellow",
     "no_clear_setup": "gray",
 }
 _TREND_BADGE_COLORS = {
@@ -1423,6 +1720,13 @@ _TREND_BADGE_COLORS = {
     # gray, which would visually erase that distinction.
     "choppy_up": "blue",
     "choppy_down": "orange",
+    # momentum_acceleration (analysis/technical.py, added 2026-08-26) is
+    # a SEPARATE short-window signal from market_regime above — violet
+    # rather than reusing green/red, so it never reads as if it were
+    # just another market_regime value at a glance.
+    "accelerating_up": "violet",
+    "accelerating_down": "violet",
+    "stable": "gray",
 }
 
 
@@ -2051,6 +2355,10 @@ def _live_asset_dashboard(symbol: str, exchange: str, description: str) -> None:
                 with st.container(horizontal=True, gap="small"):
                     _trend_badge(stats.trend)
                     _trend_badge(stats.market_regime)
+                    # Short-window sibling added 2026-08-26 — catches a
+                    # fresh pump/dump leg already underway even when
+                    # market_regime above still reads sideways.
+                    _trend_badge(stats.momentum_acceleration)
                 st.metric(
                     "Volatility (ann.)",
                     f"{stats.volatility_annualized_pct:.1f}%"
@@ -2194,31 +2502,6 @@ def _show_watchlist_detail_dialog() -> None:
 if st.session_state.get("_watchlist_detail_symbol"):
     _show_watchlist_detail_dialog()
 
-st.header(":material/rule: Rebalance Suggestions", divider=True)
-# FTMO gets its own, wider position-count/tighter per-symbol-exposure
-# rules (config.FTMO_MAX_POSITION_COUNT/FTMO_MAX_SYMBOL_EXPOSURE_PCT) —
-# this account is meant to genuinely diversify across several asset
-# categories at once, unlike PMEX's narrower single-market book.
-with st.container(border=True):
-    st.caption(
-        "Deterministic rule checks — stop-loss presence, position count, "
-        "and symbol concentration — run against the live positions above. "
-        "Independent of the AI reasoning below; nothing here requires a "
-        "model call."
-    )
-    suggestions = evaluate_positions(
-        positions,
-        max_position_count=config.FTMO_MAX_POSITION_COUNT if selected_exchange == "FTMO" else None,
-        max_symbol_exposure_pct=(
-            config.FTMO_MAX_SYMBOL_EXPOSURE_PCT if selected_exchange == "FTMO" else None
-        ),
-    )
-    if suggestions:
-        for s in suggestions:
-            st.warning(f"**[{s.action}] {s.symbol}** — {s.reason}")
-    else:
-        st.success("All positions are within the current rules.")
-
 # Cold-start fill: if this browser session has never generated a
 # suggestion for a given exchange yet, load the most recent saved
 # records/*.md transcript's final answer as the default so the section
@@ -2266,16 +2549,26 @@ with _portfolio_controls_box:
         # the same instant. Seeded from the persisted file only once per
         # session (not on every rerun) so a later change from THIS
         # widget's own interaction is never clobbered by the file value.
+        # Same multi-tab race fixed for the mega-analysis trigger-time
+        # picker (see its own comment in _render_mega_analysis_countdown
+        # for the full explanation) — compare against this session's own
+        # last-synced value, never the file's current one, so a second,
+        # stale tab can't flip this back the next time IT reruns for any
+        # unrelated reason (any click anywhere on that tab's page).
         if "mega_analysis_enabled_toggle" not in st.session_state:
             st.session_state["mega_analysis_enabled_toggle"] = read_mega_analysis_enabled()
+            st.session_state["_mega_analysis_enabled_last_synced"] = (
+                st.session_state["mega_analysis_enabled_toggle"]
+            )
         mega_analysis_enabled = st.toggle(
             "Automated daily analysis",
             key="mega_analysis_enabled_toggle",
             help="Mutually exclusive with the manual button below — only one "
             "trigger path is armed at a time.",
         )
-        if mega_analysis_enabled != read_mega_analysis_enabled():
+        if mega_analysis_enabled != st.session_state["_mega_analysis_enabled_last_synced"]:
             set_mega_analysis_enabled(mega_analysis_enabled)
+            st.session_state["_mega_analysis_enabled_last_synced"] = mega_analysis_enabled
     button_col, model_col, apply_col = st.columns([2, 1, 1])
     with button_col:
         suggest_clicked = st.button(
@@ -2307,6 +2600,9 @@ with _portfolio_controls_box:
             or not st.session_state.get(f"{_execution_state_prefix}suggested_allocation")
             or not st.session_state.get(f"{_execution_state_prefix}suggestion_generated_this_session"),
         )
+
+    if selected_exchange == "FTMO":
+        _render_mega_analysis_progress_log()
 
     # One-shot result banner for whatever the confirmation dialog (further
     # below) last executed — popped so it shows exactly once, right after
@@ -2486,7 +2782,8 @@ elif suggest_clicked and selected_exchange == "FTMO":
 
                 analyses = analyze_ftmo_assets(ftmo_assets, on_progress=_on_analysis_progress)
                 ftmo_summary_text = build_ftmo_summary(
-                    ftmo_account, ftmo_assets, fresh_ftmo_status, positions=positions, analyses=analyses
+                    ftmo_account, ftmo_assets, fresh_ftmo_status,
+                    positions=positions, analyses=analyses, pending_orders=pending_orders,
                 )
 
                 audit_placeholder = {"box": None}
@@ -2813,6 +3110,7 @@ if apply_clicked:
         try:
             fresh_account = get_account_summary()
             fresh_positions = get_open_positions()
+            fresh_pending_orders = get_pending_orders()
             fresh_assets = get_market_watch()
         except MT5ConnectionError as e:
             st.error(str(e))
@@ -2825,6 +3123,8 @@ if apply_clicked:
                 get_contract_spec,
                 market_prices,
                 price_sanity_band_pct=config.PRICE_SANITY_BAND_PCT,
+                pending_orders=fresh_pending_orders,
+                amend_tolerance_pct=config.AMEND_TOLERANCE_PCT,
             )
             if not plan:
                 st.info("Nothing to do — the account already matches the suggested mix.")
@@ -2977,6 +3277,52 @@ if st.session_state.get(f"{_execution_state_prefix}rebalance_plan"):
                             continue
                         try:
                             result = close_position(matching, volume=ticket_volume)
+                        except MT5ConnectionError as e:
+                            result = OrderResult(False, None, str(e), None)
+                        outcomes.append((o, result))
+                elif o.action == "cancel":
+                    for ticket in o.pending_tickets_to_cancel:
+                        try:
+                            result = cancel_pending_order(ticket)
+                        except MT5ConnectionError as e:
+                            result = OrderResult(False, None, str(e), None)
+                        outcomes.append((o, result))
+                elif o.action == "amend_pending":
+                    cancel_results = []
+                    for ticket in o.pending_tickets_to_cancel:
+                        try:
+                            result = cancel_pending_order(ticket)
+                        except MT5ConnectionError as e:
+                            result = OrderResult(False, None, str(e), None)
+                        cancel_results.append(result)
+                        outcomes.append((o, result))
+                    if all(r.success for r in cancel_results):
+                        try:
+                            result = open_position(
+                                o.symbol, o.side, o.volume, o.price, o.stop_loss, o.take_profit
+                            )
+                        except MT5ConnectionError as e:
+                            result = OrderResult(False, None, str(e), None)
+                        outcomes.append((o, result))
+                    else:
+                        # Don't stack a fresh order on top of one that
+                        # failed to cancel — same guard as the unattended
+                        # execution loop's own amend_pending branch.
+                        outcomes.append(
+                            (o, OrderResult(False, None, "cancel failed, replacement order not sent", None))
+                        )
+                elif o.action == "amend_position":
+                    for ticket in o.position_tickets_to_amend:
+                        matching = next(
+                            (p for p in plan_positions if p.ticket == ticket), None
+                        )
+                        if matching is None:
+                            outcomes.append(
+                                (o, OrderResult(False, None, f"ticket {ticket} not found", None))
+                            )
+                            continue
+                        try:
+                            result = modify_position_sltp(matching, o.stop_loss, o.take_profit)
                         except MT5ConnectionError as e:
                             result = OrderResult(False, None, str(e), None)
                         outcomes.append((o, result))

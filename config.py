@@ -93,6 +93,14 @@ ALLOW_LIVE_EXECUTION = os.getenv("ALLOW_LIVE_EXECUTION", "0") == "1"
 # proposing a sensible one in the first place.
 PRICE_SANITY_BAND_PCT = float(os.getenv("PRICE_SANITY_BAND_PCT", "5"))
 
+# How close (as a %) an already-resting pending order's own price/stop/
+# target must be to a fresh target's own numbers before compute_rebalance_
+# plan treats them as "unchanged" (hold) rather than "amend" — added
+# 2026-08-23 so trivial, insignificant differences (rounding, a slightly
+# re-quoted live price) don't trigger a pointless cancel-and-reopen or
+# SL/TP-modify every single poll.
+AMEND_TOLERANCE_PCT = float(os.getenv("AMEND_TOLERANCE_PCT", "0.05"))
+
 # Optional fallback contract-spec source: a CSV dumped *from inside* the
 # MT5 terminal by mql5/DumpSymbolSpecs.mq5, read by get_contract_spec()
 # only when the live mt5.symbol_info() API call still comes back empty
@@ -170,12 +178,25 @@ FTMO_COMMISSION_METALS_COMMODITIES_PCT_ROUND_TURN = float(
 FTMO_COMMISSION_CRYPTO_PCT_ROUND_TURN = float(
     os.getenv("FTMO_COMMISSION_CRYPTO_PCT_ROUND_TURN", "0.0650")
 )
+# Equities ("Equities I CFD" in this account's own Market Watch path —
+# confirmed live via records/ftmo/*.md's own "REAL trading cost" lines)
+# had NO rate here at all until 2026-08-26 — direct user correction:
+# every equity symbol's commission was showing as "unknown" (see
+# _ftmo_commission_pct_round_turn's own fallback), which the mega
+# session's own category-diversification instructions then read as a
+# real cost-data gap, not a zero-cost asset class, and avoided trading
+# equities as a result. User-provided rate: 0.002% of notional value
+# per lot, round-turn — same percent-of-notional style as metals/
+# commodities/crypto above, not a flat $/lot rate like FX.
+FTMO_COMMISSION_EQUITIES_PCT_ROUND_TURN = float(
+    os.getenv("FTMO_COMMISSION_EQUITIES_PCT_ROUND_TURN", "0.002")
+)
 
 # Overrides for risk/rebalance.py's generic MAX_POSITION_COUNT/
 # MAX_SYMBOL_EXPOSURE_PCT, specific to FTMO (by explicit user request):
 # unlike PMEX's single-market futures book, FTMO's account is meant to
 # genuinely diversify across several distinct asset categories (forex,
-# metals, commodities/agriculturals, indices, crypto where offered) at
+# metals, commodities/agriculturals, indices, equities, crypto where offered) at
 # roughly 1-2 instruments each — that alone can reach 8-10 positions,
 # above PMEX's own MAX_POSITION_COUNT=6 default. The per-symbol exposure
 # cap is tightened rather than reused as-is, since a wider, more-diversified
@@ -363,4 +384,54 @@ COPILOT_EXECUTION_RUN_TIMEOUT_SECONDS = int(
 # dropped rather than checked, not silently truncated without a trace.
 COPILOT_EXECUTION_MAX_PENDING_SETUPS = int(
     os.getenv("COPILOT_EXECUTION_MAX_PENDING_SETUPS", "10")
+)
+# Same defensive cap, for the OTHER live-Copilot-call phase added
+# 2026-08-23: already-settled (order_placed/filled) immediate_allocation
+# symbols carrying their own invalidation_condition, re-checked every
+# poll the same way a Pending Setup's trigger_condition is. A separate
+# constant from COPILOT_EXECUTION_MAX_PENDING_SETUPS (not a shared one)
+# so the two mechanisms stay independently tunable and testable.
+COPILOT_EXECUTION_MAX_WATCHED_POSITIONS = int(
+    os.getenv("COPILOT_EXECUTION_MAX_WATCHED_POSITIONS", "10")
+)
+# Same defensive cap, for the tactical-defense candidate phase added
+# 2026-08-27: every already-FILLED immediate_allocation/fired-Pending-
+# Setup symbol gets a live tactical DEFEND/EXIT check every poll,
+# independent of whether it carries an invalidation_condition (see
+# ai.copilot_execution's own docstring for the real gold-trade incident
+# that motivated this new, separate authority).
+COPILOT_EXECUTION_MAX_TACTICAL_CANDIDATES = int(
+    os.getenv("COPILOT_EXECUTION_MAX_TACTICAL_CANDIDATES", "10")
+)
+# User-controlled on/off switch for the Clerk's new tactical-defense
+# authority (DEFEND/EXIT on an already-filled position's short-term
+# "trend" read), added 2026-08-27. Defaults to DISABLED when the file is
+# missing/corrupt — a deliberate break from this module's own usual
+# opt-out-not-opt-in convention (compare COPILOT_EXECUTION_ENABLED_FILE
+# above), since this is fresh unattended authority over real money, not
+# yet proven live — see ai.copilot_execution.read_tactical_defense_
+# enabled and this project's own staged shadow-mode rollout plan.
+COPILOT_TACTICAL_DEFENSE_ENABLED_FILE = os.getenv(
+    "COPILOT_TACTICAL_DEFENSE_ENABLED_FILE", "copilot_tactical_defense_enabled.json"
+)
+# Cooldown/no-thrash guardrail for a DEFEND action re-firing on the same
+# symbol: a new DEFEND inside this many minutes of the last one is
+# suppressed UNLESS the position's adverse move has also worsened by at
+# least COPILOT_TACTICAL_DEFEND_MIN_RETRIGGER_PCT since that last action
+# (both required together) — see ai.copilot_execution._validate_and_
+# apply_tactical_verdict's own docstring.
+COPILOT_TACTICAL_DEFEND_COOLDOWN_MINUTES = int(
+    os.getenv("COPILOT_TACTICAL_DEFEND_COOLDOWN_MINUTES", "60")
+)
+COPILOT_TACTICAL_DEFEND_MIN_RETRIGGER_PCT = float(
+    os.getenv("COPILOT_TACTICAL_DEFEND_MIN_RETRIGGER_PCT", "0.3")
+)
+# Sane bounds on a DEFEND verdict's own proposed partial-close fraction —
+# parse_tactical_verdict REJECTS the whole verdict (never silently
+# clamps) when the model proposes a fraction outside this range.
+COPILOT_TACTICAL_MIN_PARTIAL_CLOSE_FRACTION = float(
+    os.getenv("COPILOT_TACTICAL_MIN_PARTIAL_CLOSE_FRACTION", "0.10")
+)
+COPILOT_TACTICAL_MAX_PARTIAL_CLOSE_FRACTION = float(
+    os.getenv("COPILOT_TACTICAL_MAX_PARTIAL_CLOSE_FRACTION", "0.75")
 )

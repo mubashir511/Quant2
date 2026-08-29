@@ -5,6 +5,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -33,9 +34,16 @@ from analysis.technical import TechnicalStats, compute_technical_stats
 from data.book_wisdom import format_book_wisdom
 from data.commodity_geography import INDEX_LINKED_COUNTRIES, METAL_LINKED_COUNTRIES
 from data.crop_context import CROP_TRADE_PROFILES, fetch_crop_supply_demand_context
-from data.macro_source import fetch_country_indicators, fetch_fx_rate_to_usd, fetch_market_indicators
+from data.macro_source import (
+    MacroCycleDiagnostic,
+    fetch_country_indicators,
+    fetch_fx_rate_to_usd,
+    fetch_macro_cycle_closes,
+    fetch_macro_cycle_diagnostic,
+    fetch_market_indicators,
+)
 from data.market_history import fetch_price_history_ohlcv
-from data.mt5_source import AccountSummary, ContractSpec, MarketAsset, Position, get_contract_spec
+from data.mt5_source import AccountSummary, ContractSpec, MarketAsset, PendingOrder, Position, get_contract_spec
 from data.news_source import fetch_recent_headlines
 from data.underlying import resolve_yahoo_ticker
 
@@ -1092,6 +1100,12 @@ def format_enriched_asset_context(
                 )
             if stats.market_regime is not None:
                 pattern_bits.append(f"market type: {stats.market_regime}")
+            if stats.momentum_acceleration is not None:
+                # Short-window sibling to market_regime — catches a fresh
+                # pump/dump leg already underway even when the medium-
+                # term regime above still reads sideways (see
+                # analysis/technical.py's own MOMENTUM_WINDOW comment).
+                pattern_bits.append(f"short-term momentum: {stats.momentum_acceleration}")
             if pattern_bits:
                 lines.append(f"  pattern: {', '.join(pattern_bits)}")
             lines += format_backtests(r)
@@ -1114,12 +1128,52 @@ def build_enriched_asset_context(assets: list[MarketAsset]) -> str:
     return format_enriched_asset_context(analyze_assets(assets))
 
 
+def _format_macro_cycle_diagnostic(cycle: MacroCycleDiagnostic) -> list[str]:
+    """Pring's 6-stage market-cycle read, from data.macro_source.
+    fetch_macro_cycle_diagnostic()'s own real, computed 12-month-MA
+    comparisons — added 2026-08-27, "Phase 3" of the book-wisdom
+    initiative. Returns [] (section omitted entirely) when no leg has
+    real data, same "degrade honestly, never fake a value" convention
+    as the rest of this function."""
+    legs = [cycle.yield_3m, cycle.yield_10y, cycle.equity_index, cycle.commodity_index, cycle.dollar_index]
+    if not any(leg.above_ma is not None for leg in legs):
+        return []
+
+    lines = [
+        "Business-cycle stage diagnostic (Pring's bond/stock/commodity "
+        "model — current value vs. its own trailing 12-month average; "
+        "within this account's broker limitations this is leading-"
+        "indicator CONTEXT for FX/gold/equity-CFD timing, not a literal "
+        "instruction to trade bonds/rates directly, which aren't "
+        "offered here):"
+    ]
+    for leg in legs:
+        if leg.above_ma is None:
+            continue
+        direction = "ABOVE" if leg.above_ma else "BELOW"
+        lines.append(f"- {leg.label}: {direction} its 12-month MA ({leg.current:.2f} vs {leg.moving_avg_12m:.2f})")
+    if cycle.stage_label:
+        lines.append(f"- Best-effort stage read: {cycle.stage_label} — {cycle.stage_description}")
+    lines.append(f"- {cycle.note}")
+    return lines
+
+
 def build_macro_snapshot() -> str:
     """US yield curve/DXY/VIX plus GDP growth/inflation/unemployment for
     the US, UK, Japan, and China. Missing values are simply omitted rather
     than faked — see data/macro_source.py for why a given field can be None."""
-    market = fetch_market_indicators()
+    # fetch_macro_cycle_closes() and fetch_market_indicators() overlap on 3
+    # tickers (^IRX/^TNX/DX-Y.NYB) — fetched once here and shared, instead
+    # of each function independently re-fetching the same 3 tickers (found
+    # on audit, 2026-08-27; see fetch_market_indicators's own docstring).
+    cycle_closes = fetch_macro_cycle_closes()
+    market = fetch_market_indicators(precomputed_closes={
+        "^IRX": cycle_closes.get("yield_3m"),
+        "^TNX": cycle_closes.get("yield_10y"),
+        "DX-Y.NYB": cycle_closes.get("dollar_index"),
+    })
     countries = fetch_country_indicators()
+    cycle = fetch_macro_cycle_diagnostic(closes_by_key=cycle_closes)
 
     lines = ["Macro snapshot:"]
 
@@ -1150,6 +1204,11 @@ def build_macro_snapshot() -> str:
             bits.append(f"unemployment {c.unemployment_pct:.1f}%")
         if bits:
             lines.append(f"- {c.country}: {', '.join(bits)}")
+
+    cycle_lines = _format_macro_cycle_diagnostic(cycle)
+    if cycle_lines:
+        lines.append("")
+        lines.extend(cycle_lines)
 
     if len(lines) == 1:
         lines.append("- macro data unavailable right now")
@@ -1314,6 +1373,34 @@ def build_positions_context(positions: list[Position]) -> str:
             f"{p.price_open:.2f}, now {p.price_current:.2f} "
             f"({pnl_pct:+.1f}%, {p.profit:+.2f} unrealized)"
             + (f", stop at {p.sl:.2f}" if p.sl is not None else ", no stop set")
+            + (f", target at {p.tp:.2f}" if p.tp is not None else ", no target set")
+        )
+    return "\n".join(lines)
+
+
+def build_pending_orders_context(pending_orders: list[PendingOrder]) -> str:
+    """Outstanding (not-yet-filled) pending limit/stop orders, if any —
+    feeds the AI's target mix so it reconciles what's already resting on
+    the books, the same way build_positions_context does for filled
+    positions (added 2026-08-23, direct user request: an already-
+    suggested but not-yet-filled limit order previously had zero
+    visibility in this prompt at all). Empty string when there are none
+    (nothing to reconcile)."""
+    if not pending_orders:
+        return ""
+    lines = ["Outstanding Pending Orders (real, not yet filled — reconcile "
+             "the final mix against these too, same as Current Open "
+             "Positions above):"]
+    for o in pending_orders:
+        age = ""
+        if o.time_setup is not None:
+            hours = (datetime.now() - o.time_setup).total_seconds() / 3600
+            age = f", resting {hours:.1f}h"
+        lines.append(
+            f"- {o.symbol}: {o.order_type} {o.volume:g} lots, trigger at "
+            f"{o.price_open:.2f}{age}"
+            + (f", stop at {o.sl:.2f}" if o.sl is not None else ", no stop set")
+            + (f", target at {o.tp:.2f}" if o.tp is not None else ", no target set")
         )
     return "\n".join(lines)
 
@@ -1387,6 +1474,8 @@ class AllocationEntry:
     stop_loss: float | None = None
     take_profit: float | None = None
     side: str = "buy"  # "buy" or "sell" — see risk/apply_suggestion.py::compute_rebalance_plan
+    reason: str = ""  # current thesis for this specific target, mirrors PendingSetup.reason
+    invalidation_condition: str | None = None  # mechanically-checkable exit trigger, mirrors PendingSetup.trigger_condition
 
 
 def parse_final_allocation(
@@ -1418,7 +1507,21 @@ def parse_final_allocation(
     path has already been burned by once. Returns None on anything
     unexpected — missing block, malformed JSON, wrong shape — rather than
     raising; the text response still displays fine even if this fails, it
-    just means no allocation chart/execution plan."""
+    just means no allocation chart/execution plan.
+
+    `reason`/`invalidation_condition` (added 2026-08-23, direct user
+    request -- letting both Claude and Copilot re-assess an already-
+    suggested position instead of only ever proposing fresh ones) are
+    read OPTIONALLY: absent entirely -> ""/None (never a parse
+    failure over a merely-omitted new field), but a WRONG TYPE if present
+    still fails the whole parse, same treatment as price/stop_loss/
+    take_profit. This asymmetry is deliberate: a full parse failure here
+    means _write_latest_suggestion (ai/ftmo_suggest.py) leaves
+    execution guidance frozen on the PRIOR, stale suggestion rather than
+    ever wiping it to nothing -- worse than gracefully degrading to "no
+    invalidation_condition given, skip this symbol's watch this cycle"
+    over one model omission on a brand-new field older saved records
+    never had."""
     match = _last_allocation_match(response_text)
     if match is None:
         return None
@@ -1447,6 +1550,12 @@ def parse_final_allocation(
             return None
         if take_profit is not None and not isinstance(take_profit, (int, float)):
             return None
+        reason = value.get("reason", "")
+        if not isinstance(reason, str):
+            return None
+        invalidation_condition = value.get("invalidation_condition")
+        if invalidation_condition is not None and not isinstance(invalidation_condition, str):
+            return None
         side = value.get("side")
         if side is None:
             if require_side:
@@ -1462,6 +1571,8 @@ def parse_final_allocation(
             stop_loss=float(stop_loss) if stop_loss is not None else None,
             take_profit=float(take_profit) if take_profit is not None else None,
             side=side_norm,
+            reason=reason,
+            invalidation_condition=invalidation_condition,
         )
     return result
 
@@ -2310,12 +2421,17 @@ def build_audit_block(
     *any* model responds, so the pool tolerates several being down at once
     (see AUDIT_MODELS for why it's spread across multiple providers).
 
-    `include_copilot` defaults to True (every existing caller's behavior
-    unchanged). The scheduled FTMO mega-analysis run (see
-    ai.mega_analysis.run_mega_analysis) passes False — direct user request
-    2026-08-22: Copilot has a separate, dedicated role elsewhere and
-    should not also spend its own request budget on the unattended run's
-    audit pool. AUDIT_MODELS itself (the 10-model OpenRouter pool) is
+    `include_copilot` defaults to True as the function's own library
+    default, but as of 2026-08-25 every real caller (FTMO, PMEX, PSX)
+    explicitly passes False — Copilot has no auditor role anywhere in
+    this app for now, direct user request: it was already carved out of
+    FTMO's audit pool 2026-08-22 (a separate, dedicated clerk role
+    there, see ai/copilot_execution.py), and the same reasoning was
+    extended to PMEX/PSX 2026-08-25 rather than leaving it inconsistent
+    across markets. The True default survives only for this function's
+    own direct unit tests exercising that code path — flip a caller back
+    to True (or omit the argument) if Copilot's auditor role is ever
+    reinstated. AUDIT_MODELS itself (the 10-model OpenRouter pool) is
     untouched by this flag; only the extra 11th Copilot voice is skipped.
 
     `audit_instruction` lets a different market's suggestion pipeline (see
@@ -2478,7 +2594,9 @@ def suggest_portfolio(
         return draft
 
     _notify(f"Sending the draft to {len(AUDIT_MODELS)} independent free models for audit...")
-    audit = build_audit_block(summary, draft, on_progress=on_audit_progress, past_lessons=past_lessons)
+    audit = build_audit_block(
+        summary, draft, on_progress=on_audit_progress, past_lessons=past_lessons, include_copilot=False
+    )
     _notify(
         "Audit received — Claude is revising its suggestion..."
         if audit.audit_available
