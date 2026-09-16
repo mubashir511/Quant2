@@ -16,7 +16,7 @@ from ai.ftmo_suggest import (
 from data.mt5_source import connect, get_account_summary, get_market_watch, get_open_positions, get_pending_orders
 from utils import run_with_timeout
 
-# Re-exported so existing callers (ai/copilot_execution.py, app.py) that
+# Re-exported so existing callers (ai/clerk_execution.py, app.py) that
 # import read_latest_suggestion from this module keep working unchanged
 # — the function itself moved to ai/ftmo_suggest.py (see that module's
 # own docstring for why: it's written by ANY successful
@@ -159,7 +159,7 @@ def mega_session_is_live(progress: dict, state: dict) -> bool:
     """True iff `progress` (from read_progress()) reflects a mega
     session that's still genuinely in flight, not a stale leftover from
     a run that already finished or crashed. Shared by app.py's own
-    live-progress display and ai.copilot_execution's pre-execution
+    live-progress display and ai.clerk_execution's pre-execution
     check (previously two independent copies of this exact heuristic —
     consolidated here 2026-08-27 after fixing a real bug in both at
     once: see below).
@@ -182,7 +182,7 @@ def mega_session_is_live(progress: dict, state: dict) -> bool:
     real run's single "Claude is researching..." step and its
     audit-pool phase can each individually run longer than that with
     no new progress write, which wrongly hid the whole live-progress
-    UI mid-run (found live 2026-08-27) — and, in ai.copilot_execution's
+    UI mid-run (found live 2026-08-27) — and, in ai.clerk_execution's
     copy, could in principle have let the execution-check job act
     mid-run instead of correctly waiting."""
     progress_ts = progress.get("updated_utc")
@@ -335,6 +335,8 @@ def is_due(now_utc: datetime, state: dict | None = None) -> bool:
 def run_mega_analysis(
     on_stage: Callable[[str], None] | None = None,
     on_audit_progress: Callable[[str], None] | None = None,
+    on_analyses: Callable[[list], None] | None = None,
+    model: str | None = None,
 ) -> str:
     """Runs the exact same FTMO Portfolio Suggestion pipeline the manual
     "Suggest Portfolio Mix" button does for FTMO (app.py's FTMO branch) —
@@ -348,15 +350,18 @@ def run_mega_analysis(
 
     Passes include_copilot=False explicitly below (matching suggest_
     ftmo_portfolio's own default now) — Copilot has a separate, dedicated
-    role for FTMO (the hourly clerk/executioner, see
-    ai/copilot_execution.py) and must not also spend its own request
-    budget auditing here. This is no longer scheduled-run-specific: an
-    earlier version of this exclusion only covered this path, but the
-    manual "Suggest Portfolio Mix" button (app.py) showed Copilot still
+    role in the audit pool it must not also spend its own request budget
+    on here; that role is entirely unrelated to the Execution Clerk (the
+    short-interval clerk/executioner, see ai/clerk_execution.py, which
+    stopped using Copilot at all as of 2026-08-30 — see that module's
+    own docstring). This is no longer scheduled-run-specific: an earlier
+    version of this exclusion only covered this path, but the manual
+    "Suggest Portfolio Mix" button (app.py) showed Copilot still
     auditing FTMO suggestions there too, so suggest_ftmo_portfolio's own
     default flipped to exclude it everywhere for FTMO — this explicit
     pass is now redundant with that default, kept for clarity. PMEX and
-    PSX are untouched — only FTMO's relationship with Copilot changed.
+    PSX are untouched — only FTMO's relationship with Copilot's audit
+    role changed.
 
     Returns the raw suggestion text. A CLI-layer failure (missing CLI /
     a run that failed outright) comes back as that same error string
@@ -369,7 +374,7 @@ def run_mega_analysis(
 
     suggest_ftmo_portfolio() itself writes the derived
     MEGA_ANALYSIS_LATEST_SUGGESTION_FILE artifact on any genuine
-    success — the sole source of truth ai.copilot_execution's clerk
+    success — the sole source of truth ai.clerk_execution's clerk
     reads — unconditionally, regardless of caller; this function doesn't
     need to (and no longer does) trigger that separately.
 
@@ -384,7 +389,24 @@ def run_mega_analysis(
     just to keep the file honestly up to date. Calls _reset_progress()
     first, before anything else, so this run's own step log starts
     empty rather than carrying over whatever the previous run last left
-    behind."""
+    behind.
+
+    `on_analyses`, if given, is called once with the real per-instrument
+    analyses list right after it's computed — added so the manual
+    "Suggest Portfolio Mix" button (app.py) can call this SAME function
+    instead of re-implementing the whole pipeline inline, which is what
+    silently caused it to never write to this function's own progress
+    file at all: a real, reported bug where the manual run showed no
+    live status in the shared Mega Session section, and didn't pause the
+    Clerk's own periodic check the way a scheduled run correctly does,
+    since mega_session_is_live() has nothing to go on without these
+    writes. This callback lets the button still keep the `analyses`
+    value it separately needs for its own session_state afterward.
+
+    `model`, if given, overrides config.MEGA_ANALYSIS_MODEL for this one
+    call — the manual button lets a user pick a model (e.g. a cheap/fast
+    "haiku" test run) without touching that config value; None (the
+    default) preserves the exact original scheduled-run behavior."""
     _reset_progress()
 
     def _notify(message: str) -> None:
@@ -428,17 +450,21 @@ def run_mega_analysis(
     _notify(f"Analyzing {len(assets)} instruments...")
     analyses = analyze_ftmo_assets(assets, on_progress=_notify_instrument_progress)
     _notify(f"Analyzed all {len(assets)} instruments.")
+    if on_analyses:
+        on_analyses(analyses)
     summary = build_ftmo_summary(
         account, assets, status, positions=positions, analyses=analyses, pending_orders=pending_orders
     )
 
     # config.MEGA_ANALYSIS_MODEL defaults to "sonnet" (the real, intended
-    # production model) — overridable via the MEGA_ANALYSIS_MODEL env var
-    # purely for a cheap/fast manual test run (e.g. "haiku") without
-    # touching this file, so there's a single obvious place to remember
-    # to unset the override afterward rather than a hardcoded value here
-    # that's easy to forget mid-test.
-    _notify(f"Running Claude {config.MEGA_ANALYSIS_MODEL} + the full audit-model pool...")
+    # production model) — overridable via the MEGA_ANALYSIS_MODEL env var,
+    # or per-call via the `model` parameter above (the manual button's own
+    # model picker), purely for a cheap/fast manual test run (e.g. "haiku")
+    # without touching this file, so there's a single obvious place to
+    # remember to unset the override afterward rather than a hardcoded
+    # value here that's easy to forget mid-test.
+    resolved_model = model or config.MEGA_ANALYSIS_MODEL
+    _notify(f"Running Claude {resolved_model} + the full audit-model pool...")
 
     def _notify_audit(text: str) -> None:
         logger.info(text)
@@ -448,7 +474,7 @@ def run_mega_analysis(
 
     return suggest_ftmo_portfolio(
         summary,
-        model=config.MEGA_ANALYSIS_MODEL,
+        model=resolved_model,
         save_record=True,
         on_stage=_notify,
         on_audit_progress=_notify_audit,

@@ -15,7 +15,7 @@ $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 Set-Location $root
 
-$pythonExe = "C:\Users\mubas\AppData\Local\Programs\Python\Python314\python.exe"
+$pythonExe = Join-Path $root ".venv\Scripts\python.exe"
 $logFile = Join-Path $root "streamlit_log.txt"
 $icoPath = Join-Path $root "quant_app.ico"
 $appUrl = "http://localhost:8501"
@@ -75,7 +75,17 @@ if (Test-PortOpen -ComputerName "localhost" -Port 8501) {
 # it exits, so the tracked process's own HasExited still accurately
 # reflects whether Streamlit itself is still running.
 function Start-Streamlit {
-    $cmdLine = "`"$pythonExe`" -m streamlit run app.py --server.headless true >> `"$logFile`" 2>&1"
+    # --server.address 0.0.0.0 (added for remote/mobile access via
+    # Tailscale, direct user request): binds to every network interface
+    # on this PC, not just localhost, so a request arriving over the
+    # Tailscale virtual adapter (its own private 100.64.0.0/10 network)
+    # can actually reach it. Safe specifically BECAUSE the Windows
+    # Firewall rule set up alongside this only allows inbound port 8501
+    # from that same Tailscale range — binding wide is what lets that
+    # firewall rule be the actual access boundary instead of Streamlit's
+    # own bind address; the app.py password gate is the second,
+    # independent layer in case either of those is ever misconfigured.
+    $cmdLine = "`"$pythonExe`" -m streamlit run app.py --server.headless true --server.address 0.0.0.0 >> `"$logFile`" 2>&1"
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = "cmd.exe"
     # The extra outer quote pair matters: cmd.exe /c has a documented

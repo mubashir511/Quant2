@@ -7,7 +7,7 @@ import mega_analysis_job
 
 # The PID-liveness-aware lock mechanism itself (pid_is_alive/acquire_lock/
 # release_lock) was extracted into job_lock.py once a second unattended
-# job (copilot_execution_job.py) needed the exact same logic — see
+# job (clerk_execution_job.py) needed the exact same logic — see
 # tests/test_job_lock.py for its own dedicated coverage. This file keeps
 # only what's specific to mega_analysis_job.py: main()'s lock lifecycle
 # around a due run, and the inline post-success execution-check wiring.
@@ -147,10 +147,10 @@ def test_main_fires_inline_execution_check_after_a_successful_run(mock_is_due, m
     lock = tmp_path / "mega_analysis.lock"
     monkeypatch.setattr(mega_analysis_job, "_LOCK_PATH", lock)
     # The inline path acquires its own, separate execution lock (shared
-    # with copilot_execution_job.py's own standalone poll — see the
+    # with clerk_execution_job.py's own standalone poll — see the
     # module docstring) — pointed at a tmp_path file so this test never
     # touches the real project-root lock file.
-    monkeypatch.setattr(mega_analysis_job, "EXECUTION_LOCK_PATH", tmp_path / "copilot_execution.lock")
+    monkeypatch.setattr(mega_analysis_job, "EXECUTION_LOCK_PATH", tmp_path / "clerk_execution.lock")
 
     state_before = {"last_attempt_utc": "2026-08-22T00:00:00+00:00"}
     state_after = {
@@ -172,7 +172,7 @@ def test_main_fires_inline_execution_check_after_a_successful_run(mock_is_due, m
 
     mock_run_with_timeout.assert_called_once()
     args, kwargs = mock_run_with_timeout.call_args
-    assert args[0] is mega_analysis_job.run_copilot_execution_check
+    assert args[0] is mega_analysis_job.run_clerk_execution_check
 
 
 @patch("mega_analysis_job.run_scheduled_mega_analysis")
@@ -233,7 +233,7 @@ def test_main_swallows_an_exception_from_the_inline_execution_check(mock_is_due,
     # job's own lock release or propagate out of main().
     lock = tmp_path / "mega_analysis.lock"
     monkeypatch.setattr(mega_analysis_job, "_LOCK_PATH", lock)
-    monkeypatch.setattr(mega_analysis_job, "EXECUTION_LOCK_PATH", tmp_path / "copilot_execution.lock")
+    monkeypatch.setattr(mega_analysis_job, "EXECUTION_LOCK_PATH", tmp_path / "clerk_execution.lock")
 
     state_before = {"last_attempt_utc": "2026-08-22T00:00:00+00:00"}
     state_after = {
@@ -254,12 +254,12 @@ def test_main_swallows_an_exception_from_the_inline_execution_check(mock_is_due,
         mega_analysis_job.main()  # must not raise
 
     assert not lock.exists()  # still released cleanly
-    assert not (tmp_path / "copilot_execution.lock").exists()  # execution lock also released
+    assert not (tmp_path / "clerk_execution.lock").exists()  # execution lock also released
 
 
 # --- real concurrency bug found on audit: two independent processes ---
-# (this job's own inline pass, and copilot_execution_job.py's standalone
-# hourly poll) must never run run_copilot_execution_check() at once
+# (this job's own inline pass, and clerk_execution_job.py's standalone
+# hourly poll) must never run run_clerk_execution_check() at once
 
 
 @patch("mega_analysis_job.run_scheduled_mega_analysis")
@@ -269,7 +269,7 @@ def test_inline_execution_check_skips_gracefully_when_lock_already_held(mock_is_
 
     lock = tmp_path / "mega_analysis.lock"
     monkeypatch.setattr(mega_analysis_job, "_LOCK_PATH", lock)
-    execution_lock = tmp_path / "copilot_execution.lock"
+    execution_lock = tmp_path / "clerk_execution.lock"
     # Simulate the standalone hourly job (a genuinely different, alive
     # process) already holding the shared execution lock right now.
     execution_lock.write_text(str(os.getpid()))

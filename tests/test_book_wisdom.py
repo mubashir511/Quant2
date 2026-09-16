@@ -50,7 +50,7 @@ def test_phase3_entries_are_regime_tier():
 
 
 def test_format_trend_wisdom_excludes_phase2_and_phase3_regime_content():
-    # The Execution Clerk's tactical-defense prompt (ai/copilot_execution.
+    # The Execution Clerk's tactical-defense prompt (ai/clerk_execution.
     # py::_build_tactical_prompt) calls format_trend_wisdom() exclusively —
     # Phase 2's correlation/diversification content and Phase 3's
     # geopolitical-shock/macro-cycle content are portfolio-construction-

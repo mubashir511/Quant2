@@ -1,14 +1,53 @@
 import csv
+import functools
 import logging
+import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
 import config
 
 logger = logging.getLogger(__name__)
+
+# The MetaTrader5 Python package wraps a single, process-wide IPC
+# connection to the terminal — not documented thread-safe, and this
+# whole module's design always assumed exactly one logical caller at a
+# time (see e.g. _fetch_technical_context's own docstring in
+# ai/clerk_execution.py). That assumption silently broke once genuine
+# background threads existed in this app: the Execution Clerk's and Mega
+# Analysis's own in-app periodic auto-triggers (both added 2026-08-30/
+# 31) can now legitimately overlap with each other AND with the live-
+# data st.fragment(run_every=...) panels (Live Positions/Watchlist),
+# all touching MT5 from different threads in the same process. Direct
+# user report 2026-08-31: starting a mega session froze the ENTIRE
+# Streamlit session — not just its own panel, the unrelated Clerk
+# section too — eventually requiring a manual app restart; a genuine
+# concurrent-IPC hang/corruption at the MT5 layer, not a Python
+# exception (nothing in the logs). _serialize_mt5_access restores the
+# "exactly one caller at a time" invariant with a real lock: every
+# public MT5-touching function in this module and in
+# data/mt5_execution.py is wrapped with it (importing this SAME lock
+# object, not a second independent one) so a second thread's own MT5
+# call simply waits its turn — cheaply, a blocked lock acquisition
+# doesn't spin — instead of racing the first one at the IPC layer.
+#
+# Reentrant (RLock), not a plain Lock: several decorated public
+# functions below (get_current_price, get_market_watch, get_contract_
+# spec, fetch_mt5_price_history, etc.) internally call the also-
+# decorated _ensure_symbol_selected — a plain Lock would deadlock a
+# thread against itself on that nested acquisition.
+MT5_ACCESS_LOCK = threading.RLock()
+
+
+def _serialize_mt5_access(fn):
+    @functools.wraps(fn)
+    def _wrapper(*args, **kwargs):
+        with MT5_ACCESS_LOCK:
+            return fn(*args, **kwargs)
+    return _wrapper
 
 # A symbol visible via symbols_get() can still fail to select on the
 # first attempt — confirmed live (MT5 terminal's own Symbols window
@@ -24,6 +63,7 @@ _SYMBOL_SELECT_RETRY_ATTEMPTS = 3
 _SYMBOL_SELECT_RETRY_DELAY_SECONDS = 0.3
 
 
+@_serialize_mt5_access
 def _ensure_symbol_selected(mt5, symbol: str) -> bool:
     """Selects a symbol for this API session, retrying briefly on
     failure. Never raises. Returns whether it ultimately succeeded —
@@ -113,6 +153,7 @@ class MT5ConnectionError(RuntimeError):
     pass
 
 
+@_serialize_mt5_access
 def connect(
     login: str | int | None = None,
     password: str | None = None,
@@ -185,6 +226,7 @@ def connect(
             )
 
 
+@_serialize_mt5_access
 def is_trading_permitted() -> tuple[bool, str]:
     """Whether the CURRENTLY connected terminal/account can actually
     place a real order right now — distinct from whether the ACCOUNT is
@@ -221,6 +263,7 @@ def is_trading_permitted() -> tuple[bool, str]:
     return True, ""
 
 
+@_serialize_mt5_access
 def get_open_positions() -> list[Position]:
     import MetaTrader5 as mt5
 
@@ -258,12 +301,24 @@ _ORDER_TYPE_LABELS = {
 }
 
 
+@_serialize_mt5_access
 def get_pending_orders() -> list[PendingOrder]:
     """Working orders not yet filled (limit/stop orders) — distinct from
     get_open_positions(), which only returns already-filled positions.
     MT5 keeps these as two separate concepts; a symbol can have a real,
     live pending order sitting on the account with zero effect on
-    positions_get() until price actually reaches it."""
+    positions_get() until price actually reaches it.
+
+    `time_setup` is explicitly UTC-aware (tz=timezone.utc) — the same
+    naive-datetime bug already found and fixed live in get_history_deals
+    above (2026-09-01) recurred here: a bare datetime.fromtimestamp(...)
+    with no tz renders in whatever timezone the calling MACHINE happens
+    to be in, not the UTC this account's own compliance/staleness logic
+    assumes throughout. Confirmed live 2026-09-04: risk/apply_
+    suggestion.py::compute_rebalance_plan's own pending-order-age check
+    (comparing against datetime.now(timezone.utc)) crashed with
+    "can't subtract offset-naive and offset-aware datetimes" the first
+    time it ran against a real naive time_setup from this function."""
     import MetaTrader5 as mt5
 
     raw = mt5.orders_get()
@@ -282,12 +337,106 @@ def get_pending_orders() -> list[PendingOrder]:
                 sl=o.sl if o.sl else None,
                 tp=o.tp if o.tp else None,
                 ticket=o.ticket,
-                time_setup=datetime.fromtimestamp(o.time_setup) if o.time_setup else None,
+                time_setup=datetime.fromtimestamp(o.time_setup, tz=timezone.utc) if o.time_setup else None,
             )
         )
     return orders
 
 
+@dataclass
+class CancelledPendingOrder:
+    """A real GTC pending order that was CANCELLED or EXPIRED before ever
+    filling — added 2026-09-09 for ai.curiosity's missed-opportunity
+    detection (see that module's own docstring for the real, motivating
+    incident: INTC and AMD buy-limit orders sitting well below a fast-
+    moving market, never filling, both eventually overtaken by price so
+    far their own original take-profits were exceeded before the entry
+    ever triggered — a real, recurring pattern this account's own
+    curiosity function had NO visibility into at all, since it only ever
+    examined trades that actually opened and closed).
+
+    Deliberately a SEPARATE dataclass from PendingOrder (that one
+    describes a STILL-RESTING order; this one describes one that's
+    already been removed) rather than reusing it with an extra status
+    field — the two represent genuinely different real-world states, and
+    conflating them risks a caller accidentally treating a dead order as
+    still live."""
+    ticket: int
+    symbol: str
+    side: str  # "buy" or "sell"
+    order_type: str  # e.g. "buy limit" / "sell stop", same _ORDER_TYPE_LABELS convention as PendingOrder
+    volume: float
+    price_open: float  # the entry level that never got filled
+    sl: float | None
+    tp: float | None
+    time_setup: datetime  # when the order was first placed
+    time_done: datetime  # when it was cancelled/expired
+
+
+@_serialize_mt5_access
+def get_cancelled_pending_orders(
+    date_from: datetime, date_to: datetime | None = None
+) -> list[CancelledPendingOrder]:
+    """Real orders that were CANCELED or EXPIRED (MT5's own ORDER_STATE_*)
+    without ever filling — the raw material ai.curiosity needs to detect
+    a missed opportunity, which get_history_deals/get_pending_orders
+    alone cannot: a deal only exists once an order actually fills, and
+    get_pending_orders only shows what's STILL resting right now, not
+    what used to be resting and got removed. Deliberately excludes
+    ORDER_STATE_REJECTED (a broker-side rejection is a different,
+    unrelated failure mode — not "the market moved on," but "this order
+    was never valid in the first place") and ORDER_STATE_FILLED (a real
+    trade, already covered by get_history_deals/ClosedTrade).
+
+    Same "empty list on any failure, never raise" contract as
+    get_history_deals — a quiet account with nothing cancelled in the
+    lookback window is a normal, expected result, not an error. Same
+    UTC-aware-timestamp discipline as every other MT5 timestamp in this
+    file (see get_history_deals'/get_pending_orders' own docstrings for
+    the real bugs naive datetimes caused live).
+
+    Newest first (sorted by time_done, descending) — mirrors group_
+    closed_trades' own explicit "Newest first" contract. Real bug found
+    on self-review: ai.curiosity.score_missed_opportunities slices its
+    input to just the first `pool_size` orders, documented as "most
+    recent pool_size first," but MT5's own history_orders_get() makes no
+    such ordering guarantee (ticket/time-ascending in practice) — with
+    nothing sorting this list, a lookback window with more than pool_
+    size cancelled orders would have silently favored the OLDEST ones
+    instead."""
+    import MetaTrader5 as mt5
+
+    date_to = date_to if date_to is not None else datetime.now() + timedelta(days=1)
+    raw = mt5.history_orders_get(date_from, date_to)
+    if raw is None:
+        error = mt5.last_error()
+        logger.warning("get_cancelled_pending_orders: history_orders_get returned nothing (last_error=%s)", error)
+        return []
+
+    relevant_states = {mt5.ORDER_STATE_CANCELED, mt5.ORDER_STATE_EXPIRED}
+    orders = []
+    for o in raw:
+        if o.state not in relevant_states or not o.symbol:
+            continue
+        orders.append(
+            CancelledPendingOrder(
+                ticket=o.ticket,
+                symbol=o.symbol,
+                side="buy" if o.type in (mt5.ORDER_TYPE_BUY, mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_BUY_STOP) else "sell",
+                order_type=_ORDER_TYPE_LABELS.get(o.type, f"type {o.type}"),
+                volume=o.volume_initial,
+                price_open=o.price_open,
+                sl=o.sl if o.sl else None,
+                tp=o.tp if o.tp else None,
+                time_setup=datetime.fromtimestamp(o.time_setup, tz=timezone.utc),
+                time_done=datetime.fromtimestamp(o.time_done, tz=timezone.utc),
+            )
+        )
+    orders.sort(key=lambda o: o.time_done, reverse=True)
+    return orders
+
+
+@_serialize_mt5_access
 def get_current_price(symbol: str) -> float | None:
     """Live mid price for a single symbol — used to show a pending
     order's current market price alongside its trigger price, without
@@ -307,6 +456,7 @@ def get_current_price(symbol: str) -> float | None:
     return (tick.bid + tick.ask) / 2
 
 
+@_serialize_mt5_access
 def get_current_bid_ask(symbol: str) -> tuple[float, float] | None:
     """Live (bid, ask) for a single symbol — get_current_price's sibling
     for a caller that needs the two sides separately (e.g. a spread
@@ -324,6 +474,7 @@ def get_current_bid_ask(symbol: str) -> tuple[float, float] | None:
     return tick.bid, tick.ask
 
 
+@_serialize_mt5_access
 def get_server_time_offset(symbol: str = "EURUSD") -> timedelta | None:
     """How far ahead of (or behind) this machine's true UTC clock the
     connected MT5 broker's own server clock currently is — computed
@@ -351,6 +502,24 @@ def get_server_time_offset(symbol: str = "EURUSD") -> timedelta | None:
     return timedelta(seconds=tick.time - time.time())
 
 
+@_serialize_mt5_access
+def get_terminal_commondata_path() -> str | None:
+    """The terminal's shared COMMON data folder (MQL5's FILE_COMMON
+    target) — used by ai/chart_overlay.py to write the file mql5/
+    Quant2ChartOverlay.mq5 reads, since FILE_COMMON is shared across
+    every terminal/login profile on this machine (this account runs
+    more than one MT5 login against the same terminal.exe), unlike the
+    per-terminal Files folder DumpSymbolSpecs.mq5 already uses. None on
+    any failure — the caller treats a missing path the same as any
+    other write failure for this purely cosmetic feature, never a
+    reason to raise."""
+    import MetaTrader5 as mt5
+
+    info = mt5.terminal_info()
+    return info.commondata_path if info is not None else None
+
+
+@_serialize_mt5_access
 def get_account_summary() -> AccountSummary:
     import MetaTrader5 as mt5
 
@@ -367,6 +536,7 @@ def get_account_summary() -> AccountSummary:
     )
 
 
+@_serialize_mt5_access
 def get_market_watch() -> list[MarketAsset]:
     """Tradable instruments the user has added to their MT5 Market Watch.
 
@@ -438,6 +608,7 @@ def _load_symbol_spec_from_csv(symbol: str, csv_path: str) -> ContractSpec | Non
     return None
 
 
+@_serialize_mt5_access
 def _compute_margin_via_order_calc(symbol: str) -> float:
     """Real per-1.0-lot margin via mt5.order_calc_margin() — MT5's own
     calc-mode-agnostic margin calculation (works for FOREX/CFD calc
@@ -468,6 +639,7 @@ def _compute_margin_via_order_calc(symbol: str) -> float:
     return margin
 
 
+@_serialize_mt5_access
 def get_contract_spec(symbol: str) -> ContractSpec | None:
     """Real order-size/margin constraints for a symbol — e.g. a minimum
     lot can require far more margin than a small account holds at all,
@@ -558,8 +730,24 @@ class HistoricalDeal:
     position_id: int = 0  # groups a position's open/close legs into one round-trip trade
     price: float = 0.0
     side: str = ""  # "buy"/"sell" for a real trade leg, "" for a non-trade balance deal
+    # MT5's own DEAL_ENTRY_IN=0/DEAL_ENTRY_OUT=1/DEAL_ENTRY_INOUT=2/
+    # DEAL_ENTRY_OUT_BY=3 — which leg of a position this deal represents.
+    # Added 2026-09-01 (see group_closed_trades' own docstring) so a
+    # position with more than one entry or exit leg (any partial
+    # open/close) can be grouped correctly instead of just guessing from
+    # time order.
+    entry: int = 0
+    # Raw instrument profit alone — MT5's own `d.profit`, NOT combined
+    # with swap/commission the way `profit` above deliberately is. Added
+    # 2026-09-02: this is what the MT5 terminal's own "Profit" column
+    # shows (confirmed live), so the app's Trade History table can show
+    # BOTH the true net result (profit, already used everywhere else,
+    # e.g. FTMO compliance) and this raw figure side by side, instead of
+    # the two only ever appearing to disagree with no visible reason why.
+    raw_profit: float = 0.0
 
 
+@_serialize_mt5_access
 def get_history_deals(date_from: datetime, date_to: datetime | None = None) -> list[HistoricalDeal]:
     """Real closed-trade history from the currently-connected account —
     the raw material risk/ftmo_rules.py needs to reconstruct real daily
@@ -587,7 +775,24 @@ def get_history_deals(date_from: datetime, date_to: datetime | None = None) -> l
     from every FTMO compliance computation until this was found. Default
     now pushes `date_to` a full day into local-future to comfortably
     absorb any such clock skew; `date_from` already uses the same
-    "far enough to not matter" approach at its own call site."""
+    "far enough to not matter" approach at its own call site. This
+    `date_to` filter-boundary default deliberately stays naive/local —
+    it only needs to be a wide-enough net, not a precise value (unlike
+    each individual deal's OWN `time` field below, which is exact).
+
+    Each deal's own `d.time` is a raw Unix epoch integer — timezone-
+    independent by definition — but `datetime.fromtimestamp(d.time)`
+    (no `tz=`) used to render it in THIS MACHINE's own local timezone,
+    not a fixed reference. Real bug found live 2026-09-01: the app's own
+    Trade History table showed times up to several hours off from what
+    the MT5 terminal itself displayed (the terminal shows UTC), purely
+    because whatever computer happened to be running the code determined
+    the offset — the exact same trade would display a DIFFERENT wall-
+    clock time depending on the machine, which also silently skewed
+    risk/ftmo_rules.py's own day-bucketing for the real FTMO daily-loss
+    rule (see that module's own fix, same day). Fixed by making every
+    deal's `time` explicitly UTC-aware, matching what MT5's own terminal
+    happens to display for this broker."""
     import MetaTrader5 as mt5
 
     date_to = date_to if date_to is not None else datetime.now() + timedelta(days=1)
@@ -600,12 +805,14 @@ def get_history_deals(date_from: datetime, date_to: datetime | None = None) -> l
     return [
         HistoricalDeal(
             ticket=d.ticket,
-            time=datetime.fromtimestamp(d.time),
+            time=datetime.fromtimestamp(d.time, tz=timezone.utc),
             symbol=d.symbol,
             profit=d.profit + d.swap + d.commission,
+            raw_profit=d.profit,
             volume=d.volume,
             position_id=d.position_id,
             price=d.price,
+            entry=d.entry,
             side=(
                 ("buy" if d.type == mt5.DEAL_TYPE_BUY else "sell")
                 if d.symbol and d.type in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL)
@@ -626,11 +833,28 @@ class ClosedTrade:
     closed_at: datetime
     open_price: float
     close_price: float
-    profit: float  # net realized P&L across every leg of this position
+    profit: float  # net realized P&L across every leg of this position (profit+swap+commission)
+    # Raw instrument profit alone, summed across every leg — matches
+    # what the MT5 terminal's own "Profit" column shows for this
+    # position (confirmed live). `profit` above is the more complete,
+    # truly-realized number (it's what actually moved the account
+    # balance); this is here specifically so the two can be shown side
+    # by side instead of silently disagreeing by whatever the position's
+    # total commission+swap came to.
+    gross_profit: float = 0.0
 
     @property
     def duration(self) -> timedelta:
         return self.closed_at - self.opened_at
+
+
+_DEAL_ENTRY_IN = 0  # mt5.DEAL_ENTRY_IN — opens or adds to a position
+_DEAL_ENTRY_OUT = 1  # mt5.DEAL_ENTRY_OUT — reduces or fully closes a position
+# DEAL_ENTRY_INOUT(2)/DEAL_ENTRY_OUT_BY(3) are hedging-mode-only
+# (position reversal / close-by) — this account trades in netting mode,
+# so these are never expected in practice, but a deal with either code
+# is deliberately excluded from both legs below rather than misclassified
+# as a plain entry or exit.
 
 
 def group_closed_trades(deals: list[HistoricalDeal]) -> list[ClosedTrade]:
@@ -644,37 +868,64 @@ def group_closed_trades(deals: list[HistoricalDeal]) -> list[ClosedTrade]:
     the true net result: a real closed XAUUSD trade's balance impact
     only matched exactly when both the opening leg's commission and the
     closing leg's profit+swap+commission were summed together, not
-    either alone. A position with only one deal on record is still
-    open (or, rarely, a non-trade balance adjustment) and is excluded —
-    this list is specifically "trades that finished." side/open_price
-    come from the earliest deal (the position's own opening leg) and
-    close_price from the latest (its closing leg) — a position can have
-    more than 2 deals (partial closes), so this always takes the FIRST
-    and LAST by time rather than assuming exactly two. Newest first."""
+    either alone. `gross_profit` sums the same legs' RAW profit alone
+    (added 2026-09-02) — this is what the MT5 terminal's own "Profit"
+    column shows, so a caller can display both the true net result and
+    the terminal-matching gross figure side by side, rather than the two
+    silently disagreeing by the position's own total commission+swap
+    with no visible explanation.
+
+    Real bug found live 2026-09-01, comparing this account's own MT5
+    terminal against the app's Trade History table for a position that
+    had TWO tactical partial closes (three exit legs total, not one): the
+    old version picked the FIRST deal by time as "the opening leg" and
+    the LAST as "the closing leg," using the last leg's own `volume` and
+    `price` for the whole row — a real position opened at 0.11 lots and
+    fully closed across three separate exits showed up with volume 0.04
+    (only the size of the FINAL partial close) and a close price that
+    ignored the other two exits entirely. Fixed by classifying every
+    deal via MT5's own `entry` field (DEAL_ENTRY_IN vs DEAL_ENTRY_OUT)
+    instead of guessing from time order, then volume-weighting the price
+    across ALL entry legs and ALL exit legs separately — this is also
+    exactly how the MT5 terminal's own aggregate "Price" column for a
+    multi-leg position is computed (confirmed: reproduces the terminal's
+    own displayed value to 5 decimal places on the real position that
+    exposed this bug). A position needs at least one of EACH (entry and
+    exit) to count as a finished round-trip; one-sided deal lists (still
+    open, or a lone non-trade balance adjustment) are excluded — this
+    list is specifically "trades that finished." Newest first."""
     by_position: dict[int, list[HistoricalDeal]] = {}
     for d in deals:
         if not d.symbol or not d.position_id:
             continue
         by_position.setdefault(d.position_id, []).append(d)
 
+    def _weighted_avg_price(legs: list[HistoricalDeal]) -> float:
+        total_volume = sum(leg.volume for leg in legs)
+        if total_volume <= 0:
+            return legs[-1].price
+        return sum(leg.price * leg.volume for leg in legs) / total_volume
+
     trades = []
     for position_id, position_deals in by_position.items():
-        if len(position_deals) < 2:
+        entry_legs = [d for d in position_deals if d.entry == _DEAL_ENTRY_IN]
+        exit_legs = [d for d in position_deals if d.entry == _DEAL_ENTRY_OUT]
+        if not entry_legs or not exit_legs:
             continue
-        position_deals.sort(key=lambda d: d.time)
-        opening_leg = position_deals[0]
-        closing_leg = position_deals[-1]
+        entry_legs.sort(key=lambda d: d.time)
+        exit_legs.sort(key=lambda d: d.time)
         trades.append(
             ClosedTrade(
                 position_id=position_id,
-                symbol=closing_leg.symbol,
-                side=opening_leg.side,
-                volume=closing_leg.volume,
-                opened_at=opening_leg.time,
-                closed_at=closing_leg.time,
-                open_price=opening_leg.price,
-                close_price=closing_leg.price,
+                symbol=exit_legs[-1].symbol,
+                side=entry_legs[0].side,
+                volume=sum(leg.volume for leg in exit_legs),
+                opened_at=entry_legs[0].time,
+                closed_at=exit_legs[-1].time,
+                open_price=_weighted_avg_price(entry_legs),
+                close_price=_weighted_avg_price(exit_legs),
                 profit=sum(d.profit for d in position_deals),
+                gross_profit=sum(d.raw_profit for d in position_deals),
             )
         )
     trades.sort(key=lambda t: t.closed_at, reverse=True)
@@ -684,6 +935,7 @@ def group_closed_trades(deals: list[HistoricalDeal]) -> list[ClosedTrade]:
 _MT5_TIMEFRAMES = ("H1", "H4", "D1", "MN1")
 
 
+@_serialize_mt5_access
 def fetch_mt5_price_history(symbol: str, timeframe: str, count: int = 300) -> pd.DataFrame:
     """Real OHLCV bars for `symbol` at `timeframe` ("H1"/"H4"/"D1"/"MN1"),
     fetched directly from the currently-connected MT5 terminal's own
@@ -734,6 +986,72 @@ def fetch_mt5_price_history(symbol: str, timeframe: str, count: int = 300) -> pd
     # the Series themselves would align-by-label against the `index=`
     # param and silently fill every value with NaN (confirmed live via a
     # failing test) rather than raising anything.
+    return pd.DataFrame(
+        {
+            "Open": raw["open"].astype(float).values,
+            "High": raw["high"].astype(float).values,
+            "Low": raw["low"].astype(float).values,
+            "Close": raw["close"].astype(float).values,
+            "Volume": raw["tick_volume"].astype(float).values,
+        },
+        index=pd.to_datetime(raw["time"], unit="s"),
+    )
+
+
+@_serialize_mt5_access
+def fetch_mt5_price_history_range(
+    symbol: str, timeframe: str, date_from: datetime, date_to: datetime
+) -> pd.DataFrame:
+    """Same real OHLCV shape as fetch_mt5_price_history (identical
+    columns, same naive/UTC-equivalent DatetimeIndex convention, same
+    empty-typed-DataFrame-on-any-failure contract) but bounded by a real
+    TIME WINDOW instead of "the most recent N bars ending now" — added
+    2026-09-05 for ai/curiosity.py, which needs price action bracketing a
+    PAST closed trade's own entry/exit instants, not the current moment.
+    Uses mt5.copy_rates_range instead of copy_rates_from_pos — no other
+    caller in this codebase needed a windowed-in-the-past fetch before
+    this, so this is genuinely new API surface, not a refactor of
+    existing behavior.
+
+    `date_from`/`date_to` are expected NAIVE, matching get_history_deals'
+    own convention (that function's own docstring: this account's real
+    FTMO broker's server clock IS UTC, confirmed live) — a tz-AWARE
+    datetime is defensively stripped to naive rather than raising, so a
+    caller handing over a ClosedTrade's own tz-aware opened_at/closed_at
+    (see data/mt5_source.py's own group_closed_trades) doesn't need to
+    remember to convert at every call site."""
+    empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"], dtype=float)
+    if timeframe not in _MT5_TIMEFRAMES:
+        raise ValueError(f"Unsupported timeframe {timeframe!r} — expected one of {_MT5_TIMEFRAMES}")
+
+    if date_from.tzinfo is not None:
+        date_from = date_from.replace(tzinfo=None)
+    if date_to.tzinfo is not None:
+        date_to = date_to.replace(tzinfo=None)
+
+    import MetaTrader5 as mt5
+
+    mt5_timeframe = {
+        "H1": mt5.TIMEFRAME_H1,
+        "H4": mt5.TIMEFRAME_H4,
+        "D1": mt5.TIMEFRAME_D1,
+        "MN1": mt5.TIMEFRAME_MN1,
+    }[timeframe]
+
+    _ensure_symbol_selected(mt5, symbol)
+    rates = mt5.copy_rates_range(symbol, mt5_timeframe, date_from, date_to)
+    if rates is None or len(rates) == 0:
+        error = mt5.last_error()
+        logger.warning(
+            "fetch_mt5_price_history_range(%s, %s, %s, %s): copy_rates_range returned nothing (last_error=%s)",
+            symbol, timeframe, date_from, date_to, error,
+        )
+        return empty
+
+    raw = pd.DataFrame(rates)
+    # .values, not the bare Series — see fetch_mt5_price_history's own
+    # comment for why (align-by-label against a fresh DatetimeIndex
+    # would otherwise silently fill every value with NaN).
     return pd.DataFrame(
         {
             "Open": raw["open"].astype(float).values,
@@ -823,6 +1141,7 @@ def _compute_swap_pct_per_day(info, price: float) -> tuple[float | None, float |
     return None, None
 
 
+@_serialize_mt5_access
 def get_symbol_category(symbol: str) -> str:
     """The broker's own top-level symbol-path category (e.g. "Forex",
     "Metals CFD", "Crypto", "Agriculture", "Cash CFD") — pulled out of
@@ -846,6 +1165,42 @@ def get_symbol_category(symbol: str) -> str:
     return info.path.split("\\")[0]
 
 
+def is_symbol_tradable_now(symbol: str, now_utc: datetime) -> bool:
+    """True if `symbol`'s market is genuinely open right now, based on
+    get_symbol_category's asset class and a deterministic weekly
+    calendar. There is no real per-symbol trading-hours API in this MT5
+    Python package (confirmed directly: symbol_info_session_trade/
+    symbol_info_session_quote don't exist here) — this is a documented,
+    approximate, broker/DST-dependent weekend model, not a claim of
+    exact hours: crypto trades 24/7; forex/exotics close Friday evening
+    and reopen Sunday evening UTC; everything else (metals, commodities,
+    indices, equities, agriculture) stays closed from Friday evening
+    through Monday. Added to stop the mega session from proposing new
+    trades on instruments that literally cannot fill right now — see
+    get_symbol_category's own docstring for the category strings this
+    reads."""
+    category = get_symbol_category(symbol)
+    if category.startswith("Crypto"):
+        return True
+    weekday = now_utc.weekday()  # Monday=0 .. Sunday=6
+    if category in ("Forex", "Exotics"):
+        if weekday == 4:  # Friday
+            return now_utc.hour < config.WEEKEND_FOREX_CLOSE_HOUR_UTC
+        if weekday == 5:  # Saturday
+            return False
+        if weekday == 6:  # Sunday
+            return now_utc.hour >= config.WEEKEND_FOREX_REOPEN_HOUR_UTC
+        return True
+    # Metals CFD, Commodities, Cash CFD (indices), Equities I CFD,
+    # Agriculture, Uncategorized — closed all weekend, until Monday.
+    if weekday == 4:
+        return now_utc.hour < config.WEEKEND_OTHER_CLOSE_HOUR_UTC
+    if weekday in (5, 6):
+        return False
+    return True
+
+
+@_serialize_mt5_access
 def get_trade_economics(symbol: str) -> TradeCost | None:
     """Real spread + swap cost for `symbol`, straight from the live MT5
     feed — the deterministic, "don't make the model guess a number

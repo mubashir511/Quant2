@@ -56,39 +56,39 @@ not removed.
 
 The lock-file mechanism itself (job_lock.py::acquire_lock/release_lock)
 was later extracted into a shared module once a second unattended job
-(copilot_execution_job.py) needed the exact same PID-liveness logic —
+(clerk_execution_job.py) needed the exact same PID-liveness logic —
 this file now just supplies its own lock path/staleness window to that
 shared implementation rather than keeping a second, independently-
 drifting private copy.
 
 2026-08-23 update — inline "immediate execution" wiring: direct user
 request ("if the mega session instructed for any trade immediately in
-the analysis, that trade will be immediately executed by the copilot")
+the analysis, that trade will be immediately executed by the Clerk")
 — rather than making a same-session trade wait for the next standalone
-Copilot poll (originally up to ~59 minutes away when that poll was
-hourly; now bounded by config.COPILOT_EXECUTION_CHECK_INTERVAL_MINUTES,
+Clerk poll (originally up to ~59 minutes away when that poll was
+hourly; now bounded by config.CLERK_EXECUTION_CHECK_INTERVAL_MINUTES,
 tightened to 15 on direct user request 2026-08-23 since the check
 itself is cheap), a successful run here also triggers one inline
-Copilot execution-check pass immediately afterward, in the same
+Execution Clerk check pass immediately afterward, in the same
 process. Gated strictly on `last_status == "success"` AND
 `last_run_date_utc == today` (never after a timeout/error/cli_failed —
 see ai.mega_analysis's own _RUN_TIMEOUT_SECONDS/run_with_timeout
 docstring for why an abandoned timed-out thread must never race a fresh
 inline call), and wrapped in its own try/except plus a separate, small
-run_with_timeout ceiling (COPILOT_EXECUTION_RUN_TIMEOUT_SECONDS) so a
+run_with_timeout ceiling (CLERK_EXECUTION_RUN_TIMEOUT_SECONDS) so a
 hang or exception in the execution-check can never propagate out of
 main() or make this job overrun. The standalone poll
-(copilot_execution_job.py) continues independently afterward for
+(clerk_execution_job.py) continues independently afterward for
 ongoing conditional-setup watching regardless of whether this inline
 call ran.
 
 Real concurrency bug found on a post-build audit, fixed the same day:
-this inline call used to invoke run_copilot_execution_check() directly
+this inline call used to invoke run_clerk_execution_check() directly
 with no lock protection at all — a genuinely different OS process
-(copilot_execution_job.py's own standalone poll) could acquire
+(clerk_execution_job.py's own standalone poll) could acquire
 ITS OWN separate lock and start running the exact same function
 concurrently, since nothing here ever competed for that lock. Fixed by
-acquiring the literal same EXECUTION_LOCK_PATH (ai/copilot_execution.py)
+acquiring the literal same EXECUTION_LOCK_PATH (ai/clerk_execution.py)
 before calling it, and skipping gracefully (not blocking/waiting) if the
 standalone job already holds it — this inline pass is a lower-latency
 bonus, not a guarantee, so losing the race just means the next standalone
@@ -112,7 +112,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import config
-from ai.copilot_execution import EXECUTION_LOCK_PATH, EXECUTION_LOCK_STALE_AFTER_SECONDS, run_copilot_execution_check
+from ai.clerk_execution import EXECUTION_LOCK_PATH, EXECUTION_LOCK_STALE_AFTER_SECONDS, run_clerk_execution_check
 from ai.mega_analysis import is_due, next_run_utc, read_mega_analysis_enabled, read_state, run_scheduled_mega_analysis
 from job_lock import acquire_lock, release_lock
 from utils import run_with_timeout
@@ -136,7 +136,7 @@ _INLINE_EXECUTION_TIMEOUT_SENTINEL = object()
 
 
 def _run_inline_execution_check_if_successful(state_before: dict, now_utc: datetime) -> None:
-    """Fires one immediate Copilot execution-check pass right after a
+    """Fires one immediate Execution Clerk check pass right after a
     genuinely successful mega-analysis run, so a "feasible right now"
     trade doesn't sit idle waiting for the next standalone poll boundary.
     Never lets a hang or exception here propagate — this is a bonus,
@@ -157,27 +157,27 @@ def _run_inline_execution_check_if_successful(state_before: dict, now_utc: datet
 
     if not acquire_lock(EXECUTION_LOCK_PATH, EXECUTION_LOCK_STALE_AFTER_SECONDS):
         logger.info(
-            "Skipping the inline Copilot execution-check pass — the standalone "
+            "Skipping the inline Execution Clerk check pass — the standalone "
             "poll already holds the execution lock right now; it will pick up any "
             "immediately-feasible trade on its own next run instead."
         )
         return
 
-    logger.info("Mega analysis succeeded — running one inline Copilot execution-check pass.")
+    logger.info("Mega analysis succeeded — running one inline Execution Clerk check pass.")
     try:
         result = run_with_timeout(
-            run_copilot_execution_check,
-            config.COPILOT_EXECUTION_RUN_TIMEOUT_SECONDS,
+            run_clerk_execution_check,
+            config.CLERK_EXECUTION_RUN_TIMEOUT_SECONDS,
             default=_INLINE_EXECUTION_TIMEOUT_SENTINEL,
             catch_exceptions=False,
         )
         if result is _INLINE_EXECUTION_TIMEOUT_SENTINEL:
             logger.error(
-                "Inline Copilot execution-check timed out after %.0f minutes.",
-                config.COPILOT_EXECUTION_RUN_TIMEOUT_SECONDS / 60,
+                "Inline Execution Clerk check timed out after %.0f minutes.",
+                config.CLERK_EXECUTION_RUN_TIMEOUT_SECONDS / 60,
             )
     except Exception:
-        logger.exception("Inline Copilot execution-check raised an exception.")
+        logger.exception("Inline Execution Clerk check raised an exception.")
     finally:
         release_lock(EXECUTION_LOCK_PATH)
 

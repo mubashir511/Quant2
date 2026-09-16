@@ -1,7 +1,16 @@
 import pandas as pd
 import pytest
 
-from analysis.technical import compute_technical_stats
+from analysis.technical import (
+    RSI_OVERBOUGHT,
+    RSI_OVERSOLD,
+    VELOCITY_FAST_THRESHOLD_PCT,
+    classify_rsi_tier,
+    classify_velocity_tier,
+    compute_atr,
+    compute_regime_segments,
+    compute_technical_stats,
+)
 
 
 def make_series(n_days: int, start: float = 100.0, daily_drift: float = 0.0) -> pd.Series:
@@ -155,6 +164,16 @@ def test_atr_computed_from_history():
     assert stats.atr_pct == stats.atr / stats.last_price * 100
 
 
+def test_compute_atr_public_direct_call_matches_compute_technical_stats():
+    # compute_atr was promoted from a private _compute_atr (2026-09-05,
+    # for ai/curiosity.py's own reuse) — same known scenario as
+    # test_atr_computed_from_history above, called directly instead of
+    # through compute_technical_stats, confirming the public entry point
+    # gives the identical real number.
+    history = make_history(30, start=100.0, daily_drift=1.0)
+    assert compute_atr(history) == 1.5
+
+
 def test_atr_none_when_history_shorter_than_window():
     history = make_history(10, start=100.0, daily_drift=1.0)
     stats = compute_technical_stats(history["Close"], history=history)
@@ -235,3 +254,126 @@ def test_momentum_acceleration_stable_when_genuinely_flat():
     prices = pd.Series([100.0] * 60)
     stats = compute_technical_stats(prices)
     assert stats.momentum_acceleration == "stable"
+
+
+def _phase(n: int, start: float, drift: float) -> list[float]:
+    return [start + i * drift for i in range(n)]
+
+
+def test_regime_segments_empty_below_two_windows():
+    prices = pd.Series(_phase(39, 100.0, 0.0))
+    assert compute_regime_segments(prices, window=20) == []
+
+
+def test_regime_segments_single_sideways_segment_stays_plain_sideways():
+    # Flat for exactly 2 windows: nothing precedes it, so it can't be
+    # relabeled accumulation/distribution — stays plain "sideways".
+    prices = pd.Series(_phase(40, 100.0, 0.0))
+    segments = compute_regime_segments(prices, window=20)
+    assert len(segments) == 1
+    assert segments[0].regime == "sideways"
+    assert segments[0].start_index == 19
+
+
+def test_regime_segments_down_then_flat_infers_accumulation():
+    prices = pd.Series(_phase(40, 500.0, -2.0) + _phase(40, 500.0 - 39 * 2.0, 0.0))
+    segments = compute_regime_segments(prices, window=20)
+    regimes = [s.regime for s in segments]
+    assert regimes[0] == "trending_down"
+    assert "accumulation" in regimes
+    assert "distribution" not in regimes
+
+
+def test_regime_segments_up_then_flat_infers_distribution():
+    prices = pd.Series(_phase(40, 100.0, 2.0) + _phase(40, 100.0 + 39 * 2.0, 0.0))
+    segments = compute_regime_segments(prices, window=20)
+    regimes = [s.regime for s in segments]
+    assert regimes[0] == "trending_up"
+    assert "distribution" in regimes
+    assert "accumulation" not in regimes
+
+
+def test_regime_segments_never_repeats_the_same_regime_back_to_back():
+    down = _phase(40, 500.0, -2.0)
+    flat1 = _phase(40, down[-1], 0.0)
+    up = _phase(40, flat1[-1], 2.0)
+    flat2 = _phase(40, up[-1], 0.0)
+    prices = pd.Series(down + flat1 + up + flat2)
+    segments = compute_regime_segments(prices, window=20)
+    for prev, nxt in zip(segments, segments[1:]):
+        assert prev.regime != nxt.regime
+
+
+def test_regime_segments_full_sequence_down_accumulation_up_distribution():
+    down = _phase(40, 500.0, -2.0)
+    flat1 = _phase(40, down[-1], 0.0)
+    up = _phase(40, flat1[-1], 2.0)
+    flat2 = _phase(40, up[-1], 0.0)
+    prices = pd.Series(down + flat1 + up + flat2)
+    segments = compute_regime_segments(prices, window=20)
+    regimes = [s.regime for s in segments]
+    assert regimes == ["trending_down", "accumulation", "trending_up", "distribution"]
+    starts = [s.start_index for s in segments]
+    assert starts == sorted(starts)
+
+
+# --- classify_velocity_tier: real 2026-09-08/09 incident-driven feature ---
+
+
+def test_classify_velocity_tier_none_without_a_real_atr_pct_reading():
+    # Never guess a tier from missing data — same convention as every
+    # other stat in this file.
+    assert classify_velocity_tier(None) is None
+
+
+def test_classify_velocity_tier_slow_below_threshold():
+    # Real USDCAD reading the day this was built: ~0.10%/hour.
+    assert classify_velocity_tier(0.10) == "slow"
+    assert classify_velocity_tier(0.20) == "slow"
+
+
+def test_classify_velocity_tier_fast_at_and_above_threshold():
+    # Real XAUUSD reading the day this was built: ~0.31-0.35%/hour.
+    assert classify_velocity_tier(VELOCITY_FAST_THRESHOLD_PCT) == "fast"
+    assert classify_velocity_tier(0.33) == "fast"
+    assert classify_velocity_tier(0.85) == "fast"  # equities-range
+
+
+def test_classify_velocity_tier_boundary_is_inclusive_on_the_fast_side():
+    just_below = VELOCITY_FAST_THRESHOLD_PCT - 0.001
+    just_above = VELOCITY_FAST_THRESHOLD_PCT + 0.001
+    assert classify_velocity_tier(just_below) == "slow"
+    assert classify_velocity_tier(just_above) == "fast"
+
+
+# --- classify_rsi_tier: real 2026-09-09 incident (RSI 11/15 mislabeled "overbought") ---
+
+
+def test_classify_rsi_tier_none_without_a_reading():
+    assert classify_rsi_tier(None) is None
+
+
+def test_classify_rsi_tier_oversold_below_30():
+    # The exact real readings a local model repeatedly mislabeled
+    # "overbought" on a live USDCAD position across three consecutive polls.
+    assert classify_rsi_tier(11) == "oversold"
+    assert classify_rsi_tier(15) == "oversold"
+    assert classify_rsi_tier(29.9) == "oversold"
+
+
+def test_classify_rsi_tier_overbought_above_70():
+    assert classify_rsi_tier(71) == "overbought"
+    assert classify_rsi_tier(90) == "overbought"
+
+
+def test_classify_rsi_tier_neutral_between_30_and_70_inclusive():
+    assert classify_rsi_tier(30) == "neutral"
+    assert classify_rsi_tier(50) == "neutral"
+    assert classify_rsi_tier(70) == "neutral"
+
+
+def test_classify_rsi_tier_uses_the_documented_convention_constants():
+    assert classify_rsi_tier(RSI_OVERSOLD) == "neutral"  # boundary itself is not yet oversold
+    assert classify_rsi_tier(RSI_OVERSOLD - 0.01) == "oversold"
+    assert classify_rsi_tier(RSI_OVERBOUGHT) == "neutral"  # boundary itself is not yet overbought
+    assert classify_rsi_tier(RSI_OVERBOUGHT + 0.01) == "overbought"

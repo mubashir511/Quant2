@@ -8,12 +8,12 @@ IMPORTANT CAVEAT, stated plainly here and repeated in both the UI
 disclosure convention: this is a real, best-effort RECONSTRUCTION from
 this account's own MT5 trade history, NOT a certified mirror of FTMO's
 internal ledger. Two real sources of drift from FTMO's own numbers:
-1. Day boundaries here are bucketed by each deal's own server-time
-   timestamp's calendar date, not FTMO's real CE(S)T midnight reset —
-   a trade near a day boundary can bucket into the "wrong" day relative
-   to FTMO's own accounting if the MT5 server's timezone doesn't line up
-   exactly with CE(S)T (and doesn't account for the CET/CEST DST switch
-   at all). This only matters for a trade genuinely straddling midnight.
+1. Day boundaries here are bucketed by each deal's own UTC calendar
+   date, not FTMO's real CE(S)T midnight reset — a trade near a day
+   boundary can bucket into the "wrong" day relative to FTMO's own
+   accounting, since UTC doesn't line up exactly with CE(S)T (and
+   doesn't account for the CET/CEST DST switch at all). This only
+   matters for a trade genuinely straddling midnight.
 2. FTMO's own internal ledger may include adjustments (e.g. a manual
    correction) this reconstruction has no way to see.
 Cross-check against FTMO's own dashboard before trusting this near a
@@ -33,7 +33,7 @@ own published rules, not invented):
 
 from dataclasses import dataclass
 from datetime import date as date_cls
-from datetime import datetime
+from datetime import datetime, timezone
 
 from data.mt5_source import HistoricalDeal
 
@@ -74,10 +74,19 @@ def compute_ftmo_status(
     start through now) — this function does no fetching or filtering by
     time range itself beyond bucketing what it's given into calendar days.
 
-    Day bucketing uses each deal's own `HistoricalDeal.time` (already a
-    naive local/server-time datetime from data/mt5_source.py) — see the
-    module docstring's caveat #1 for why this is a best-effort
-    approximation of the true CE(S)T boundary, not an exact one.
+    Day bucketing uses each deal's own `HistoricalDeal.time` (a
+    timezone-AWARE UTC datetime, as of the 2026-09-01 fix below — see
+    the module docstring's caveat #1 for why UTC-day bucketing is still
+    a best-effort approximation of the true CE(S)T boundary, not an
+    exact one). `now`'s own default was fixed the same day for the same
+    reason: `datetime.now()` (naive, whatever timezone the machine
+    happens to be running in) used to silently make this function's own
+    "today" boundary — and therefore the real 3%/10% FTMO compliance
+    numbers on a live funded account — depend on which computer ran the
+    app, rather than a fixed, machine-independent reference. Found live
+    when a Trade History display bug (same root cause: naive-local
+    HistoricalDeal.time) was traced on a machine set to a different
+    timezone than the one this was originally built/verified on.
 
     Zero-history (a fresh account with no trades yet) degrades cleanly:
     daily-loss/max-loss headroom read as the full 3%/10% (nothing has
@@ -85,7 +94,7 @@ def compute_ftmo_status(
     fields come back None (nothing to compute a rule violation from) —
     never a crash or a 0/0.
     """
-    now = now if now is not None else datetime.now()
+    now = now if now is not None else datetime.now(timezone.utc)
     today = now.date()
 
     # A deposit/withdrawal/credit adjustment shows up in MT5's own deal

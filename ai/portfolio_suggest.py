@@ -1,11 +1,12 @@
 import json
 import logging
 import re
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -21,10 +22,13 @@ from ai.openrouter_client import MISSING_KEY_MESSAGE as OPENROUTER_MISSING_KEY_M
 from ai.openrouter_client import run_openrouter
 from ai.session_record import SessionRecord, save_portfolio_session
 from analysis.backtest import (
+    ChartPatternBacktest,
+    FavorableExcursionStats,
     MomentumPersistenceBacktest,
     RSIReactionBacktest,
     SupportResistanceBacktest,
     VolatilityRegimeBacktest,
+    backtest_chart_pattern_reaction,
     backtest_momentum_persistence,
     backtest_rsi_reaction,
     backtest_support_resistance_reaction,
@@ -365,6 +369,36 @@ _ROLE_STAGE2_SYNTHESIZE = (
     "narrate it in the visible answer either (no 'the larger model said "
     "X, the smaller one said Y', no naming which specific model's "
     "critique swayed a decision)."
+    "\n\n"
+    "ONE CLASS OF AUDIT OBJECTION IS NOT OPTIONAL TO WEIGH AWAY, "
+    "regardless of which model raised it: an objection anchored to a "
+    "concrete, checkable fact already sitting in the data given below — "
+    "an audit correctly pointing out that the trend/setup structure "
+    "classification you used for a timeframe doesn't match what the "
+    "actual computed data says, or that this SPECIFIC instrument's own "
+    "backtest for the setup type you're proposing (e.g. buying an "
+    "oversold bounce, or a support/resistance touch) shows a real, poor "
+    "historical win rate/average R. Confirmed live on the FTMO account "
+    "this pipeline shares its audit architecture with: a past run's own "
+    "H1 read was actually a downtrend while the draft called it an "
+    "'aligned uptrend' with H4, and that instrument's own oversold-RSI-"
+    "long backtest showed a 14-17% win rate with a negative average R — "
+    "two independent audits caught both, and the final revision kept the "
+    "same long thesis nearly verbatim anyway; the position went on to "
+    "lose in exactly the way the ignored data predicted. Silently "
+    "keeping a conclusion that a hard, data-backed objection like this "
+    "directly contradicts is not an acceptable outcome of the internal "
+    "weighing above — either the position/direction/size genuinely "
+    "changes to account for it, or your visible thesis for that "
+    "instrument explicitly states the real conflicting number (the "
+    "actual trend read, or the actual backtest win rate/avg R) and gives "
+    "a specific, genuine reason it's being taken anyway (e.g. a "
+    "fundamental catalyst strong enough to override a middling technical "
+    "backtest). A thesis that never mentions an instrument's own "
+    "unfavorable backtest or a contradicted trend classification, while "
+    "still asserting the read it contradicts, is a defect — this is the "
+    "one place where reflecting the resolution in the visible answer is "
+    "required, not merely internal process."
 )
 
 
@@ -732,6 +766,8 @@ class AssetAnalysis:
     momentum_persistence_backtest: MomentumPersistenceBacktest | None = None
     volatility_regime_backtest: VolatilityRegimeBacktest | None = None
     support_resistance_backtest: SupportResistanceBacktest | None = None
+    double_bottom_backtest: ChartPatternBacktest | None = None
+    double_top_backtest: ChartPatternBacktest | None = None
     # "yahoo" (default — PMEX/PSX always, FTMO where a Yahoo mapping
     # exists) or "mt5" (FTMO's own native-D1 backfill — see
     # ai/ftmo_suggest.py::_enrich_with_native_d1). Placed last, and
@@ -740,6 +776,13 @@ class AssetAnalysis:
     # AssetAnalysis(...) call's arguments — see format_enriched_asset_
     # context's volume-caveat branch for the one place this is read.
     data_source: str = "yahoo"
+    # None on the Yahoo/PMEX path (get_symbol_category is MT5-specific,
+    # so this is unused there); a real bool on the FTMO/MT5 path,
+    # computed via data.mt5_source.is_symbol_tradable_now — see
+    # ai/ftmo_suggest.py's native-build path. Same "append at the end,
+    # always keyword-passed" convention as data_source above, for the
+    # same reason: can't silently shift any existing positional call.
+    market_open: bool | None = None
 
 
 def analyze_assets(
@@ -785,6 +828,7 @@ def analyze_assets(
         stats = compute_technical_stats(prices, history=history)
         headlines = fetch_recent_headlines(yahoo_ticker, limit=config.NEWS_HEADLINES_PER_ASSET)
         rsi_overbought_bt, rsi_oversold_bt = backtest_rsi_reaction(history)
+        double_bottom_bt, double_top_bt = backtest_chart_pattern_reaction(history)
 
         results.append(
             AssetAnalysis(
@@ -795,6 +839,8 @@ def analyze_assets(
                 momentum_persistence_backtest=backtest_momentum_persistence(prices),
                 volatility_regime_backtest=backtest_volatility_regime(prices),
                 support_resistance_backtest=backtest_support_resistance_reaction(history),
+                double_bottom_backtest=double_bottom_bt,
+                double_top_backtest=double_top_bt,
             )
         )
 
@@ -873,6 +919,74 @@ def _format_rsi_backtest(bt: RSIReactionBacktest | None, condition: str) -> str:
     )
 
 
+def _format_chart_pattern_backtest(bt: ChartPatternBacktest | None, pattern_name: str, side: str) -> str:
+    """Real trade-simulation result for a chart-pattern archetype (see
+    analysis/backtest.py::backtest_chart_pattern_reaction and
+    ChartPatternBacktest's own docstring) — same reporting shape as
+    _format_rsi_backtest above, plus an explicit entry-timing caveat: the
+    simulated entry is NOT a breakout/retest entry, just the first bar
+    this account's own detector confirms the pattern shape."""
+    label = pattern_name.replace("_", " ")
+    if bt is None:
+        return (
+            f"  historical {label} reaction: not enough real historical occurrences of this "
+            "pattern (or no High/Low data to derive a real stop/target from) in this "
+            "instrument's own history to compute — treat any chart-pattern thesis based on "
+            "it as unverified assumption, not evidence."
+        )
+    win_rate = f"{bt.win_rate_pct:.0f}%" if bt.win_rate_pct is not None else "n/a (none resolved yet)"
+    return (
+        f"  historical {label} reaction (real trade simulation, this instrument's own past): "
+        f"{bt.trades} distinct past occurrences of this account's own {label} detector firing, "
+        f"simulating a {side} taken shortly after each occurrence was first detected with a "
+        f"{bt.stop_atr_multiple:g}x-ATR stop / {bt.target_atr_multiple:g}x-ATR target (max "
+        f"{bt.max_holding_bars} bars held) -> {bt.wins} wins, {bt.losses} losses, "
+        f"{bt.timeouts} timed out; win rate {win_rate} of resolved trades, average realized "
+        f"{bt.avg_r_multiple:+.2f}R across all of them"
+        f"{_real_execution_note(bt.round_trip_cost_pct, bt.swap_pct_per_day_used, bt.min_stop_distance_pct)} "
+        "[entry timing caveat: entered a few bars after the pattern's second peak/trough is "
+        "confirmed, NOT after a neckline breakout or retest — this measures whether the "
+        "pattern SHAPE itself has real historical follow-through, not whether entering at any "
+        "specific breakout/retest price would have worked]"
+    )
+
+
+def _format_favorable_excursion(excursion: FavorableExcursionStats | None, label: str) -> str:
+    """Real historical MAGNITUDE of the favorable move — a fully separate
+    measurement from the win-rate/avg-R figures on the backtest line
+    above this one (see analysis.backtest.FavorableExcursionStats and
+    analysis.backtest._compute_favorable_excursion's own docstrings for
+    exactly why: that figure is capped at a fixed 2:1 target, this one
+    is not). Only meaningfully called when the PARENT backtest is not
+    None (see format_backtests) — a None parent already reports its own
+    "not enough data" line; this function's own None branch is the
+    narrower, genuinely distinct case where the parent resolved but this
+    longer-horizon, separately-gated measurement did not.
+
+    Deliberately terse: what this figure MEANS and how to use/not-misuse
+    it (uncapped vs. the fixed target, not cost-netted, prefer the
+    median, why its own sample size usually undercounts the win-rate
+    figure's trade count above it) is explained ONCE, generically, in
+    ai/ftmo_suggest.py's own "USE THE REAL HISTORICAL FAVORABLE-
+    EXCURSION MAGNITUDE" instruction paragraph — repeating that same
+    ~80-word explanation on every one of up to 6 lines per instrument,
+    across a dozen-plus instruments, would bloat the prompt with
+    near-identical boilerplate that crowds out the actual differentiating
+    signal (the real numbers) and risks being skimmed past rather than
+    genuinely read, the same failure mode this project has already
+    documented for a weak model reasoning over one fact buried among
+    many (see ai/clerk_execution.py's own TacticalSignals precedent).
+    This line only needs to state the real numbers plainly."""
+    if excursion is None:
+        return f"  historical favorable-excursion magnitude ({label}): not enough real history for a full look-forward window"
+    return (
+        f"  historical favorable-excursion magnitude ({label}): {excursion.sample_size} of the "
+        f"same historical entries above kept a full {excursion.horizon_bars}-bar window -> median "
+        f"{excursion.median_r:+.2f}R, mean {excursion.avg_r:+.2f}R (uncapped, not cost-netted — "
+        "see the TP-sizing instruction above for how to use this)"
+    )
+
+
 def _real_execution_note(round_trip_cost_pct: float, swap_pct_per_day: float, min_stop_distance_pct: float) -> str:
     """Discloses whenever a trade-simulation backtest (RSIReactionBacktest
     or one side of SupportResistanceBacktest) was actually netted against
@@ -916,7 +1030,7 @@ def _real_execution_note(round_trip_cost_pct: float, swap_pct_per_day: float, mi
     return " [" + "; ".join(clauses) + "]"
 
 
-def format_backtests(r: AssetAnalysis) -> list[str]:
+def format_backtests(r: AssetAnalysis, include_favorable_excursion: bool = True) -> list[str]:
     """Real multi-year backtests of this specific instrument's own price
     history (see analysis/backtest.py) — mirrors ai/psx_suggest.py's own
     `_format_backtests` in spirit and wording, kept as an independent
@@ -925,7 +1039,28 @@ def format_backtests(r: AssetAnalysis) -> list[str]:
     counterpart) since it's shared by both PMEX's own prompt and FTMO's
     (via format_enriched_asset_context, which ai/ftmo_suggest.py's own
     format_ftmo_asset_context calls per-instrument) — same reasoning as
-    ai/ftmo_suggest.py::fetch_ftmo_status's own promotion to public. Not
+    ai/ftmo_suggest.py::fetch_ftmo_status's own promotion to public.
+
+    `include_favorable_excursion=False` (default True) drops the
+    favorable-excursion magnitude lines entirely — added specifically for
+    ai/clerk_execution.py's own tactical-verdict prompts, which reuse this
+    SAME formatted text as their `technical_context` but do NOT include
+    ai/ftmo_suggest.py's own _INSTRUCTION_HEAD (the only place the real
+    "CRITICAL, easy to misread" warning and the account's own HOLDING
+    HORIZON scale-mismatch caveat for this figure actually live). Without
+    this flag, Clerk's own weak local model (qwen3:8b/phi4-mini — see
+    ai/clerk_execution.py's own TacticalSignals docstring for the
+    documented incidents this exact model has already produced reasoning
+    freely over raw numbers in prose) would see a bare, uncaveated
+    positive-looking magnitude figure with a dangling "see the TP-sizing
+    instruction above" reference that doesn't exist in ITS prompt at all
+    — the same "never re-derive real evidence from prose when it's one
+    fact among many" risk that class already documents, not a new one.
+    Excluding it here is the fix, not adding more explanatory prose for a
+    model already shown not to reliably engage with it — the same
+    established convention as TacticalSignals itself. Claude's own
+    mega-session prompt (the only caller that omits this argument) is
+    unaffected. Not
     currently used by app.py's own watchlist popup, which renders the
     same underlying dataclasses directly as charts/metrics instead (see
     app.py::_render_backtest_metrics). Deliberately does NOT
@@ -937,7 +1072,13 @@ def format_backtests(r: AssetAnalysis) -> list[str]:
     would be close to meaningless), it's left out here and disclosed as
     out of scope in the prompt text instead."""
     lines = [_format_rsi_backtest(r.rsi_overbought_backtest, "overbought")]
+    if include_favorable_excursion and r.rsi_overbought_backtest is not None:
+        lines.append(
+            _format_favorable_excursion(r.rsi_overbought_backtest.excursion, "overbought RSI reversal short")
+        )
     lines.append(_format_rsi_backtest(r.rsi_oversold_backtest, "oversold"))
+    if include_favorable_excursion and r.rsi_oversold_backtest is not None:
+        lines.append(_format_favorable_excursion(r.rsi_oversold_backtest.excursion, "oversold RSI reversal long"))
 
     mp = r.momentum_persistence_backtest
     if mp is not None:
@@ -998,27 +1139,60 @@ def format_backtests(r: AssetAnalysis) -> list[str]:
             "specifically, rather than assuming support/resistance lines are reliable just "
             "because they're a well-known charting concept."
         )
+        if include_favorable_excursion:
+            lines.append(_format_favorable_excursion(sr.support_excursion, "support bounce long"))
+            lines.append(_format_favorable_excursion(sr.resistance_excursion, "resistance rejection short"))
     else:
         lines.append(
             "  historical support/resistance reliability: not enough real historical tests "
             "of these levels (or no High/Low data to derive a real stop/target from) to compute"
         )
+
+    lines.append(_format_chart_pattern_backtest(r.double_bottom_backtest, "double_bottom", "long"))
+    if include_favorable_excursion and r.double_bottom_backtest is not None:
+        lines.append(_format_favorable_excursion(r.double_bottom_backtest.excursion, "double bottom long"))
+    lines.append(_format_chart_pattern_backtest(r.double_top_backtest, "double_top", "short"))
+    if include_favorable_excursion and r.double_top_backtest is not None:
+        lines.append(_format_favorable_excursion(r.double_top_backtest.excursion, "double top short"))
     return lines
 
 
 def format_enriched_asset_context(
-    analyses: list[AssetAnalysis], account_equity: float | None = None
+    analyses: list[AssetAnalysis],
+    account_equity: float | None = None,
+    include_favorable_excursion: bool = True,
+    include_market_status: bool = True,
 ) -> str:
     """Pure formatting over already-computed AssetAnalysis objects — same
     text shape as before this was split out of a single fetch+format loop,
-    plus an optional feasibility line when account_equity is supplied."""
+    plus an optional feasibility line when account_equity is supplied.
+
+    `include_favorable_excursion` is passed straight through to
+    format_backtests — see that function's own docstring for why
+    ai/clerk_execution.py's tactical prompts must pass False here.
+
+    `include_market_status=False`: same reasoning as include_favorable_
+    excursion above, and ai/clerk_execution.py's tactical prompts must
+    pass False here too — the "market CLOSED (weekend)" tag exists to
+    support ai/ftmo_suggest.py's own "CHECK WHETHER THIS INSTRUMENT'S
+    MARKET IS EVEN OPEN RIGHT NOW" instruction (don't propose a NEW
+    trade on a closed market), which Clerk's tactical prompts never
+    include. Worse than the excursion case: Clerk never proposes new
+    trades at all (it only manages/amends/cancels existing positions and
+    setups — see run_clerk_execution_check's own candidate pools), so an
+    unexplained "market CLOSED" tag would be pure noise with real
+    hallucination risk for its weak local model, not decision-relevant
+    context, for every candidate it evaluates."""
     lines = []
     for r in analyses:
         spread_pct = _spread_pct(r)
         feasibility_line = _feasibility_line(r, account_equity)
 
+        show_closed = include_market_status and r.market_open is not None and not r.market_open
+        market_status_suffix = " — market CLOSED (weekend)" if show_closed else ""
+
         if r.display_name is None:
-            lines.append(f"- {r.symbol} ({r.description}): bid {r.bid}, ask {r.ask}")
+            lines.append(f"- {r.symbol} ({r.description}): bid {r.bid}, ask {r.ask}{market_status_suffix}")
             if spread_pct is not None:
                 lines.append(f"  execution: bid-ask spread {spread_pct:.2f}% of price")
             if feasibility_line is not None:
@@ -1030,7 +1204,7 @@ def format_enriched_asset_context(
             )
             continue
 
-        lines.append(f"- {r.symbol} ({r.display_name}): bid {r.bid}, ask {r.ask}")
+        lines.append(f"- {r.symbol} ({r.display_name}): bid {r.bid}, ask {r.ask}{market_status_suffix}")
         if spread_pct is not None:
             lines.append(f"  execution: bid-ask spread {spread_pct:.2f}% of price")
         if feasibility_line is not None:
@@ -1108,7 +1282,7 @@ def format_enriched_asset_context(
                 pattern_bits.append(f"short-term momentum: {stats.momentum_acceleration}")
             if pattern_bits:
                 lines.append(f"  pattern: {', '.join(pattern_bits)}")
-            lines += format_backtests(r)
+            lines += format_backtests(r, include_favorable_excursion=include_favorable_excursion)
         else:
             lines.append(
                 "  technical: not available (price-history fetch failed) — do not "
@@ -1394,7 +1568,18 @@ def build_pending_orders_context(pending_orders: list[PendingOrder]) -> str:
     for o in pending_orders:
         age = ""
         if o.time_setup is not None:
-            hours = (datetime.now() - o.time_setup).total_seconds() / 3600
+            # o.time_setup is explicitly UTC-aware (data/mt5_source.py's
+            # get_pending_orders) — datetime.now() alone is naive, and
+            # subtracting a naive datetime from an aware one raises
+            # TypeError. Real bug found live 2026-09-05: this crashed the
+            # WHOLE mega-analysis run outright the first time this
+            # function actually ran against a symbol with a real pending
+            # order (NVDA's resting BUY LIMIT) — the exact same bug class
+            # already fixed once for get_pending_orders/get_history_deals
+            # (see their own docstrings), just not yet caught here since
+            # this specific line hadn't been exercised with real pending-
+            # order data until now.
+            hours = (datetime.now(timezone.utc) - o.time_setup).total_seconds() / 3600
             age = f", resting {hours:.1f}h"
         lines.append(
             f"- {o.symbol}: {o.order_type} {o.volume:g} lots, trigger at "
@@ -1853,113 +2038,87 @@ def get_openrouter_audit(
 # than treating a 550B general-reasoning model and a 30B coding-agent
 # model as equally authoritative by default just because both produced a
 # paragraph of audit text.
+#
+# Trimmed from a flat 10-model pool to 3 PRIMARY + AUDIT_MODEL_FALLBACKS
+# below (2026-09-03, direct user request: "use models efficiently... use
+# top 3 in terms of parameters capacity, availability and task-specific
+# merit, if any of the model isn't available then go to next best
+# model"). Running all 10 concurrently every session cost more tokens/
+# wall-clock than the marginal audit quality justified once Stage 2 also
+# has to read and reconcile all 10 — see build_audit_block's own
+# fallback-cascade logic (_run_audit_slot) for how a dead/rate-limited
+# primary here gets replaced by the next-best model from the fallback
+# bench instead of just losing that slot's review, preserving the old
+# 10-model pool's "something is almost always available" resilience
+# without paying for 10 concurrent calls in the common case. Ranked by
+# ACTIVE parameter count (the better capability proxy for a MoE model
+# than total params) among GENERAL-PURPOSE models only — the coding-
+# agent-specialized models below are demoted to the end of the fallback
+# bench, not into the primary 3, per the same lower-default-trust caveat
+# this list has documented since they were first added.
 AUDIT_MODELS: list[tuple[str, str, str]] = [
-    # The largest/most-capable general-purpose text models among
-    # OpenRouter's currently ~14 :free-tagged models (confirmed live via
-    # /api/v1/models — this roster churns often and third-party "top
-    # free model" lists proved stale within days, so verify live before
-    # changing this again, not from memory or search results). Ranked by
-    # parameter count as the best available proxy for audit strength
-    # (bigger/reasoning-tuned models catch more) since OpenRouter doesn't
-    # expose real usage/popularity data via API and their rankings page
-    # is JS-rendered, not scrapable. Excluded from consideration:
-    # nvidia/nemotron-3.5-content-safety (a moderation classifier, wrong
-    # task) and nvidia/nemotron-nano-12b-v2-vl (vision-language, unneeded
-    # here) — both smoke-tested-irrelevant rather than tested.
     (
         "Nvidia Nemotron-Ultra-550B",
         "nvidia/nemotron-3-ultra-550b-a55b:free",
-        "550B params, general-purpose reasoning — the largest model in this pool",
+        "550B total/55B active MoE, general-purpose reasoning — the largest active-"
+        "parameter count in the whole pool by a wide margin",
+    ),
+    (
+        "Dots Studio Dots3-Note Preview",
+        "dots-studio/dots-3-note-preview:free",
+        "280B total/16B active MoE, general-purpose reasoning — second-largest active-"
+        "parameter count among general-purpose models in this pool",
     ),
     (
         "Nvidia Nemotron-Super-120B",
         "nvidia/nemotron-3-super-120b-a12b:free",
-        "120B params, general-purpose reasoning",
+        "120B total/12B active MoE, general-purpose reasoning",
     ),
-    # Google Gemma 4 31B occupied this slot originally, but was swapped
-    # out 2026-08-16 after being confirmed persistently unavailable, not
-    # just transiently rate-limited: it failed EVERY real session across
-    # multiple days (user-reported), and a direct live smoke test with a
-    # trivial one-word prompt (not even a real audit-sized one) still
-    # got a 429 from "Google AI Studio" with `limit_source: upstream_
-    # provider_shared_pool` — that shared pool is saturated at a level
-    # this pipeline's existing 10-attempt/600s retry loop can't route
-    # around, so this is a genuine dead slot, not noise. Confirmed the
-    # OTHER Gemma already in this pool (26B A4B, below) does NOT share
-    # this problem — smoke-tested clean — so only this one entry needed
-    # replacing, not "avoid Gemma/Google AI Studio entirely." Re-checked
-    # the live /api/v1/models roster rather than reusing the fallback
-    # candidate named in an earlier round's comment (inclusionai/
-    # ling-3.0-tiny:free) — it had disappeared from the roster entirely
-    # since then, confirming this list really does churn and must be
-    # re-verified live each time, not assumed stable.
-    (
-        "Dots Studio Dots3-Note Preview",
-        "dots-studio/dots-3-note-preview:free",
-        "280B total/16B active MoE, general-purpose reasoning — the lightest model in "
-        "its own family but still comfortably larger than most of this pool",
-    ),
+]
+
+# Ordered reserve bench: when a PRIMARY model above gives up (exhausts
+# its own retry window — see _run_audit_with_retry) or was never
+# reachable to begin with, build_audit_block's _run_audit_slot promotes
+# the next model here into that primary's slot, in this order, until one
+# produces a real result or the bench is exhausted. General-purpose
+# models first (closer substitutes for the primary tier they're
+# replacing), coding-agent-specialized models last (same lower-default-
+# trust caveat as always — an emergency substitute, not a preferred
+# reviewer). Every model here was previously a full primary member of
+# the 10-model pool and is still smoke-tested-live/documented exactly as
+# before; only the DEFAULT concurrency changed, not each model's own
+# vetting history.
+AUDIT_MODEL_FALLBACKS: list[tuple[str, str, str]] = [
     (
         "Nvidia Nemotron-Nano-Omni-30B-Reasoning",
         "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
         "30B total/3B active MoE, general-purpose, reasoning-tuned",
     ),
-    ("OpenAI gpt-oss-20b", "openai/gpt-oss-20b:free", "20B params, general-purpose reasoning"),
-    # A 6th model, deliberately not because it's stronger than the Gemma
-    # above — confirmed live via /api/v1/models that OpenRouter currently
-    # has exactly one other free Google model, and it's a 26B MoE with
-    # only 4B *active* params, weaker than the 31B dense model already in
-    # this list, not a genuine capability upgrade. Added anyway, by
-    # explicit user request, purely for redundancy: one more independent
-    # model in the pool is still one more chance of surviving a shared-
-    # pool rate-limit that happens to hit several models simultaneously
-    # (confirmed live earlier this session that this does happen).
+    (
+        "Nvidia Nemotron 3.5 Lightning",
+        "nvidia/nemotron-3.5-lightning:free",
+        "30B total/3B active MoE, general-purpose agentic reasoning",
+    ),
     (
         "Google Gemma 4 26B A4B",
         "google/gemma-4-26b-a4b-it:free",
-        "26B total/4B active MoE, general-purpose reasoning — the smallest ACTIVE-parameter "
-        "count among the pool's general-purpose models, kept for provider redundancy over "
-        "raw capability",
+        "26B total/4B active MoE, general-purpose reasoning",
     ),
-    # Expanded 6 -> 10 (2026-08-11), re-checking /api/v1/models live rather
-    # than assuming the roster above was still current — it wasn't: 8 new
-    # free models had appeared since the 6th-model decision. After the same
-    # two task-fit exclusions as above (still present: nvidia/nemotron-3.5-
-    # content-safety, nvidia/nemotron-nano-12b-v2-vl), 6 genuinely new
-    # candidates remained. All 4 added below were smoke-tested live
-    # (a real, successful chat-completions round-trip) before being added,
-    # matching this list's established practice of never trusting an entry
-    # from the models listing alone.
-    #
-    # Honest caveat, not silently glossed over: 3 of these 4 (everything
-    # below except the Nemotron) are marketed as CODING-AGENT models
-    # (Poolside's own copy cites Terminal-Bench, a coding benchmark;
-    # Cohere's North family debuts as "its first agentic coding model") —
-    # a genuinely different post-training specialization than the general
-    # instruction-following/reasoning models that made up the first 6, even
-    # though they're still general chat-completion-capable LLMs that can
-    # produce a written audit. This is a real, deliberate size-over-fit
-    # tradeoff to reach 10 total: after excluding the content-safety/
-    # vision-language models, only 2 of the 6 remaining free candidates
-    # (the ones NOT added here — inclusionai/ling-3.0-tiny at 7.9B and
-    # nvidia/nemotron-nano-9b-v2 at 9B) are both general-purpose AND
-    # smaller than every model added below — there was no way to reach 10
-    # using only general-purpose models without going smaller than what's
-    # already in the pool. If a future audit run's OpenRouter transcripts
-    # show these three producing noticeably shallower/more code-flavored
-    # critiques than the general-purpose models, that's the first thing to
-    # revisit — swap one or more back out for ling-3.0-tiny/nemotron-nano-
-    # 9b-v2 despite their smaller size, rather than assuming the pooling/
-    # retry machinery itself is at fault. Per-model profile strings below
-    # are what let stage 2 actually act on this caveat per audit, rather
-    # than this comment being the only place it's recorded.
+    (
+        "MiniMax M3",
+        "minimax/minimax-m3:free",
+        "Multimodal foundation model, CODING/AGENTIC-leaning per its own description "
+        "(long-horizon agentic work, coding) rather than general financial/textual "
+        "reasoning — weigh its open-ended judgment calls with more caution than the "
+        "general-purpose models above, though any concrete, verifiable point it "
+        "raises still stands on its own merits",
+    ),
     (
         "Poolside Laguna S 2.1",
         "poolside/laguna-s-2.1:free",
         "118B total/8B active MoE, CODING-AGENT-specialized (tuned for coding-agent "
-        "benchmarks, not general financial/textual reasoning) — weigh its open-ended "
-        "judgment calls with more caution than the general-purpose models above, though "
-        "any concrete, verifiable point it raises still stands on its own merits",
+        "benchmarks, not general financial/textual reasoning) — same lower-default-"
+        "trust caveat as MiniMax M3 above",
     ),
     (
         "Poolside Laguna XS 2.1",
@@ -1974,16 +2133,113 @@ AUDIT_MODELS: list[tuple[str, str, str]] = [
         "30B total/3B active MoE, CODING-AGENT-specialized (Cohere's own debut agentic "
         "CODING model) — same lower-default-trust caveat as the Poolside models above",
     ),
-    (
-        "Nvidia Nemotron 3 Nano 30B A3B",
-        "nvidia/nemotron-3-nano-30b-a3b:free",
-        "30B total/3B active MoE, general-purpose agentic reasoning (not coding-specialized)",
-    ),
 ]
 
 
+# Case-insensitive substrings that mark a paragraph as a concrete,
+# checkable finding (a real number, a contradiction, a named error) as
+# opposed to preamble, agreements, or restated framing — used by
+# _extract_highest_signal_excerpt below to decide what survives
+# truncation. Deliberately broad/cheap (substring counting, no NLP) —
+# matches this project's "pure computation, no new LLM call" pattern for
+# everything in the past-lessons pipeline.
+_HIGH_SIGNAL_AUDIT_MARKERS = (
+    "contradicted", "win rate", "avg r", "average r", "backtest", "error",
+    "misrepresentation", "ignored", "false", "incorrect", "mismatch",
+    "missing", "flaw", "inconsistent", "recurring",
+)
+
+
+def _extract_highest_signal_excerpt(text: str, max_chars: int) -> str:
+    """Keeps the highest-signal `max_chars` worth of `text` instead of
+    just its first `max_chars` characters — added 2026-09-03, direct
+    user request, after confirming live that plain front-truncation
+    silently discarded a real, decisive finding (a documented 14%
+    historical win rate for the exact setup a draft was repeating) that
+    happened to sit 27,000 characters into a 40,000-character audit
+    block, while a same-session sibling audit's much earlier, less
+    consequential remark survived purely by being first.
+
+    Splits `text` on blank lines (this project's audit reports are
+    already paragraph-per-finding — see AUDIT_INSTRUCTION's own "#### N.
+    TITLE" structure), scores each paragraph by how many distinct
+    _HIGH_SIGNAL_AUDIT_MARKERS substrings it contains, and greedily
+    keeps highest-scoring paragraphs first (ties broken by original
+    order, via Python's stable sort) until the budget runs out —
+    concrete, numbered findings survive regardless of where in the
+    original text they fell; scene-setting prose that never mentions a
+    number or a named error is what gets cut first.
+
+    Two guards keep raw keyword-counting from picking badly, both
+    confirmed necessary against a real 40,000-character audit block:
+    a bare section header (e.g. "### CRITICAL FLAWS") scores nonzero on
+    a single word despite carrying zero actual information, so anything
+    under `_MIN_SCORABLE_PARAGRAPH_CHARS` never scores above 0 and only
+    fills leftover space, never displaces a real finding; and a long
+    markdown table repeats words like "error"/"score" often enough by
+    sheer row count to outscore — and then crowd out — several genuinely
+    more important short findings, so no single paragraph may claim more
+    than 1/3 of the total budget (a longer high-scoring paragraph still
+    gets included, just truncated to its share, rather than either
+    monopolizing the excerpt or losing out to headers entirely).
+
+    When nothing in the text scores above zero (no marker matched
+    anywhere), the highest-scoring-first order is simply original order,
+    so behavior degrades to roughly the old front-truncation — no
+    regression for a session whose findings don't happen to use any of
+    these markers."""
+    paragraphs = [p for p in text.split("\n\n") if p.strip()]
+    if not paragraphs:
+        return text[:max_chars]
+
+    _MIN_SCORABLE_PARAGRAPH_CHARS = 60
+
+    def _score(paragraph: str) -> int:
+        if len(paragraph) < _MIN_SCORABLE_PARAGRAPH_CHARS:
+            return 0
+        lowered = paragraph.lower()
+        return sum(1 for marker in _HIGH_SIGNAL_AUDIT_MARKERS if marker in lowered)
+
+    scores = [_score(p) for p in paragraphs]
+    n_positive = sum(1 for s in scores if s > 0)
+    ranked = sorted(
+        ((i, paragraphs[i], scores[i]) for i in range(len(paragraphs))),
+        key=lambda item: (-item[2], item[0]),
+    )
+    max_share_per_paragraph = max(_MIN_SCORABLE_PARAGRAPH_CHARS, max_chars // 3)
+
+    kept_by_index: dict[int, str] = {}
+    budget = max_chars
+    positive_seen = 0
+    for index, paragraph, score in ranked:
+        if budget <= 0:
+            break
+        if score > 0:
+            positive_seen += 1
+        separator_cost = 2 if kept_by_index else 0  # "\n\n" between kept paragraphs
+        available = budget - separator_cost
+        if available <= 0:
+            continue
+        # Only cap this paragraph's share when a REAL competitor (another
+        # positive-scoring paragraph) is still waiting for the freed
+        # room — capping the single best (or only) finding just to hand
+        # the leftover space to a worthless zero-score header/filler
+        # wastes budget rather than protecting anything.
+        more_positive_pending = score > 0 and positive_seen < n_positive
+        cap = max_share_per_paragraph if more_positive_pending else available
+        share = min(len(paragraph), cap, available)
+        if share < _MIN_SCORABLE_PARAGRAPH_CHARS and share < len(paragraph):
+            # Not worth a fragment too small to carry any real content —
+            # skip rather than waste the little budget left on a stub.
+            continue
+        kept_by_index[index] = paragraph[:share]
+        budget -= share + separator_cost
+
+    return "\n\n".join(kept_by_index[i] for i in sorted(kept_by_index))
+
+
 def build_past_audit_lessons(
-    records_dir: Path | None = None, max_sessions: int = 2, max_chars_per_session: int = 3000
+    records_dir: Path | None = None, max_sessions: int = 2, max_chars_per_session: int = 6000
 ) -> str:
     """Pulls the actual audit findings (Stage 2) out of the most recent
     saved Portfolio Suggestion transcripts (see ai/session_record.py) so
@@ -1999,7 +2255,22 @@ def build_past_audit_lessons(
     reason over it, not pre-digest it first. Truncates per session and
     caps how many sessions are included so this can't balloon an already
     token-heavy prompt — free audit models in particular may have
-    tighter context budgets than Claude itself.
+    tighter context budgets than Claude itself. The truncation itself is
+    signal-prioritized (see _extract_highest_signal_excerpt), not a bare
+    first-N-characters cut — a real incident confirmed the latter can
+    silently drop the single most decisive finding in the whole block
+    purely because of where it happened to fall in a ~10-model audit
+    transcript, while less consequential remarks survived just by being
+    first.
+
+    `max_chars_per_session` doubled 3000 -> 6000 (2026-09-03, alongside
+    AUDIT_MODELS' own 10 -> 3 trim, direct user request to "max data to
+    2x... without hitting usage limits") — genuinely affordable, not
+    just permitted: the OLD 3000-char budget still reached 11 consumers
+    every run (10 audit models + Claude's own draft), for 33,000 total
+    characters of past-lessons context; the NEW 6000-char budget reaches
+    only 4 (3 audit models + Claude), for 24,000 — MORE signal per
+    session while still costing LESS in aggregate than before the trim.
 
     "" when there's no records directory yet (first-ever run) or it's
     empty — nothing to learn from, not a failure."""
@@ -2025,7 +2296,7 @@ def build_past_audit_lessons(
         if not audit_block:
             continue
 
-        excerpt = audit_block[:max_chars_per_session]
+        excerpt = _extract_highest_signal_excerpt(audit_block, max_chars_per_session)
         sections.append(f"--- From a past session ({path.stem}) ---\n{excerpt}")
 
     if not sections:
@@ -2107,13 +2378,20 @@ def build_past_outcome_lessons(
             current = fetch_current_price(symbol)
             if current is None:
                 continue
-            pct_change = (current - entry.price) / entry.price * 100
-            stop_status = (
-                "STOP WOULD HAVE BEEN HIT" if current <= entry.stop_loss else "stop not hit"
-            )
+            is_sell = entry.side == "sell"
+            # A SELL profits on a price drop and its stop sits ABOVE
+            # entry, so the breach direction is the mirror image of a BUY
+            # (whose stop sits below entry) — using the BUY-only check
+            # unconditionally here previously reported every SELL's stop
+            # status backwards, corrupting roughly half the account's real
+            # trade history in this feedback block.
+            pct_change = (current - entry.price) / entry.price * 100 * (-1 if is_sell else 1)
+            stop_hit = current >= entry.stop_loss if is_sell else current <= entry.stop_loss
+            stop_status = "STOP WOULD HAVE BEEN HIT" if stop_hit else "stop not hit"
             lines.append(
-                f"- {symbol}: suggested entry {entry.price:g}, stop {entry.stop_loss:g} -> "
-                f"current price {current:g} ({pct_change:+.1f}%), {stop_status}"
+                f"- {symbol} ({entry.side.upper()}): suggested entry {entry.price:g}, "
+                f"stop {entry.stop_loss:g} -> current price {current:g} "
+                f"({pct_change:+.1f}% in the trade's favor), {stop_status}"
             )
 
         if lines:
@@ -2255,6 +2533,47 @@ def _run_audit_with_retry(
     return label, result
 
 
+def _run_audit_slot(
+    primary: tuple[str, str, str],
+    claim_fallback: Callable[[], tuple[str, str, str] | None],
+    summary: str,
+    draft: str,
+    status_map: dict[str, ModelAuditStatus] | None = None,
+    past_lessons: str = "",
+    audit_instruction: str = AUDIT_INSTRUCTION,
+) -> tuple[str, str]:
+    """Runs `primary` (one of the 3 PRIMARY slots in AUDIT_MODELS) via
+    _run_audit_with_retry; if it gives up entirely (exhausts its own
+    retry window, or hits a missing-key failure _run_audit_with_retry
+    never retries), claims the next model from `claim_fallback` — a
+    shared, thread-safe accessor over AUDIT_MODEL_FALLBACKS so two slots
+    failing at once can't both claim the same reserve model — and tries
+    that instead, repeating until one produces a real result or the
+    bench is exhausted (claim_fallback returns None).
+
+    Added when the audit pool was trimmed from 10 concurrent models to 3
+    (2026-09-03, direct user request), specifically to keep the old
+    pool's "something is almost always available" resilience without
+    paying for 10 concurrent calls in the common case: a dead/rate-
+    limited primary now gets a real replacement reviewer for its slot
+    instead of that slot's review just being lost. The final (label,
+    result) reflects whichever model actually produced it — a promoted
+    fallback's own label, not the original primary's — so build_audit_
+    block's per-model profile lookup must cover both AUDIT_MODELS and
+    AUDIT_MODEL_FALLBACKS, not just the primary list."""
+    label, model, _ = primary
+    while True:
+        label, result = _run_audit_with_retry(
+            label, model, summary, draft, status_map, past_lessons, audit_instruction,
+        )
+        if result not in (OPENROUTER_FAILED_MESSAGE, OPENROUTER_MISSING_KEY_MESSAGE):
+            return label, result
+        next_candidate = claim_fallback()
+        if next_candidate is None:
+            return label, result
+        label, model, _ = next_candidate
+
+
 def _format_audit_progress(status_map: dict[str, ModelAuditStatus]) -> str:
     """Human-readable snapshot of every audit model's live status, for a
     UI to show as a sub-status under "Sending the draft to N independent
@@ -2262,6 +2581,12 @@ def _format_audit_progress(status_map: dict[str, ModelAuditStatus]) -> str:
     lines = []
     succeeded = retrying = in_progress = gave_up = 0
     for label, status in status_map.items():
+        if status.state == "bench":
+            # Not yet claimed by any slot — an unused reserve model isn't
+            # "waiting to start" (it may never run at all this session)
+            # and would otherwise inflate the denominator below with
+            # models nobody is actually counting on this run.
+            continue
         if status.state == "succeeded":
             succeeded += 1
             lines.append(f"✓ {label} — audit received")
@@ -2287,7 +2612,7 @@ def _format_audit_progress(status_map: dict[str, ModelAuditStatus]) -> str:
                 f"… {label} — waiting for response (attempt {status.attempt}/{status.max_attempts})"
             )
 
-    total = len(status_map)
+    total = succeeded + retrying + in_progress + gave_up
     summary_line = (
         f"{succeeded}/{total} models completed, {in_progress} in progress, "
         f"{retrying} retrying, {gave_up} gave up"
@@ -2412,14 +2737,36 @@ def build_audit_block(
     audit_instruction: str = AUDIT_INSTRUCTION,
     past_lessons: str = "",
     include_copilot: bool = True,
+    focus_directives: list[str] | None = None,
 ) -> AuditResult:
-    """Runs every model in AUDIT_MODELS in parallel against Claude's own
-    stage-1 draft, retrying each one individually (see
-    _run_audit_with_retry) if it's unavailable. Always attempted — once
-    stage 1 produces a draft, there's always something for the audits to
-    review, unlike the old Gemini-gated design. audit_available is true if
-    *any* model responds, so the pool tolerates several being down at once
-    (see AUDIT_MODELS for why it's spread across multiple providers).
+    """Runs every model in AUDIT_MODELS (the 3 PRIMARY slots) in parallel
+    against Claude's own stage-1 draft, retrying each one individually
+    (see _run_audit_with_retry) if it's unavailable, and promoting the
+    next model from AUDIT_MODEL_FALLBACKS into a slot whose primary gave
+    up entirely (see _run_audit_slot). Always attempted — once stage 1
+    produces a draft, there's always something for the audits to review,
+    unlike the old Gemini-gated design. audit_available is true if *any*
+    slot produces a real result, so the pool tolerates a primary AND its
+    whole fallback bench being down at once for one slot without losing
+    the other slots' reviews.
+
+    `focus_directives`, if given, must have exactly len(AUDIT_MODELS)
+    entries — one per primary slot, in AUDIT_MODELS order. Each slot's
+    actual instruction becomes `audit_instruction` plus that slot's own
+    directive text, regardless of whether the primary or a promoted
+    fallback ends up running it (the focus belongs to the SLOT, not to
+    whichever specific model fills it). Added 2026-09-03, direct user
+    request, alongside the 10->3 model trim: splitting the (long) shared
+    checklist into non-overlapping per-slot focuses cuts each individual
+    audit's own output size and removes the "3 models all re-flag the
+    same finding" duplication stage 2 previously had to wade through,
+    without dropping any checklist item pool-wide (each still goes to
+    exactly one focused reviewer). None (the default) preserves the
+    original behavior for every caller that doesn't pass it — PMEX/PSX
+    currently don't, only ai/ftmo_suggest.py does, since that pipeline's
+    own AUDIT_INSTRUCTION is what a real incident showed this was needed
+    for; extending it to PMEX/PSX's own checklists is a separate,
+    unstarted decision, not implied by this default.
 
     `include_copilot` defaults to True as the function's own library
     default, but as of 2026-08-25 every real caller (FTMO, PMEX, PSX)
@@ -2431,8 +2778,8 @@ def build_audit_block(
     across markets. The True default survives only for this function's
     own direct unit tests exercising that code path — flip a caller back
     to True (or omit the argument) if Copilot's auditor role is ever
-    reinstated. AUDIT_MODELS itself (the 10-model OpenRouter pool) is
-    untouched by this flag; only the extra 11th Copilot voice is skipped.
+    reinstated. AUDIT_MODELS itself is untouched by this flag; only the
+    extra Copilot voice is skipped.
 
     `audit_instruction` lets a different market's suggestion pipeline (see
     ai/psx_suggest.py) reuse this exact retry/pooling/progress machinery
@@ -2451,10 +2798,34 @@ def build_audit_block(
     summary every second, so a UI can show which models have responded,
     which are retrying and when, and which have given up, instead of one
     static line for the whole (up to ~10-minutes-per-model) audit phase."""
+    if focus_directives is not None and len(focus_directives) != len(AUDIT_MODELS):
+        raise ValueError(
+            f"focus_directives must have exactly {len(AUDIT_MODELS)} entries "
+            f"(one per AUDIT_MODELS slot), got {len(focus_directives)}."
+        )
+    # Every label EITHER list could ever return must be pre-populated here
+    # before any worker thread starts — a promoted fallback's _set_status
+    # call (inside _run_audit_with_retry) only ever REPLACES an existing
+    # key, never inserts one, which is what makes the polling loop below
+    # safe to read status_map.items() from this thread while worker
+    # threads write to it concurrently, without an explicit lock.
     status_map: dict[str, ModelAuditStatus] = {
         label: ModelAuditStatus(state="waiting", attempt=0, max_attempts=0)
         for label, _, _ in AUDIT_MODELS
     }
+    # Fallback-bench entries start in a distinct "bench" state, not
+    # "waiting" — most runs never touch most of the bench (only a slot
+    # whose primary genuinely gives up ever claims one), and counting/
+    # rendering all 7 as perpetually "waiting to start" would show a
+    # misleading "3/10 models completed" instead of the true "3/3" for a
+    # normal run where every primary succeeds. _format_audit_progress
+    # skips "bench" entries entirely; _claim_fallback flips one to
+    # "waiting" (a same-key value replacement, not an insert — still
+    # safe for the polling thread's concurrent .items() read below) at
+    # the exact moment it's actually promoted into a slot.
+    status_map.update(
+        {label: ModelAuditStatus(state="bench", attempt=0, max_attempts=0) for label, _, _ in AUDIT_MODEL_FALLBACKS}
+    )
     if include_copilot:
         # Copilot gets its own entry too — see _run_copilot_with_status's own
         # docstring for why this matters: without it, a slow Copilot call was
@@ -2463,8 +2834,24 @@ def build_audit_block(
         status_map[_COPILOT_STATUS_LABEL] = ModelAuditStatus(state="waiting", attempt=0, max_attempts=1)
     # Looked up when composing audit_sections below, so each model's audit
     # text can be shown to Claude alongside its own capability/
-    # specialization profile — see AUDIT_MODELS' own comment for why.
-    profile_by_label = {label: profile for label, _, profile in AUDIT_MODELS}
+    # specialization profile — covers fallback labels too, since a
+    # promoted fallback's own profile (not its replaced primary's) is
+    # what stage 2 needs to weigh that specific audit's credibility.
+    profile_by_label = {label: profile for label, _, profile in AUDIT_MODELS + AUDIT_MODEL_FALLBACKS}
+
+    # Shared, lock-protected reserve queue: two slots failing at the same
+    # time claim from the SAME underlying list, so they can never both
+    # promote the identical fallback model into two different slots.
+    fallback_bench = list(AUDIT_MODEL_FALLBACKS)
+    fallback_lock = threading.Lock()
+
+    def _claim_fallback() -> tuple[str, str, str] | None:
+        with fallback_lock:
+            if not fallback_bench:
+                return None
+            candidate = fallback_bench.pop(0)
+        status_map[candidate[0]] = ModelAuditStatus(state="waiting", attempt=0, max_attempts=0)
+        return candidate
 
     with ThreadPoolExecutor(max_workers=len(AUDIT_MODELS) + (1 if include_copilot else 0)) as pool:
         # Submitted as individual futures (not list(pool.map(...))) so one
@@ -2472,16 +2859,16 @@ def build_audit_block(
         # already-completed result is collected.
         futures = [
             pool.submit(
-                _run_audit_with_retry,
-                label,
-                model,
+                _run_audit_slot,
+                primary,
+                _claim_fallback,
                 summary,
                 draft,
                 status_map,
                 past_lessons,
-                audit_instruction,
+                audit_instruction if focus_directives is None else f"{audit_instruction}\n\n{focus_directives[i]}",
             )
-            for label, model, _ in AUDIT_MODELS
+            for i, primary in enumerate(AUDIT_MODELS)
         ]
         # Runs alongside the OpenRouter pool, not after it, so it doesn't
         # add net wall-clock time to every run — no retry loop (see

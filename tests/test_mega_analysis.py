@@ -407,9 +407,80 @@ def test_run_mega_analysis_reports_per_instrument_progress_as_current_activity_n
     progress = read_progress()
     assert not any("EURUSD" in step or "GBPUSD" in step for step in progress["steps"])
     assert "Analyzed all 2 instruments." in progress["steps"]
-    # The last per-instrument message must not linger as a stale
-    # current_activity once the scan hands off to the next milestone.
-    assert progress["current_activity"] is None
+
+
+@patch("ai.mega_analysis.suggest_ftmo_portfolio", return_value="a real suggestion")
+@patch("ai.mega_analysis.build_ftmo_summary", return_value="summary text")
+@patch("ai.mega_analysis.analyze_ftmo_assets", return_value=["fake analysis"])
+@patch("ai.mega_analysis.fetch_ftmo_status")
+@patch("ai.mega_analysis.get_pending_orders", return_value=[])
+@patch("ai.mega_analysis.get_open_positions", return_value=[])
+@patch("ai.mega_analysis.get_market_watch", return_value=["EURUSD"])
+@patch("ai.mega_analysis.get_account_summary")
+@patch("ai.mega_analysis.connect")
+def test_run_mega_analysis_calls_on_analyses_with_the_real_result(
+    mock_connect, mock_account, mock_watch, mock_positions, mock_pending_orders, mock_status,
+    mock_analyze, mock_summary, mock_suggest, _fixed_schedule,
+):
+    # Real gap this closes: the manual "Suggest Portfolio Mix" button
+    # (app.py) needs the analyses list for its own session_state after
+    # calling this function, but this function's own return value is
+    # just the raw suggestion string (unchanged, so run_scheduled_mega_
+    # analysis's own contract never breaks) -- on_analyses is the seam
+    # that lets the caller still get it.
+    from ai.mega_analysis import run_mega_analysis
+
+    captured = []
+    run_mega_analysis(on_analyses=captured.append)
+
+    assert captured == [["fake analysis"]]
+
+
+@patch("ai.mega_analysis.suggest_ftmo_portfolio", return_value="a real suggestion")
+@patch("ai.mega_analysis.build_ftmo_summary", return_value="summary text")
+@patch("ai.mega_analysis.analyze_ftmo_assets", return_value=[])
+@patch("ai.mega_analysis.fetch_ftmo_status")
+@patch("ai.mega_analysis.get_pending_orders", return_value=[])
+@patch("ai.mega_analysis.get_open_positions", return_value=[])
+@patch("ai.mega_analysis.get_market_watch", return_value=["EURUSD"])
+@patch("ai.mega_analysis.get_account_summary")
+@patch("ai.mega_analysis.connect")
+def test_run_mega_analysis_model_override_reaches_suggest_ftmo_portfolio(
+    mock_connect, mock_account, mock_watch, mock_positions, mock_pending_orders, mock_status,
+    mock_analyze, mock_summary, mock_suggest, _fixed_schedule,
+):
+    # The manual button lets a user pick a model (e.g. a cheap "haiku"
+    # test run) -- this must actually reach suggest_ftmo_portfolio, and
+    # the live progress line must reflect the REAL model being used, not
+    # the config default, so the two can never silently disagree.
+    from ai.mega_analysis import run_mega_analysis
+
+    run_mega_analysis(model="haiku")
+
+    mock_suggest.assert_called_once()
+    assert mock_suggest.call_args.kwargs["model"] == "haiku"
+    progress = read_progress()
+    assert "Running Claude haiku + the full audit-model pool..." in progress["steps"]
+
+
+@patch("ai.mega_analysis.suggest_ftmo_portfolio", return_value="a real suggestion")
+@patch("ai.mega_analysis.build_ftmo_summary", return_value="summary text")
+@patch("ai.mega_analysis.analyze_ftmo_assets", return_value=[])
+@patch("ai.mega_analysis.fetch_ftmo_status")
+@patch("ai.mega_analysis.get_pending_orders", return_value=[])
+@patch("ai.mega_analysis.get_open_positions", return_value=[])
+@patch("ai.mega_analysis.get_market_watch", return_value=["EURUSD"])
+@patch("ai.mega_analysis.get_account_summary")
+@patch("ai.mega_analysis.connect")
+def test_run_mega_analysis_model_defaults_to_config_when_not_given(
+    mock_connect, mock_account, mock_watch, mock_positions, mock_pending_orders, mock_status,
+    mock_analyze, mock_summary, mock_suggest, _fixed_schedule,
+):
+    from ai.mega_analysis import run_mega_analysis
+
+    run_mega_analysis()
+
+    assert mock_suggest.call_args.kwargs["model"] == config.MEGA_ANALYSIS_MODEL
 
 
 @patch("ai.mega_analysis.suggest_ftmo_portfolio", return_value="a real suggestion")

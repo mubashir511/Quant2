@@ -1,5 +1,5 @@
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pandas as pd
@@ -7,6 +7,7 @@ import pytest
 
 from ai.portfolio_suggest import (
     AUDIT_INSTRUCTION,
+    AUDIT_MODEL_FALLBACKS,
     AUDIT_MODELS,
     AllocationEntry,
     AssetAnalysis,
@@ -20,6 +21,7 @@ from ai.portfolio_suggest import (
     analyze_assets,
     build_audit_block,
     build_copilot_verification,
+    _extract_highest_signal_excerpt,
     build_past_audit_lessons,
     build_past_lessons,
     build_past_outcome_lessons,
@@ -50,6 +52,7 @@ from ai.copilot_cli import CLI_MISSING_MESSAGE as COPILOT_MISSING_MESSAGE
 from ai.openrouter_client import FAILED_MESSAGE as OPENROUTER_FAILED_MESSAGE
 from ai.openrouter_client import MISSING_KEY_MESSAGE as OPENROUTER_MISSING_KEY_MESSAGE
 from analysis.backtest import (
+    FavorableExcursionStats,
     MomentumPersistenceBacktest,
     RSIReactionBacktest,
     SupportResistanceBacktest,
@@ -184,10 +187,17 @@ def test_build_pending_orders_context_empty_when_no_orders():
 
 
 def test_build_pending_orders_context_describes_each_order_with_age():
+    # time_setup is timezone-AWARE (UTC) in real production data (see
+    # data/mt5_source.py's get_pending_orders) — a naive value here would
+    # have hidden the real 2026-09-05 bug where build_pending_orders_
+    # context itself compared it against a naive datetime.now(), crashing
+    # the whole mega-analysis run the first time a real pending order
+    # actually reached this function.
     orders = [
         PendingOrder(
             symbol="GO10OZ", volume=1.0, order_type="buy limit", price_open=1990.0,
-            sl=1950.0, tp=2100.0, ticket=777, time_setup=datetime.now() - pd.Timedelta(hours=5),
+            sl=1950.0, tp=2100.0, ticket=777,
+            time_setup=datetime.now(timezone.utc) - pd.Timedelta(hours=5),
         ),
     ]
     text = build_pending_orders_context(orders)
@@ -493,6 +503,111 @@ def test_format_enriched_asset_context_includes_backtest_evidence():
     assert "0.42" in text and "persistent" in text
     assert "supports the 'coiled spring' reading" in text
     assert "buying off support" in text and "shorting off resistance" in text
+    # The RSI/support/resistance backtests above all carry excursion=None
+    # (not set) — the parent backtests resolved, so this must be the
+    # NARROWER "not enough real history for a full look-forward window"
+    # sentence, not the parent's own "not enough episodes" one (see the
+    # dedicated None-case test below for that distinction spelled out
+    # explicitly).
+    assert "historical favorable-excursion magnitude" in text
+    assert text.count("not enough real history for a full look-forward window") >= 1
+
+
+def test_format_enriched_asset_context_includes_favorable_excursion_magnitude():
+    # Direct feature test: when a backtest carries a real, populated
+    # FavorableExcursionStats, format_enriched_asset_context must surface
+    # its median/mean/horizon — the actual new evidence this feature
+    # exists to add to Claude's prompt.
+    analysis = _analysis_with_stats()
+    analysis.rsi_overbought_backtest = RSIReactionBacktest(
+        "overbought", 70.0, 6, 5, 1, 0, 83.3, 1.5, 1.5, 3.0, 10,
+        excursion=FavorableExcursionStats(sample_size=8, avg_r=4.53, median_r=3.81, horizon_bars=90),
+    )
+
+    text = format_enriched_asset_context([analysis])
+    assert "historical favorable-excursion magnitude" in text
+    assert "8 of the same historical entries above" in text
+    assert "median +3.81R" in text
+    assert "mean +4.53R" in text
+    assert "90-bar window" in text
+
+
+def test_format_enriched_asset_context_degrades_honestly_when_excursion_is_none():
+    # The parent backtest resolves (a real win-rate/avg-R figure), but
+    # its excursion field is None (too few entries kept a full 90-bar
+    # window) — this must emit the excursion formatter's OWN distinct
+    # "not enough real history for a full look-forward window" sentence,
+    # not the parent's own "not enough real historical episodes" sentence
+    # (which describes a different gate entirely).
+    analysis = _analysis_with_stats()
+    analysis.rsi_overbought_backtest = RSIReactionBacktest(
+        "overbought", 70.0, 6, 5, 1, 0, 83.3, 1.5, 1.5, 3.0, 10, excursion=None,
+    )
+
+    text = format_enriched_asset_context([analysis])
+    assert "historical favorable-excursion magnitude (overbought RSI reversal short): not enough real history" in text
+
+
+def test_format_enriched_asset_context_can_exclude_favorable_excursion_entirely():
+    # Real gap caught on a self-recheck (2026-09-12): ai/clerk_execution.py
+    # reuses this exact formatted text as `technical_context` for its own
+    # tactical-verdict prompts, which never include ai/ftmo_suggest.py's
+    # own _INSTRUCTION_HEAD — the ONLY place the favorable-excursion
+    # figure's critical misread warning and HOLDING HORIZON scale-
+    # mismatch caveat actually live. include_favorable_excursion=False
+    # must drop every excursion line while leaving the underlying win-
+    # rate/avg-R backtest lines (which carry no such dangling-reference
+    # problem) completely untouched.
+    analysis = _analysis_with_stats()
+    analysis.rsi_overbought_backtest = RSIReactionBacktest(
+        "overbought", 70.0, 6, 5, 1, 0, 83.3, 1.5, 1.5, 3.0, 10,
+        excursion=FavorableExcursionStats(sample_size=8, avg_r=4.53, median_r=3.81, horizon_bars=90),
+    )
+
+    text = format_enriched_asset_context([analysis], include_favorable_excursion=False)
+    assert "historical favorable-excursion magnitude" not in text
+
+
+def test_format_enriched_asset_context_can_exclude_market_status_entirely():
+    # Same real gap as include_favorable_excursion=False (see that
+    # test's own comment): ai/clerk_execution.py's tactical prompts never
+    # include _INSTRUCTION_HEAD, the only place "market CLOSED" is
+    # explained/actionable -- and Clerk never proposes new trades at all,
+    # so the tag would be pure noise there. Must drop the tag while
+    # leaving everything else in the line untouched.
+    analysis = _analysis_with_stats()
+    analysis.market_open = False
+
+    text = format_enriched_asset_context([analysis], include_market_status=False)
+    assert "market CLOSED" not in text
+    assert "- GOLD-DE26 (Gold): bid 2000.0, ask 2000.5" in text
+
+
+def test_format_enriched_asset_context_flags_closed_market():
+    analysis = _analysis_with_stats()
+    analysis.market_open = False
+
+    text = format_enriched_asset_context([analysis])
+    assert "market CLOSED (weekend)" in text
+
+
+def test_format_enriched_asset_context_silent_when_market_open():
+    analysis = _analysis_with_stats()
+    analysis.market_open = True
+
+    text = format_enriched_asset_context([analysis])
+    assert "market CLOSED" not in text
+
+
+def test_format_enriched_asset_context_silent_when_market_open_unknown():
+    # Yahoo/PMEX path never sets market_open (stays None) — must not
+    # claim a status it doesn't actually know.
+    analysis = _analysis_with_stats()
+    assert analysis.market_open is None
+
+    text = format_enriched_asset_context([analysis])
+    assert "market CLOSED" not in text
+    assert "market OPEN" not in text
 
 
 def test_format_enriched_asset_context_discloses_real_execution_cost_when_present():
@@ -1563,10 +1678,16 @@ def test_build_audit_block_available_if_even_one_model_succeeds(mock_audit):
 @patch("config.AUDIT_RETRY_INTERVAL_SECONDS", 1)
 @patch("ai.portfolio_suggest.get_openrouter_audit")
 def test_build_audit_block_treats_one_audit_exception_as_unavailable_without_losing_the_others(mock_audit):
-    failing_model = AUDIT_MODELS[0][1]
+    # A slot whose primary raises now recovers via _run_audit_slot's own
+    # fallback cascade (a genuinely improved behavior, not a bug to work
+    # around) — so to keep testing the original intent here ("one truly-
+    # dead audit path doesn't corrupt/lose the other slots' results"),
+    # the primary's ENTIRE fallback bench must also fail for that slot to
+    # end up genuinely unavailable.
+    failing_models = {AUDIT_MODELS[0][1]} | {model for _, model, _ in AUDIT_MODEL_FALLBACKS}
 
     def audit_side_effect(summary, draft, model, **kwargs):
-        if model == failing_model:
+        if model in failing_models:
             raise RuntimeError("boom")
         return "surviving audit text"
 
@@ -1574,6 +1695,85 @@ def test_build_audit_block_treats_one_audit_exception_as_unavailable_without_los
     result = build_audit_block("some summary", "Claude's draft mix.")
     assert result.audit_available is True
     assert result.block.count("surviving audit text") == len(AUDIT_MODELS) - 1
+    assert result.block.lower().count("not available this time") == 1
+
+
+@patch("config.AUDIT_RETRY_TIMEOUT_SECONDS", 1)
+@patch("config.AUDIT_RETRY_INTERVAL_SECONDS", 1)
+@patch("ai.portfolio_suggest.get_openrouter_audit")
+def test_build_audit_block_fallback_cascade_recovers_a_dead_primary(mock_audit):
+    # The actual point of trimming 10 models to 3 + a fallback bench
+    # (2026-09-03, direct user request): a dead/rate-limited PRIMARY no
+    # longer just loses its slot's review — the next model in
+    # AUDIT_MODEL_FALLBACKS gets promoted into that slot instead.
+    failing_model = AUDIT_MODELS[0][1]
+    rescuer_label, rescuer_model, _ = AUDIT_MODEL_FALLBACKS[0]
+
+    def audit_side_effect(summary, draft, model, **kwargs):
+        if model == failing_model:
+            return OPENROUTER_FAILED_MESSAGE
+        return "an audit"
+
+    mock_audit.side_effect = audit_side_effect
+    result = build_audit_block("some summary", "Claude's draft mix.")
+    assert result.audit_available is True
+    assert f"{rescuer_label} (" in result.block
+    assert "not available this time" not in result.block.lower()
+
+
+@patch("config.AUDIT_RETRY_TIMEOUT_SECONDS", 1)
+@patch("config.AUDIT_RETRY_INTERVAL_SECONDS", 1)
+@patch("ai.portfolio_suggest.get_openrouter_audit")
+def test_build_audit_block_two_dead_primaries_never_claim_the_same_fallback(mock_audit):
+    # The shared, lock-protected fallback queue must hand out each
+    # reserve model at most once across all slots, even when two
+    # primaries fail around the same time.
+    dead_models = {AUDIT_MODELS[0][1], AUDIT_MODELS[1][1]}
+
+    def audit_side_effect(summary, draft, model, **kwargs):
+        if model in dead_models:
+            return OPENROUTER_FAILED_MESSAGE
+        return "an audit"
+
+    mock_audit.side_effect = audit_side_effect
+    result = build_audit_block("some summary", "Claude's draft mix.")
+    assert result.audit_available is True
+    first_two_fallback_labels = [label for label, _, _ in AUDIT_MODEL_FALLBACKS[:2]]
+    assert result.block.count(f"{first_two_fallback_labels[0]} (") == 1
+    assert result.block.count(f"{first_two_fallback_labels[1]} (") == 1
+
+
+def test_focus_directives_wrong_length_raises():
+    with pytest.raises(ValueError):
+        build_audit_block("summary", "draft", focus_directives=["only one"])
+
+
+@patch("ai.portfolio_suggest.get_openrouter_audit")
+def test_focus_directives_appended_per_slot(mock_audit):
+    captured_instructions = []
+
+    def audit_side_effect(summary, draft, model, **kwargs):
+        captured_instructions.append(kwargs["audit_instruction"])
+        return "an audit"
+
+    mock_audit.side_effect = audit_side_effect
+    directives = [f"FOCUS {i}" for i in range(len(AUDIT_MODELS))]
+    build_audit_block("summary", "draft", focus_directives=directives)
+    for directive in directives:
+        assert any(directive in instr for instr in captured_instructions)
+
+
+@patch("ai.portfolio_suggest.get_openrouter_audit", return_value="an audit")
+def test_no_focus_directives_leaves_instruction_unchanged(mock_audit):
+    captured_instructions = []
+
+    def audit_side_effect(summary, draft, model, **kwargs):
+        captured_instructions.append(kwargs["audit_instruction"])
+        return "an audit"
+
+    mock_audit.side_effect = audit_side_effect
+    build_audit_block("summary", "draft", audit_instruction="BASE INSTRUCTION")
+    assert all(instr == "BASE INSTRUCTION" for instr in captured_instructions)
 
 
 @patch("ai.portfolio_suggest.get_openrouter_audit", return_value="an audit")
@@ -1770,6 +1970,69 @@ def test_build_past_audit_lessons_truncates_long_sections(tmp_path):
     assert len(lessons) < 5000
 
 
+def test_extract_highest_signal_excerpt_keeps_a_late_finding_over_an_early_one():
+    # The exact bug this fixes: plain front-truncation silently dropped a
+    # decisive, concrete finding that happened to sit late in a real
+    # 40,000-character audit block, while an earlier, less consequential
+    # remark survived purely by being first.
+    early_fluff = "This account's overall approach continues to look broadly reasonable this run. " * 3
+    late_finding = (
+        "CONTRADICTED: this instrument's own backtest shows a 14% historical win rate "
+        "with a negative average R for the exact oversold-RSI-long setup being repeated."
+    )
+    text = f"{early_fluff}\n\n" + ("filler paragraph with no real content here at all. " * 5) + f"\n\n{late_finding}"
+    # Tight enough that front-truncation (or a naive scorer that still
+    # prefers earlier text on ties) would cut before ever reaching the
+    # late finding, but with enough slack that it can be kept IN FULL —
+    # this is what actually matters, not whether some leftover budget
+    # also gets spent on filler once the real finding is already secured.
+    excerpt = _extract_highest_signal_excerpt(text, max_chars=170)
+    assert late_finding in excerpt
+
+
+def test_extract_highest_signal_excerpt_ignores_bare_headers():
+    # A short section header containing a marker word carries zero real
+    # information and must never win the budget over an actual finding.
+    header = "### CRITICAL FLAWS"
+    real_finding = (
+        "ERROR: the draft's stated R:R of 2:1 is actually 1.3:1 once the real "
+        "round-trip cost is netted against both legs, not just the reward side."
+    )
+    text = f"{header}\n\n{real_finding}"
+    excerpt = _extract_highest_signal_excerpt(text, max_chars=len(real_finding))
+    assert "ERROR" in excerpt
+    assert "CRITICAL FLAWS" not in excerpt
+
+
+def test_extract_highest_signal_excerpt_caps_one_paragraph_from_eating_the_whole_budget():
+    # A long markdown table can rack up a high raw keyword count purely
+    # by row count and would otherwise crowd out every shorter, equally
+    # or more important finding.
+    giant_table = "| Claim | Score |\n|---|---|\n" + (
+        "| some claim | CONTRADICTED error backtest win rate |\n" * 30
+    )
+    short_finding = (
+        "CONTRADICTED: H1 shows a downtrend_structure while the draft claims "
+        "H4 and H1 are aligned uptrends — a real multi-timeframe misread."
+    )
+    text = f"{giant_table}\n\n{short_finding}"
+    excerpt = _extract_highest_signal_excerpt(text, max_chars=1000)
+    assert "downtrend_structure" in excerpt
+
+
+def test_extract_highest_signal_excerpt_falls_back_to_original_order_with_no_markers():
+    text = "First paragraph with no special content at all here today. " * 2
+    text += "\n\nSecond paragraph, also perfectly plain and unremarkable text. " * 2
+    excerpt = _extract_highest_signal_excerpt(text, max_chars=80)
+    assert excerpt == text.split("\n\n")[0][:80]
+
+
+def test_extract_highest_signal_excerpt_respects_max_chars():
+    text = "\n\n".join(f"Paragraph number {i} with some ordinary filler text in it." for i in range(20))
+    excerpt = _extract_highest_signal_excerpt(text, max_chars=150)
+    assert len(excerpt) <= 150
+
+
 def test_build_past_audit_lessons_skips_file_missing_stage_2_section(tmp_path):
     (tmp_path / "portfolio_suggestion_2026-08-09_120000.md").write_text(
         "# No stage sections at all\n", encoding="utf-8"
@@ -1817,6 +2080,47 @@ def test_build_past_outcome_lessons_flags_a_breached_stop(tmp_path):
     )
     result = build_past_outcome_lessons(fetch_current_price=lambda s: 3250.0, records_dir=tmp_path)
     assert "STOP WOULD HAVE BEEN HIT" in result
+
+
+def test_build_past_outcome_lessons_sell_side_stop_hit_is_above_entry(tmp_path):
+    # A SELL's stop sits ABOVE entry; price rising to/through it is the
+    # real breach direction (the inverse of a BUY, whose stop sits below).
+    _write_stage3_record(
+        tmp_path,
+        '{"GOLD-DE26": {"pct": 10, "price": 3400.00, "stop_loss": 3450.00, "side": "sell"}, "CASH": 90}',
+    )
+    result = build_past_outcome_lessons(fetch_current_price=lambda s: 3460.0, records_dir=tmp_path)
+    assert "STOP WOULD HAVE BEEN HIT" in result
+
+
+def test_build_past_outcome_lessons_sell_side_stop_not_hit_when_price_drops(tmp_path):
+    _write_stage3_record(
+        tmp_path,
+        '{"GOLD-DE26": {"pct": 10, "price": 3400.00, "stop_loss": 3450.00, "side": "sell"}, "CASH": 90}',
+    )
+    result = build_past_outcome_lessons(fetch_current_price=lambda s: 3366.0, records_dir=tmp_path)
+    assert "stop not hit" in result
+    assert "STOP WOULD HAVE BEEN HIT" not in result
+
+
+def test_build_past_outcome_lessons_sell_side_pct_change_reported_in_trades_favor(tmp_path):
+    # Price DROPPING is a WIN for a sell — the reported % must be positive
+    # (in the trade's favor), not the raw signed (current-entry)/entry.
+    _write_stage3_record(
+        tmp_path,
+        '{"GOLD-DE26": {"pct": 10, "price": 3400.00, "stop_loss": 3450.00, "side": "sell"}, "CASH": 90}',
+    )
+    result = build_past_outcome_lessons(fetch_current_price=lambda s: 3366.0, records_dir=tmp_path)
+    assert "+1.0%" in result
+    assert "SELL" in result
+
+
+def test_build_past_outcome_lessons_labels_buy_side_explicitly(tmp_path):
+    _write_stage3_record(
+        tmp_path, '{"GOLD-DE26": {"pct": 10, "price": 3400.00, "stop_loss": 3300.00}, "CASH": 90}'
+    )
+    result = build_past_outcome_lessons(fetch_current_price=lambda s: 3434.0, records_dir=tmp_path)
+    assert "BUY" in result
 
 
 def test_build_past_outcome_lessons_skips_cash_and_symbols_missing_price_or_stop(tmp_path):
@@ -2175,6 +2479,17 @@ def test_build_stage2_instruction_audit_unavailable_requires_disclosure_and_self
     lowered = build_stage2_instruction(False).lower()
     assert "independent audit" in lowered and "not available this run" in lowered
     assert "executive summary" in lowered  # disclosed within the report's own section now
+
+
+def test_build_stage2_instruction_requires_reconciling_data_backed_objections():
+    # Mirrors ai/ftmo_suggest.py's own copy of this requirement — a
+    # backtest win-rate or a live trend-classification disagreement is a
+    # checkable fact, not a subjective judgment call the model-size
+    # weighting above is allowed to discount into silence.
+    text = build_stage2_instruction(True)
+    assert "NOT OPTIONAL TO WEIGH AWAY" in text
+    assert "backtest" in text.lower()
+    assert "is required, not merely internal process" in text
 
 
 def test_build_stage1_and_stage2_share_failure_mode_checklist():

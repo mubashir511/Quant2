@@ -3,6 +3,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from analysis.technical import compute_atr
+
 # Fractal swing-point definition: a bar is a swing high/low if its own
 # High/Low is the STRICT, UNIQUE extreme among itself and `window` bars on
 # each side (a "5-bar fractal" at the default window=2). Strict+unique
@@ -29,6 +31,40 @@ FIB_RATIOS = (0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0)
 # (a genuine re-test, not "roughly the same area").
 SR_CLUSTER_TOLERANCE_PCT = 0.3
 SR_MAX_LEVELS_PER_SIDE = 3
+
+# ATR-scaled S/R clustering tolerance — added 2026-09-09, real weakness
+# found on independent user review: SR_CLUSTER_TOLERANCE_PCT above is ONE
+# flat number applied identically to a slow FX pair (H1 atr_pct typically
+# 0.03-0.20%, see analysis.technical.VELOCITY_FAST_THRESHOLD_PCT's own
+# real comparison) and a genuinely fast mover (metals/equities/crypto,
+# 0.3-1.5%+/hour). On a fast instrument, two swing points that are really
+# the SAME re-test of one real level can sit further apart in raw %
+# terms than 0.3%, so the flat tolerance silently SPLITS one real
+# liquidity zone into several separate low-touch "levels" instead of
+# correctly recognizing them as repeated tests of the same zone —
+# understating exactly the kind of level a pullback entry should be
+# targeting. Scaling the tolerance by THIS window's own ATR%, floored at
+# the original flat value (never TIGHTER than before — a slow FX pair's
+# behavior is unchanged), fixes this without touching slow-instrument
+# behavior at all. A principled first cut, not yet validated across many
+# more days/instruments — same "ship a value, then recalibrate against
+# real data" process analysis.technical.VELOCITY_FAST_THRESHOLD_PCT went
+# through before this one.
+SR_TOLERANCE_ATR_MULTIPLE = 0.5
+
+# "Equal highs/lows" liquidity-pool tag — added 2026-09-09, direct user
+# request to distinguish a real, tight cluster of near-identical swing
+# points (the textbook signature of an obvious resting-stop/pending-order
+# concentration: multiple traders' own stops or entries sit just beyond
+# the same visible double-top/bottom) from a broader structural zone that
+# merely has several touches spread across the wider ATR-scaled tolerance
+# above. Expressed as a FRACTION of whatever tolerance is actually in use
+# for a given window (not a second flat %) so it stays "tight relative to
+# THIS instrument's own zone width" on both a slow FX pair and a fast
+# mover, rather than reintroducing the exact one-flat-number problem this
+# file just fixed for the broader tolerance.
+SR_LIQUIDITY_POOL_TOLERANCE_FRACTION = 0.35
+SR_LIQUIDITY_POOL_MIN_TOUCHES = 2
 
 TRENDLINE_MIN_POINTS = 3
 # A trendline's slope, projected across the whole lookback window, that
@@ -95,6 +131,17 @@ class FibonacciLevels:
     nearest_level_name: str
     nearest_level_price: float
     distance_to_nearest_pct: float  # (current_price - nearest_level_price) / current_price * 100
+    # How many bars back (from the window's own last bar) each swing
+    # extreme sits — added 2026-09-04 for ai/chart_overlay.py, which
+    # needs REAL time anchors to draw a native MT5 OBJ_FIBO tool
+    # correctly rather than guessing; every existing field above is a
+    # price only, with no notion of WHEN either extreme occurred.
+    # Defaulted to 0 so every caller that already constructs this
+    # dataclass without knowing about bar timing (including this
+    # project's own test fixtures) keeps working unchanged — only
+    # compute_fibonacci_levels itself sets real values.
+    swing_high_bars_ago: int = 0
+    swing_low_bars_ago: int = 0
 
 
 def compute_fibonacci_levels(
@@ -154,6 +201,7 @@ def compute_fibonacci_levels(
     nearest_name = min(levels, key=lambda name: abs(current_price - levels[name]))
     nearest_price = levels[nearest_name]
 
+    last_bar_index = len(window) - 1
     return FibonacciLevels(
         swing_high=recent_high.price,
         swing_low=recent_low.price,
@@ -163,6 +211,8 @@ def compute_fibonacci_levels(
         nearest_level_name=nearest_name,
         nearest_level_price=nearest_price,
         distance_to_nearest_pct=(current_price - nearest_price) / current_price * 100 if current_price else 0.0,
+        swing_high_bars_ago=last_bar_index - recent_high.index,
+        swing_low_bars_ago=last_bar_index - recent_low.index,
     )
 
 
@@ -198,17 +248,60 @@ def _cluster_prices(prices: list[float], tolerance_pct: float) -> list[tuple[flo
     return [(sum(c) / len(c), len(c)) for c in clusters]
 
 
+def atr_scaled_sr_tolerance(window: pd.DataFrame, floor_pct: float = SR_CLUSTER_TOLERANCE_PCT) -> float:
+    """The real S/R clustering tolerance to use for THIS window — see
+    SR_TOLERANCE_ATR_MULTIPLE's own module-level comment for the full
+    reasoning. max(floor_pct, SR_TOLERANCE_ATR_MULTIPLE * this window's
+    own atr_pct): never tighter than the original flat convention, only
+    ever wider for an instrument whose own bar-to-bar range genuinely
+    justifies it. Falls back to floor_pct outright when ATR isn't
+    computable (not enough rows, or no High/Low/Close columns) — same
+    "never fabricate a stat from missing data" rule as every other
+    ATR-derived read in this codebase (analysis.technical.compute_atr,
+    ai.curiosity._velocity_tier_for)."""
+    atr = compute_atr(window)
+    if atr is None or window.empty or "Close" not in window.columns:
+        return floor_pct
+    current_price = float(window["Close"].iloc[-1])
+    if not current_price:
+        return floor_pct
+    atr_pct = atr / current_price * 100
+    return max(floor_pct, SR_TOLERANCE_ATR_MULTIPLE * atr_pct)
+
+
 @dataclass
 class SRLevel:
     price: float
     touches: int  # how many real swing points clustered into this level — a real strength measure, not assumed
     distance_pct: float  # (level - current_price) / current_price * 100 — positive above price, negative below
+    # Added 2026-09-09 — see SR_LIQUIDITY_POOL_TOLERANCE_FRACTION's own
+    # module-level comment. True when a genuinely TIGHT sub-cluster of
+    # SR_LIQUIDITY_POOL_MIN_TOUCHES+ swing points sits within this level's
+    # own zone — a real equal-highs/equal-lows signature, distinct from
+    # (and stronger evidence than) the broader `touches` count alone.
+    # Default False so any existing direct SRLevel(...) construction
+    # elsewhere (including this project's own tests) keeps working
+    # unchanged.
+    is_liquidity_pool: bool = False
 
 
 @dataclass
 class SRLevelsResult:
     resistance_levels: list[SRLevel]  # above current price, strongest (most touches) first
     support_levels: list[SRLevel]  # below current price, strongest first
+    # The REAL tolerance_pct actually used to cluster these levels — added
+    # 2026-09-09, real gap found on independent audit: compute_chart_
+    # structure() passes an ATR-scaled tolerance (see atr_scaled_sr_
+    # tolerance) that can be several times wider than the flat
+    # SR_CLUSTER_TOLERANCE_PCT default for a fast mover, but nothing
+    # previously told a consumer what value was actually used — ai/
+    # chart_overlay.py was found hardcoding the flat module constant when
+    # exporting each level's own zone-width to the real MT5 terminal
+    # overlay, silently showing a NARROWER zone than what Python actually
+    # computed. Defaults to the flat constant so any existing direct
+    # SRLevelsResult(...) construction (including this project's own
+    # tests) keeps working unchanged.
+    tolerance_pct: float = SR_CLUSTER_TOLERANCE_PCT
 
 
 def compute_sr_levels(
@@ -217,6 +310,7 @@ def compute_sr_levels(
     tolerance_pct: float = SR_CLUSTER_TOLERANCE_PCT,
     max_levels: int = SR_MAX_LEVELS_PER_SIDE,
     swing_points: tuple[list[SwingPoint], list[SwingPoint]] | None = None,
+    liquidity_pool_tolerance_pct: float | None = None,
 ) -> SRLevelsResult | None:
     """Multi-level support/resistance from real swing-point clustering —
     a genuinely different, richer read than analysis/technical.py's own
@@ -228,7 +322,14 @@ def compute_sr_levels(
     that's been in a pure straight line with no real pivots).
 
     `swing_points`, if given, is reused instead of recomputed — see
-    compute_fibonacci_levels' own docstring for the full rationale."""
+    compute_fibonacci_levels' own docstring for the full rationale.
+
+    `liquidity_pool_tolerance_pct` (added 2026-09-09, defaults to
+    `tolerance_pct * SR_LIQUIDITY_POOL_TOLERANCE_FRACTION`) runs a SECOND,
+    tighter clustering pass over the same swing prices to flag each
+    resulting level's own `is_liquidity_pool` — see SRLevel's own field
+    comment and SR_LIQUIDITY_POOL_TOLERANCE_FRACTION's module-level
+    comment for the reasoning."""
     window = _tail_reset(history, lookback)
     if window.empty or "Close" not in window.columns:
         return None
@@ -239,12 +340,25 @@ def compute_sr_levels(
     if not all_prices:
         return None
 
+    if liquidity_pool_tolerance_pct is None:
+        liquidity_pool_tolerance_pct = tolerance_pct * SR_LIQUIDITY_POOL_TOLERANCE_FRACTION
+    tight_clusters = _cluster_prices(all_prices, liquidity_pool_tolerance_pct)
+    liquidity_pool_prices = [price for price, touches in tight_clusters if touches >= SR_LIQUIDITY_POOL_MIN_TOUCHES]
+
+    def _is_liquidity_pool(level_price: float) -> bool:
+        return any(
+            level_price != 0
+            and abs(level_price - pool_price) / level_price * 100 <= liquidity_pool_tolerance_pct
+            for pool_price in liquidity_pool_prices
+        )
+
     clusters = _cluster_prices(all_prices, tolerance_pct)
     levels = [
         SRLevel(
             price=price,
             touches=touches,
             distance_pct=(price - current_price) / current_price * 100 if current_price else 0.0,
+            is_liquidity_pool=_is_liquidity_pool(price),
         )
         for price, touches in clusters
     ]
@@ -258,7 +372,7 @@ def compute_sr_levels(
         key=lambda level: (-level.touches, -level.distance_pct),
     )[:max_levels]
 
-    return SRLevelsResult(resistance_levels=resistance, support_levels=support)
+    return SRLevelsResult(resistance_levels=resistance, support_levels=support, tolerance_pct=tolerance_pct)
 
 
 @dataclass
@@ -558,9 +672,17 @@ def compute_chart_structure(history: pd.DataFrame, lookback: int = STRUCTURE_LOO
 
     window = _tail_reset(history, lookback)
     swing_points = find_swing_points(window)
+    # ATR-scaled, not the flat SR_CLUSTER_TOLERANCE_PCT default — see
+    # SR_TOLERANCE_ATR_MULTIPLE's own module-level comment. Computed once
+    # here and threaded into compute_sr_levels below, same "share one
+    # real computation across this bundling function" discipline this
+    # function already applies to the swing-point scan itself.
+    sr_tolerance_pct = atr_scaled_sr_tolerance(window)
     return ChartStructureSnapshot(
         fibonacci=compute_fibonacci_levels(window, lookback=lookback, swing_points=swing_points),
-        sr_levels=compute_sr_levels(window, lookback=lookback, swing_points=swing_points),
+        sr_levels=compute_sr_levels(
+            window, lookback=lookback, swing_points=swing_points, tolerance_pct=sr_tolerance_pct
+        ),
         trendlines=compute_trendlines(window, lookback=lookback, swing_points=swing_points),
         patterns=(
             detect_chart_patterns(window, lookback=lookback, swing_points=swing_points)

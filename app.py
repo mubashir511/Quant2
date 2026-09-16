@@ -1,6 +1,10 @@
+import logging
+import secrets
+import threading
 import time
-from datetime import datetime, time as dt_time, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 
 import pandas as pd
 import plotly.express as px
@@ -13,32 +17,40 @@ from ai.ftmo_suggest import (
     LONG_TERM_ALIGNMENT_SHORT_MESSAGES,
     FtmoAssetAnalysis,
     analyze_ftmo_asset_live,
-    analyze_ftmo_assets,
-    build_ftmo_summary,
     classify_long_term_alignment,
     fetch_ftmo_status,
     format_ftmo_trade_cost,
-    suggest_ftmo_portfolio,
 )
-from ai.copilot_execution import (
+from ai.clerk_execution import (
     EXECUTION_LOCK_PATH,
     EXECUTION_LOCK_STALE_AFTER_SECONDS,
     execution_check_is_live,
-    next_execution_check_utc,
-    read_copilot_execution_enabled,
-    read_copilot_execution_interval_minutes,
+    read_clerk_execution_enabled,
+    read_clerk_execution_interval_minutes,
     read_execution_progress,
     read_execution_state,
     read_settlement,
     read_tactical_defense_enabled,
-    run_copilot_execution_check,
-    set_copilot_execution_enabled,
-    set_copilot_execution_interval_minutes,
+    run_clerk_execution_check,
+    set_clerk_execution_enabled,
+    set_clerk_execution_interval_minutes,
     set_tactical_defense_enabled,
 )
 from job_lock import acquire_lock, release_lock
 from utils import run_with_timeout
+from ai.researcher import (
+    RESEARCHER_LOCK_PATH,
+    RESEARCHER_LOCK_STALE_AFTER_SECONDS,
+    is_researcher_due,
+    latest_research_report,
+    next_researcher_check_utc,
+    parse_researcher_sentiment,
+    read_researcher_enabled,
+    read_researcher_state,
+    run_researcher_check,
+)
 from ai.mega_analysis import (
+    is_due as mega_analysis_is_due,
     mega_session_is_live,
     next_run_utc,
     read_latest_suggestion,
@@ -46,6 +58,8 @@ from ai.mega_analysis import (
     read_mega_analysis_trigger,
     read_progress,
     read_state,
+    run_mega_analysis,
+    run_scheduled_mega_analysis,
     set_mega_analysis_enabled,
     set_mega_analysis_trigger,
 )
@@ -89,6 +103,8 @@ from risk.apply_suggestion import (
     compute_rebalance_plan,
 )
 from risk.ftmo_rules import DEFAULT_HEADROOM_FRACTION, FtmoStatus, would_breach_daily_loss_headroom
+
+logger = logging.getLogger(__name__)
 
 # A fixed-order categorical palette (validated colorblind-safe adjacent
 # pairs, per this project's dataviz conventions) — used everywhere a
@@ -159,6 +175,50 @@ def _color_pnl(val: float) -> str:
     return f"color: {color}"
 
 
+def _sync_pull_from_file(
+    widget_key: str,
+    last_synced_key: str,
+    file_value,
+    widget_to_comparable=lambda v: v,
+    comparable_to_widget=lambda v: v,
+) -> None:
+    """Cross-device/cross-tab live-sync guardrail (direct user request
+    2026-09-02, after adding remote/mobile access via Tailscale: "add
+    live sync between mobile/PC devices with some guard rails"). This is
+    the READ-side counterpart of the multi-tab write guard already used
+    by every "instant sync to file" control in this app (the mega-
+    analysis trigger-time picker, the Clerk enable/tactical-defense
+    toggles, the Clerk review-interval picker, the mega-analysis enable
+    toggle) — see _render_mega_analysis_countdown's own 2026-08-24
+    comment for that fix's full history: comparing a widget's value
+    against the FILE's CURRENT value (instead of against what THIS
+    session itself last saw) let an idle second tab "helpfully" revert a
+    fresh change made from elsewhere within about a second.
+
+    That fix solved the WRITE side (a stale tab never writes its own
+    stale value back) but left the READ side unsolved: a control seeded
+    from the file only ONCE per session never picks up someone else's
+    later change at all, which is exactly the "my phone's change isn't
+    showing on the PC" report that motivated this function. The
+    guardrail: call this BEFORE the widget is (re-)instantiated each
+    rerun. If THIS session already has a not-yet-written local edit
+    sitting in the widget (its current value differs from what this
+    session last synced), do nothing at all — an active local edit
+    always wins and is never silently overwritten, mirroring the write
+    guard's own priority exactly. Only once there's no pending local
+    edit does a genuine external change (the file has moved since this
+    session's own last sync) get pulled into this session's display.
+    Idempotent — a no-op once already in sync, so it's safe to call on
+    every single tick of a run_every fragment."""
+    last_synced = st.session_state[last_synced_key]
+    raw_widget_value = st.session_state.get(widget_key)
+    if raw_widget_value is not None and widget_to_comparable(raw_widget_value) != last_synced:
+        return  # a local edit is pending this session — the write path below owns it
+    if file_value != last_synced:
+        st.session_state[widget_key] = comparable_to_widget(file_value)
+        st.session_state[last_synced_key] = file_value
+
+
 @st.cache_data(ttl=300)
 def _cached_server_offset_seconds() -> float | None:
     """The MT5 broker's real UTC offset, cached for 5 minutes — this
@@ -170,20 +230,136 @@ def _cached_server_offset_seconds() -> float | None:
     return offset.total_seconds() if offset is not None else None
 
 
+def _format_last_run(iso_str: str | None) -> str:
+    """Human-readable "last run"/"last check" timestamp for the Mega
+    Analysis and Execution Clerk status captions — direct user request
+    2026-08-30 ("current mechanical formate is not understandable"):
+    these previously interpolated the raw stored ISO string (e.g.
+    "2026-08-30T12:08:43.291205+00:00 UTC") straight into the caption.
+    Renders this machine's own local time (what the user actually reads
+    off their clock, same convention as _render_mega_analysis_countdown's
+    "Scheduled for (local)" metric above) plus a relative "X ago"
+    qualifier, since "how long ago did this run" is usually the more
+    useful read at a glance than the exact clock instant. Falls back to
+    the raw string on anything unparseable rather than hiding a genuine
+    value."""
+    if not iso_str:
+        return "never"
+    try:
+        dt = datetime.fromisoformat(iso_str)
+    except ValueError:
+        return iso_str
+    now = datetime.now(timezone.utc) if dt.tzinfo else datetime.now()
+    elapsed_seconds = max(0, int((now - dt).total_seconds()))
+    if elapsed_seconds < 60:
+        relative = "just now"
+    elif elapsed_seconds < 3600:
+        relative = f"{elapsed_seconds // 60} min ago"
+    elif elapsed_seconds < 86400:
+        relative = f"{elapsed_seconds // 3600} hr ago"
+    else:
+        relative = f"{elapsed_seconds // 86400} day(s) ago"
+    local_str = dt.astimezone().strftime("%b %d, %I:%M %p").replace(" 0", " ")
+    return f"{local_str} ({relative})"
+
+
+# Repo-root lock path, matching mega_analysis_job.py's own literal
+# constant exactly (Path(__file__).resolve().parent — app.py lives in
+# the same repo root) — so this in-app auto-trigger and that standalone
+# Scheduled Task (if one is ever configured again on this machine) can
+# never run the same mega analysis concurrently; whichever gets there
+# first holds the real, cross-process, PID-liveness-aware lock.
+_MEGA_ANALYSIS_LOCK_PATH = Path(__file__).resolve().parent / "mega_analysis.lock"
+_MEGA_ANALYSIS_LOCK_STALE_AFTER_SECONDS = 90 * 60
+
+
+def _fire_scheduled_job_once(fn: Callable[[], None], state: dict, lock_path: Path, lock_stale_seconds: float) -> None:
+    """Fires fn() in a genuine background thread — never blocks the
+    calling Streamlit fragment. Direct user report 2026-08-30/31: the
+    Clerk section was "fading and staying stale" after its own countdown
+    reached zero — root cause was this exact call running SYNCHRONOUSLY
+    inside the run_every fragment, blocking that fragment's own script-
+    execution thread for however long a real MT5+local-LLM check takes
+    (theoretically up to CLERK_EXECUTION_RUN_TIMEOUT_SECONDS, 25 minutes)
+    — long enough to desync the browser's own auto-rerun timer for that
+    fragment, which then never visibly recovered even after the call
+    itself finished successfully. Backgrounding it here means the
+    fragment returns almost immediately every tick regardless of how
+    long fn() takes; the existing progress-file mechanism (read_execution
+    _progress/read_progress, already polled every tick) is what shows
+    live status without blocking, exactly like it already does for a
+    check triggered by a genuinely separate OS process.
+
+    `state` (a plain dict backed by an @st.cache_resource — process-
+    lifetime, shared across every open tab, NOT st.session_state) tracks
+    whether THIS process already has a thread in flight for this
+    specific job, so a fragment tick landing while the previous run is
+    still going doesn't spawn a redundant second thread. `lock_path`/
+    `lock_stale_seconds` is the SAME cross-process PID-liveness lock
+    (job_lock.py) the standalone *_job.py scripts and the manual buttons
+    already use — this can never race a real Scheduled Task run or
+    another browser tab's own trigger for the same job."""
+    existing_thread = state.get("thread")
+    if existing_thread is not None and existing_thread.is_alive():
+        return
+    if not acquire_lock(lock_path, lock_stale_seconds):
+        return
+
+    def _worker() -> None:
+        try:
+            fn()
+        except Exception:
+            logger.exception("Background scheduled run failed")
+        finally:
+            release_lock(lock_path)
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    state["thread"] = thread
+    thread.start()
+
+
+@st.cache_resource
+def _mega_analysis_timer_state() -> dict:
+    """Process-lifetime holder tracking whether an in-app-triggered mega
+    analysis background thread is currently in flight — see
+    _fire_scheduled_job_once's own docstring for why this is
+    st.cache_resource rather than st.session_state. Unlike the Clerk's
+    own _clerk_timer_state(), this doesn't need a next_check_utc: mega
+    analysis's own due-check (ai.mega_analysis.is_due/next_run_utc) is
+    already derived entirely from real persisted state and the clock,
+    not from a marker only a live poll would ever advance — see this
+    module's own docstring for the real 2026-08-22 incident that shaped
+    that design."""
+    return {"thread": None}
+
+
 def _render_mega_analysis_countdown() -> None:
     """FTMO-only: shows the countdown to the next unattended daily "mega
     market analysis" (Claude Sonnet + the full audit pool — Copilot is
     deliberately excluded from FTMO's audit pool entirely now, not just
     here, see ai.ftmo_suggest.suggest_ftmo_portfolio's own docstring for
-    why — triggered by the Quant2MegaAnalysis Windows Scheduled Task —
-    see mega_analysis_job.py — independent of whether this page is even
-    open). Scheduling itself is anchored to plain UTC (see
-    ai.mega_analysis's own docstrings for why local-time scheduling would
-    silently drift across DST); this widget just converts that UTC
-    instant to both this machine's local time (astimezone(), correctly
-    DST-aware) and the broker's own server time (from a live tick,
-    best-effort) purely for display, per the user's explicit request to
-    stay aware of both clocks alongside UTC.
+    why). Originally triggered ONLY by the Quant2MegaAnalysis Windows
+    Scheduled Task (see mega_analysis_job.py) — but with no such task
+    configured on this machine (direct user choice earlier this session:
+    webapp-only, no independent scheduled tasks), that trigger simply
+    never fired, and this countdown just silently reset to tomorrow every
+    time it reached zero with nothing actually having run (direct user
+    report 2026-08-30/31: "the mega session again did not run today just
+    counter restart"). This fragment now fires run_scheduled_mega_
+    analysis() itself, in the background (see _fire_scheduled_job_once),
+    whenever read_mega_analysis_enabled() is on and ai.mega_analysis.
+    is_due() says today's window is open — so the countdown genuinely
+    drives a real run now, for as long as this app process stays
+    running, matching the Windows-Scheduled-Task version's own trigger
+    conditions exactly (same is_due/grace-window logic, same lock file)
+    rather than a parallel, independently-drifting copy of them.
+    Scheduling itself is anchored to plain UTC (see ai.mega_analysis's
+    own docstrings for why local-time scheduling would silently drift
+    across DST); this widget just converts that UTC instant to both this
+    machine's local time (astimezone(), correctly DST-aware) and the
+    broker's own server time (from a live tick, best-effort) purely for
+    display, per the user's explicit request to stay aware of both
+    clocks alongside UTC.
 
     The run's own LIVE step-by-step progress log (see
     ai.mega_analysis::_write_step/_write_current_activity) is rendered separately, by
@@ -197,20 +373,43 @@ def _render_mega_analysis_countdown() -> None:
     just the latest entry — see that function's own docstring."""
     now_utc = datetime.now(timezone.utc)
     state = read_state()
+    mega_enabled = read_mega_analysis_enabled()
+
+    # Real retry-storm bug found live 2026-08-31: is_due() only clears
+    # once a run reaches status="success" (see ai.mega_analysis._write_
+    # state's own docstring/comment) — a genuinely persistent failure
+    # (that day: the `claude` CLI unreachable from this process) was
+    # retried on nearly every single 1-second tick for the rest of the
+    # grace window, each attempt doing a real MT5-connect-and-analyze
+    # cycle, which is what actually produced "status messages dancing"/
+    # a sluggish page, not a hang. is_due()'s own OS-level-poll design
+    # assumed several MINUTES between attempts; this cooldown restores
+    # that natural spacing for the in-app 1-second-tick trigger without
+    # touching is_due()'s own semantics.
+    last_attempt_str = state.get("last_attempt_utc")
+    cooldown_elapsed = True
+    if last_attempt_str:
+        try:
+            last_attempt_dt = datetime.fromisoformat(last_attempt_str)
+            cooldown_elapsed = (
+                (now_utc - last_attempt_dt).total_seconds()
+                >= config.MEGA_ANALYSIS_RETRY_COOLDOWN_MINUTES * 60
+            )
+        except ValueError:
+            cooldown_elapsed = True
+
+    if mega_enabled and mega_analysis_is_due(now_utc, state=state) and cooldown_elapsed:
+        _fire_scheduled_job_once(
+            run_scheduled_mega_analysis,
+            _mega_analysis_timer_state(),
+            _MEGA_ANALYSIS_LOCK_PATH,
+            _MEGA_ANALYSIS_LOCK_STALE_AFTER_SECONDS,
+        )
+
     target = next_run_utc(now_utc, state=state)
     remaining_seconds = max(0, int((target - now_utc).total_seconds()))
     hours, rem = divmod(remaining_seconds, 3600)
     minutes, seconds = divmod(rem, 60)
-
-    broker_str = "unavailable (no live MT5 tick)"
-    if not config.USE_MOCK_DATA:
-        try:
-            offset_seconds = _cached_server_offset_seconds()
-        except MT5ConnectionError:
-            offset_seconds = None
-        if offset_seconds is not None:
-            broker_time = target + pd.Timedelta(seconds=offset_seconds)
-            broker_str = broker_time.strftime("%Y-%m-%d %H:%M") + " broker server time"
 
     # No own border here (direct user request 2026-08-23: merge this
     # visually with the manual "Suggest Portfolio Mix" controls into one
@@ -225,16 +424,46 @@ def _render_mega_analysis_countdown() -> None:
     # stale the moment either one is actually changed.
     st.caption(
         f"Unattended daily FTMO run, reviewed by up to {len(AUDIT_MODELS)} audit models "
-        "before it's finalized. Copilot handles execution separately, checking every "
-        f"{config.COPILOT_EXECUTION_CHECK_INTERVAL_MINUTES} min (see below)."
+        "before it's finalized. The Clerk handles execution separately, checking every "
+        f"{config.CLERK_EXECUTION_CHECK_INTERVAL_MINUTES} min (see below)."
     )
-    col1, col2 = st.columns(2)
-    col1.metric("Time remaining", f"{hours}h {minutes:02d}m {seconds:02d}s")
-    col2.metric(
-        "Scheduled for (local)",
-        target.astimezone().strftime("%Y-%m-%d %H:%M %Z"),
-    )
-    st.caption(f"Same instant in UTC: {target.strftime('%Y-%m-%d %H:%M')} · {broker_str}")
+    if not mega_enabled:
+        # Direct user report 2026-09-05: this countdown used to render
+        # UNCONDITIONALLY regardless of the toggle just above — so with
+        # automated analysis switched off (the ONLY state that makes the
+        # manual "Suggest Portfolio Mix" button clickable at all, see its
+        # own disabled= condition), the metric still displayed a live,
+        # ticking "Time remaining" as if a real automated run were
+        # imminent, when that path is actually completely inert while
+        # disabled. A manual click was what genuinely ran — a totally
+        # separate, on-demand mechanism this countdown has no connection
+        # to — but seeing "2m 30s remaining" tick down right next to it
+        # made the manual run look like it had fired FROM this countdown,
+        # early. Showing a plain "inactive" message instead of a number
+        # makes that impossible to misread.
+        st.info(
+            ":material/pause_circle: Automated daily analysis is currently OFF — this "
+            "countdown is inactive and nothing will fire from it. Use \"Suggest Portfolio "
+            "Mix\" below to run it manually, or toggle automated analysis back on above."
+        )
+    else:
+        broker_str = "unavailable (no live MT5 tick)"
+        if not config.USE_MOCK_DATA:
+            try:
+                offset_seconds = _cached_server_offset_seconds()
+            except MT5ConnectionError:
+                offset_seconds = None
+            if offset_seconds is not None:
+                broker_time = target + pd.Timedelta(seconds=offset_seconds)
+                broker_str = broker_time.strftime("%Y-%m-%d %H:%M") + " broker server time"
+
+        col1, col2 = st.columns(2)
+        col1.metric("Time remaining", f"{hours}h {minutes:02d}m {seconds:02d}s")
+        col2.metric(
+            "Scheduled for (local)",
+            target.astimezone().strftime("%Y-%m-%d %H:%M %Z"),
+        )
+        st.caption(f"Same instant in UTC: {target.strftime('%Y-%m-%d %H:%M')} · {broker_str}")
 
     # Direct user request 2026-08-23: let the user change the daily
     # trigger time from the UI instead of only via the
@@ -258,9 +487,22 @@ def _render_mega_analysis_countdown() -> None:
     # when its OWN widget value changed relative to what IT last knew,
     # never merely because the file diverged from under it.
     _trigger_hour, _trigger_minute = read_mega_analysis_trigger()
+    _file_trigger_pair = (_trigger_hour, _trigger_minute)
     if "mega_analysis_trigger_time" not in st.session_state:
         st.session_state["mega_analysis_trigger_time"] = dt_time(_trigger_hour, _trigger_minute)
-        st.session_state["_mega_analysis_trigger_last_synced"] = (_trigger_hour, _trigger_minute)
+        st.session_state["_mega_analysis_trigger_last_synced"] = _file_trigger_pair
+    else:
+        # Live cross-device sync (this fragment already ticks every
+        # second) — pulls a change made from another tab/device into
+        # THIS session's own display, but only when nothing typed here
+        # is still pending; see _sync_pull_from_file's own docstring.
+        _sync_pull_from_file(
+            "mega_analysis_trigger_time",
+            "_mega_analysis_trigger_last_synced",
+            _file_trigger_pair,
+            widget_to_comparable=lambda t: (t.hour, t.minute),
+            comparable_to_widget=lambda pair: dt_time(*pair),
+        )
     _new_trigger_time = st.time_input(
         "Change daily trigger time (UTC)", key="mega_analysis_trigger_time", step=300
     )
@@ -275,15 +517,51 @@ def _render_mega_analysis_countdown() -> None:
     # alert box (direct user request 2026-08-23: shrink this and squeeze
     # the gap before the manual controls below it).
     if last_status == "success" and last_attempt:
-        st.caption(f":green[✓ Last run ({last_attempt} UTC): succeeded.]")
+        st.caption(f":green[✓ Last run ({_format_last_run(last_attempt)}): succeeded.]")
     elif last_status in ("error", "cli_failed", "timeout") and last_attempt:
         st.caption(
-            f":orange[⚠ Last attempt ({last_attempt} UTC) did NOT succeed: "
+            f":orange[⚠ Last attempt ({_format_last_run(last_attempt)}) did NOT succeed: "
             f"{state.get('last_detail', '(no detail recorded)')}]"
         )
 
 
 _render_mega_analysis_countdown = st.fragment(run_every=1)(_render_mega_analysis_countdown)
+
+
+def _watch_for_external_mega_toggle_change() -> None:
+    """Cross-device live-sync guardrail for the mega-analysis enable
+    toggle specifically (direct user request 2026-09-02: "add live
+    sync... with some guard rails"). Every OTHER synced control in this
+    app already lives inside its own run_every fragment, so a plain
+    _sync_pull_from_file call on each tick is enough — but THIS toggle
+    was deliberately kept in the OUTER, non-fragment script (see its own
+    call site's comment) so a local click updates the "Suggest Portfolio
+    Mix" button's disabled= in the very same instant, which a fragment-
+    scoped rerun can't do. That means nothing periodically reruns the
+    outer script here on its own, so an external change (another
+    device's toggle) would otherwise only ever show up the next time
+    THIS tab happens to rerun for some unrelated reason.
+
+    This tiny fragment's only job is noticing that gap and closing it:
+    every couple of seconds, if this session has no pending local edit
+    of its own AND the file has moved since this session's last sync,
+    force a full st.rerun() (the default scope="app", not "fragment" —
+    confirmed against the installed Streamlit version) so the outer
+    script reruns and its own _sync_pull_from_file call (right where the
+    toggle is rendered) picks up the fresh value together with the
+    button it drives. This function itself never writes the toggle's
+    value anywhere — it only ever triggers the rerun that lets the
+    outer script's own existing logic do that safely."""
+    if "mega_analysis_enabled_toggle" not in st.session_state:
+        return  # outer script hasn't rendered the toggle yet this session
+    last_synced = st.session_state["_mega_analysis_enabled_last_synced"]
+    if st.session_state["mega_analysis_enabled_toggle"] != last_synced:
+        return  # a local edit is pending — the outer script's own write path owns it
+    if read_mega_analysis_enabled() != last_synced:
+        st.rerun()
+
+
+_watch_for_external_mega_toggle_change = st.fragment(run_every=2)(_watch_for_external_mega_toggle_change)
 
 
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -362,13 +640,56 @@ def _render_mega_analysis_progress_log() -> None:
 _render_mega_analysis_progress_log = st.fragment(run_every=1)(_render_mega_analysis_progress_log)
 
 
-def _render_copilot_execution_panel() -> None:
+@st.cache_resource
+def _clerk_timer_state() -> dict:
+    """Mutable holder for the Clerk's in-app periodic-check countdown —
+    deliberately NOT st.session_state (2026-08-30 direct user correction:
+    a plain browser page refresh opens a brand-new Streamlit session
+    with fresh session_state, which was silently resetting the countdown
+    on every refresh — a real bug, not a rendering quirk) and deliberately
+    NOT a JSON file either (a real app restart SHOULD reset this, per
+    that same correction: "only... on full app reset or restart or from
+    the enable/disable toggle switch"). st.cache_resource is the one
+    primitive that's actually shaped for this: its factory (this
+    function) runs exactly once per PROCESS, and the same returned dict
+    is handed to every session/tab that calls it afterward — so a page
+    refresh (new session, same process) sees the SAME dict and the
+    countdown keeps going, while a real restart (new process) re-runs
+    this factory and starts fresh, and the toggle's own handler below
+    still resets it explicitly on enable/disable."""
+    return {"next_check_utc": None}
+
+
+def _run_clerk_check_with_timeout() -> None:
+    """The actual work _fire_scheduled_job_once runs on a background
+    thread for the Clerk's in-app periodic trigger. Unlike
+    run_scheduled_mega_analysis (which already wraps its own call in
+    run_with_timeout internally), run_clerk_execution_check does NOT
+    self-bound its own runtime — every other caller (the manual button,
+    clerk_execution_job.py) wraps it in run_with_timeout itself, so this
+    does too, just from the background thread now instead of the
+    fragment's own thread."""
+    timed_out = object()
+    result = run_with_timeout(
+        run_clerk_execution_check,
+        config.CLERK_EXECUTION_RUN_TIMEOUT_SECONDS,
+        default=timed_out,
+        catch_exceptions=False,
+    )
+    if result is timed_out:
+        logger.error(
+            "Periodic Clerk check timed out after %.0f minutes",
+            config.CLERK_EXECUTION_RUN_TIMEOUT_SECONDS / 60,
+        )
+
+
+def _render_clerk_execution_panel() -> None:
     """FTMO-only: shows the mega session's own Immediate Allocation AND
     Pending Setups (the "clerk/executioner" half of the boardroom
-    architecture — see ai/copilot_execution.py's own module docstring),
+    architecture — see ai/clerk_execution.py's own module docstring),
     each with its real status (placed/failed-with-reason for immediate
     targets; unchecked/order placed/filled/closed-after-fill plus
-    Copilot's own reasoning text for Pending Setups), and a live-progress
+    the Clerk's own reasoning text for Pending Setups), and a live-progress
     banner while a check is actually running — same standing "automated
     runs must be as visible as a manual button click" principle as
     _render_mega_analysis_countdown above, applied to this second
@@ -376,26 +697,62 @@ def _render_copilot_execution_panel() -> None:
     direct user request ("I see position in 5 assets but only 2 assets
     are showing up in the clerk section") — this panel previously only
     ever rendered pending_setups, never the immediate_allocation targets
-    ai.copilot_execution.run_copilot_execution_check actually tries to
+    ai.clerk_execution.run_clerk_execution_check actually tries to
     execute every poll, so a FAILED attempt (no settlement record ever
     gets created for those) was invisible here even though it was
     already in the log file. Also has its own enable/disable toggle, a
     "next review" timer, and a review-frequency picker (direct user
     request 2026-08-23) — all three widgets live inside this same
-    st.fragment(run_every=5), which is safe here (unlike the mega
+    st.fragment(run_every=1), which is safe here (unlike the mega
     analysis toggle) since nothing OUTSIDE this fragment needs to react
-    to them; the whole panel simply redraws itself on its own next tick."""
+    to them; the whole panel simply redraws itself on its own next tick.
+
+    2026-08-30: the "next review" timer stopped being purely decorative
+    — this fragment now actually calls run_clerk_execution_check() when
+    its own countdown (_clerk_timer_state(), process-lifetime, shared
+    across every open tab — see that function's own docstring for why
+    it's not st.session_state) reaches zero and the toggle above is on,
+    so the Clerk genuinely re-checks on the configured cadence for as
+    long as the app process is running, not only when a mega session
+    happens to trigger it inline. Ticking at 1s (not 5s) to read as a
+    live countdown the same way the mega-analysis countdown above does
+    — direct user comparison."""
     suggestion = read_latest_suggestion()
     pending_setups = suggestion.get("pending_setups", [])
 
     now_utc = datetime.now(timezone.utc)
     exec_state = read_execution_state()
+    # Content-change fingerprint for the two tables below (direct user
+    # complaint 2026-09-02: this whole panel — including its tables —
+    # visually "jerks" on every single 1-second tick, since Streamlit
+    # just replaces the dataframe wholesale each time regardless of
+    # whether anything in it actually changed). Only advances when a
+    # NEW mega session was generated or a NEW Clerk check genuinely
+    # completed — not on every tick — so giving each table a key derived
+    # from it (see below) makes Streamlit only remount that table when
+    # there's real new content to show, which is what lets the CSS fade
+    # animation replay meaningfully instead of playing every second
+    # regardless of whether anything changed (same proven technique
+    # already used for the Watchlist's own up/down price-pulse
+    # animation — see that CSS block's own key-generation comment).
+    _clerk_content_gen = f"{suggestion.get('generated_utc', '')}_{exec_state.get('last_attempt_utc', '')}"
     exec_progress = read_execution_progress()
     live_message = None
     if execution_check_is_live(exec_progress, exec_state):
         live_message = exec_progress.get("message")
+    # Direct user request 2026-08-31, after a real live incident: starting
+    # a mega session while the Clerk's own periodic trigger could also
+    # fire froze the entire Streamlit session (not just this panel) —
+    # root-caused to concurrent MT5 access from the two background
+    # threads (now independently prevented at the source by data.
+    # mt5_source's own MT5_ACCESS_LOCK). Pausing the Clerk's countdown
+    # while a mega session is live is a second, deliberate layer on top
+    # of that lock, not a duplicate fix for the same bug — the user's
+    # own reasoning: don't spend local-LLM/CPU capacity on Clerk checks
+    # at the same moment the heavier mega session already needs it.
+    mega_session_live = mega_session_is_live(read_progress(), read_state())
 
-    with st.container(border=True):
+    with st.container(border=True, key="clerk_execution_panel"):
         heading_col, toggle_col, tactical_toggle_col = st.columns([3, 1, 1.3])
         with heading_col:
             st.subheader(":material/support_agent: Execution Clerk")
@@ -406,20 +763,37 @@ def _render_copilot_execution_panel() -> None:
             # a second, stale tab would otherwise flip this back within
             # seconds of a real change made elsewhere. Compare against
             # this session's own last-synced value, never the file's.
-            if "copilot_execution_enabled_toggle" not in st.session_state:
-                st.session_state["copilot_execution_enabled_toggle"] = read_copilot_execution_enabled()
-                st.session_state["_copilot_execution_enabled_last_synced"] = (
-                    st.session_state["copilot_execution_enabled_toggle"]
+            if "clerk_execution_enabled_toggle" not in st.session_state:
+                st.session_state["clerk_execution_enabled_toggle"] = read_clerk_execution_enabled()
+                st.session_state["_clerk_execution_enabled_last_synced"] = (
+                    st.session_state["clerk_execution_enabled_toggle"]
                 )
-            copilot_enabled = st.toggle("Enabled", key="copilot_execution_enabled_toggle")
-            if copilot_enabled != st.session_state["_copilot_execution_enabled_last_synced"]:
-                set_copilot_execution_enabled(copilot_enabled)
-                st.session_state["_copilot_execution_enabled_last_synced"] = copilot_enabled
+            else:
+                # Live cross-device sync — this whole panel already
+                # ticks every second and nothing outside it depends on
+                # this toggle, so a plain pull-on-tick is enough (no
+                # st.rerun() needed, unlike the mega-analysis toggle).
+                _sync_pull_from_file(
+                    "clerk_execution_enabled_toggle",
+                    "_clerk_execution_enabled_last_synced",
+                    read_clerk_execution_enabled(),
+                )
+            clerk_enabled = st.toggle("Enabled", key="clerk_execution_enabled_toggle")
+            if clerk_enabled != st.session_state["_clerk_execution_enabled_last_synced"]:
+                set_clerk_execution_enabled(clerk_enabled)
+                st.session_state["_clerk_execution_enabled_last_synced"] = clerk_enabled
+                # Direct user request 2026-08-30: re-enabling restarts the
+                # "Next review" countdown fresh from this moment, rather
+                # than resuming some stale reference from before it was
+                # switched off — the reset below (which also runs every
+                # tick while disabled) already guarantees this, this is
+                # just the immediate case of flipping it on right now.
+                _clerk_timer_state()["next_check_utc"] = None
         with tactical_toggle_col:
             # New, separately-staged authority (added 2026-08-27, direct
             # user request after a real gold position went from +$28 to
             # -$61 while the mega session hadn't run in days and the
-            # clerk had zero authority to react — see ai/copilot_
+            # clerk had zero authority to react — see ai/clerk_
             # execution.py's own docstring). Defaults OFF, unlike the
             # toggle above — this is fresh unattended authority over real
             # money, not yet proven live; the full pipeline still runs
@@ -430,6 +804,13 @@ def _render_copilot_execution_panel() -> None:
                 st.session_state["tactical_defense_enabled_toggle"] = read_tactical_defense_enabled()
                 st.session_state["_tactical_defense_enabled_last_synced"] = (
                     st.session_state["tactical_defense_enabled_toggle"]
+                )
+            else:
+                # Live cross-device sync — same reasoning as the toggle above.
+                _sync_pull_from_file(
+                    "tactical_defense_enabled_toggle",
+                    "_tactical_defense_enabled_last_synced",
+                    read_tactical_defense_enabled(),
                 )
             tactical_enabled = st.toggle("Tactical defense (DEFEND/EXIT)", key="tactical_defense_enabled_toggle")
             if tactical_enabled != st.session_state["_tactical_defense_enabled_last_synced"]:
@@ -446,17 +827,63 @@ def _render_copilot_execution_panel() -> None:
                 "what it WOULD do (see the Tactical columns below), but never acts.]"
             )
 
-        interval_minutes = read_copilot_execution_interval_minutes()
-        next_check = next_execution_check_utc(now_utc, state=exec_state)
-        remaining_seconds = max(0, int((next_check - now_utc).total_seconds()))
-        rem_minutes, rem_seconds = divmod(remaining_seconds, 60)
+        interval_minutes = read_clerk_execution_interval_minutes()
+
+        # In-app periodic trigger, direct user request 2026-08-30: while
+        # this fragment is alive (the webapp is open) and the toggle
+        # above is on, actually re-check on the "Review every (min)"
+        # cadence below — not just a passive countdown. Previously this
+        # metric counted down toward next_execution_check_utc, a clock-
+        # aligned instant meant for clerk_execution_job.py's own OS-level
+        # Scheduled Task poll; with no such task configured on this
+        # machine (direct user choice, "webapp-only, no independent
+        # Clerk task"), nothing ever advanced that function's own
+        # last_run_interval_utc marker, so it permanently read "due now"
+        # — a real bug, not a rendering issue.
+        #
+        # _clerk_timer_state() (process-lifetime, shared across every
+        # open tab — see its own docstring) drives this, NOT
+        # st.session_state: a plain page refresh opens a brand-new
+        # session with fresh session_state, which was silently resetting
+        # this countdown on every refresh (a second real bug, direct
+        # user report) — it must reset ONLY on the toggle above or an
+        # actual app restart, never on a refresh. EXECUTION_LOCK_PATH
+        # (the same lock the manual "Run mega session" button's own
+        # inline call already uses below) is what keeps two tabs from
+        # ever actually running a check at once, not this timer.
+        timer_state = _clerk_timer_state()
+        if not clerk_enabled:
+            # Re-enabling later must start the countdown fresh from that
+            # moment (direct user request), never resume a stale
+            # reference from before it was switched off.
+            timer_state["next_check_utc"] = None
+            remaining_seconds = None
+        elif mega_session_live:
+            # Stop the countdown entirely while a mega session runs, per
+            # the user's own explicit request — resetting to None (not
+            # just holding it) so it restarts a fresh full interval once
+            # the mega session ends, rather than resuming a countdown
+            # that may have already elapsed while paused.
+            timer_state["next_check_utc"] = None
+            remaining_seconds = None
+        else:
+            if timer_state["next_check_utc"] is None:
+                timer_state["next_check_utc"] = now_utc + timedelta(minutes=interval_minutes)
+            next_check = timer_state["next_check_utc"]
+            remaining_seconds = max(0, int((next_check - now_utc).total_seconds()))
 
         timer_col, freq_col = st.columns([1, 1])
         with timer_col:
-            st.metric(
-                "Next review",
-                "due now" if remaining_seconds <= 0 else f"{rem_minutes}m {rem_seconds:02d}s",
-            )
+            if mega_session_live:
+                st.metric("Next review", "paused (mega session running)")
+            elif remaining_seconds is None:
+                st.metric("Next review", "paused")
+            else:
+                rem_minutes, rem_seconds = divmod(remaining_seconds, 60)
+                st.metric(
+                    "Next review",
+                    "due now" if remaining_seconds <= 0 else f"{rem_minutes}m {rem_seconds:02d}s",
+                )
         with freq_col:
             # Range starts at 1 min (direct user request 2026-08-23).
             # Same multi-tab race fixed for the mega-analysis
@@ -464,9 +891,18 @@ def _render_copilot_execution_panel() -> None:
             # against this session's own last-synced value, never the
             # file's current one, so a second stale tab can't flip this
             # back within seconds of a real change made elsewhere.
-            if "copilot_execution_interval_select" not in st.session_state:
-                st.session_state["copilot_execution_interval_select"] = interval_minutes
-                st.session_state["_copilot_execution_interval_last_synced"] = interval_minutes
+            if "clerk_execution_interval_select" not in st.session_state:
+                st.session_state["clerk_execution_interval_select"] = interval_minutes
+                st.session_state["_clerk_execution_interval_last_synced"] = interval_minutes
+            else:
+                # Live cross-device sync — same reasoning as the toggles
+                # above. _freq_options below already includes whatever
+                # this pulls in (it always includes the fresh file value).
+                _sync_pull_from_file(
+                    "clerk_execution_interval_select",
+                    "_clerk_execution_interval_last_synced",
+                    interval_minutes,
+                )
             # Always includes the CURRENT file value AND this session's
             # own last-synced value (they can differ if another tab
             # changed it) so a custom/hand-edited interval never breaks
@@ -474,19 +910,38 @@ def _render_copilot_execution_panel() -> None:
             # value to be one of the options offered.
             _freq_options = sorted({
                 1, 2, 5, 10, 15, 30, 60, interval_minutes,
-                st.session_state["_copilot_execution_interval_last_synced"],
+                st.session_state["_clerk_execution_interval_last_synced"],
             })
-            new_interval = st.selectbox("Review every (min)", _freq_options, key="copilot_execution_interval_select")
-            if new_interval != st.session_state["_copilot_execution_interval_last_synced"]:
-                set_copilot_execution_interval_minutes(new_interval)
-                st.session_state["_copilot_execution_interval_last_synced"] = new_interval
+            new_interval = st.selectbox("Review every (min)", _freq_options, key="clerk_execution_interval_select")
+            if new_interval != st.session_state["_clerk_execution_interval_last_synced"]:
+                set_clerk_execution_interval_minutes(new_interval)
+                st.session_state["_clerk_execution_interval_last_synced"] = new_interval
+                # Re-base the countdown on the new interval immediately,
+                # rather than finishing out a countdown sized for the old
+                # one.
+                _clerk_timer_state()["next_check_utc"] = None
+
+        if clerk_enabled and not mega_session_live and remaining_seconds is not None and remaining_seconds <= 0:
+            # Backgrounded (see _fire_scheduled_job_once's own docstring
+            # for the real "fades and stays stale" bug this fixes,
+            # 2026-08-30/31) — never blocks this fragment's own tick, so
+            # the countdown/live-progress caption below keep updating
+            # normally for however long the actual check takes. Advanced
+            # immediately (not after completion) since nothing here waits
+            # on it any more; a still-in-flight check from a previous
+            # tick is separately guarded against inside the helper.
+            _fire_scheduled_job_once(
+                _run_clerk_check_with_timeout, timer_state, EXECUTION_LOCK_PATH, EXECUTION_LOCK_STALE_AFTER_SECONDS,
+            )
+            timer_state["next_check_utc"] = datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)
+
         if interval_minutes < 5:
             st.caption(
                 ":gray[The Windows Scheduled Task itself only polls every 5 min, so anything "
                 "below that still checks at most every ~5 min in practice.]"
             )
 
-        if not copilot_enabled:
+        if not clerk_enabled:
             st.caption(":gray[Disabled — won't check or execute anything until re-enabled.]")
 
         if not suggestion:
@@ -526,7 +981,7 @@ def _render_copilot_execution_panel() -> None:
                 # Watch condition / verdict: added 2026-08-23 direct user
                 # request — Claude's daily mega session can now write an
                 # invalidation_condition per already-suggested position,
-                # and Copilot mechanically re-checks it every poll; since
+                # and the Clerk mechanically re-checks it every poll; since
                 # this executes with no human confirmation, "why did this
                 # fire" must be visible here, not just the log.
                 invalidation_condition = entry.get("invalidation_condition")
@@ -558,7 +1013,7 @@ def _render_copilot_execution_panel() -> None:
                     # close/cancel instruction it is. `rec`'s state (still
                     # present in settlement, so its ORIGINAL nature is
                     # known) gives the precise wording when available;
-                    # most closes/cancels were never Copilot-tracked in
+                    # most closes/cancels were never Clerk-tracked in
                     # settlement to begin with (e.g. a manually-opened
                     # position, or one settled by an earlier mega-session
                     # cycle), so this falls back to an equally accurate,
@@ -587,7 +1042,7 @@ def _render_copilot_execution_panel() -> None:
                 # Tactical defense (DEFEND/EXIT) — added 2026-08-27, the
                 # Clerk's own new short-term/"trend" authority, checked
                 # independently of the invalidation-condition trip-wire
-                # above (see ai/copilot_execution.py's own docstring for
+                # above (see ai/clerk_execution.py's own docstring for
                 # the real gold-trade incident that motivated it). Every
                 # already-filled position gets checked every poll, on or
                 # off — the toggle above only gates whether a verdict is
@@ -610,7 +1065,7 @@ def _render_copilot_execution_panel() -> None:
                     if skipped_reason:
                         # Found on audit: a genuine guardrail REJECTION
                         # (cooldown, never-widen-stop, wrong-side-of-
-                        # price, sizing failure — see ai/copilot_
+                        # price, sizing failure — see ai/clerk_
                         # execution.py::_validate_and_apply_tactical_
                         # verdict's own rejected_reason) and a VALID
                         # action merely pending on the disabled toggle
@@ -657,13 +1112,15 @@ def _render_copilot_execution_panel() -> None:
                         "Detail": result.get("detail", "") if result is not None else "",
                         "Watch condition": invalidation_condition or "—",
                         "Last invalidation verdict": verdict_text,
-                        "Copilot's reasoning": reasoning,
+                        "Clerk's reasoning": reasoning,
                         "Tactical verdict": tactical_verdict_display,
                         "Tactical action": tactical_action_display,
                         "Tactical justification": tactical_justification_display,
                     }
                 )
-            st.dataframe(pd.DataFrame(imm_rows), hide_index=True)
+            st.dataframe(
+                pd.DataFrame(imm_rows), hide_index=True, key=f"clerk_imm_table_{_clerk_content_gen}"
+            )
 
         if not pending_setups:
             st.caption("No Pending Setups from the latest mega session — nothing to watch for.")
@@ -680,7 +1137,7 @@ def _render_copilot_execution_panel() -> None:
                 status = rec.get("state", "unknown") if rec is not None else "unchecked"
                 verdict = last_verdicts.get(symbol, {})
                 raw_text = verdict.get("raw_text", "") or ""
-                # Direct user request 2026-08-23: when Copilot judges a
+                # Direct user request 2026-08-23: when the Clerk judges a
                 # setup genuinely STALE (not just "hasn't triggered yet")
                 # due to a real delay, the prompt asks it to lead with a
                 # "STALE SETUP WARNING:" line — surfaced here verbatim
@@ -695,10 +1152,12 @@ def _render_copilot_execution_panel() -> None:
                             "CONFIRMED" if verdict.get("confirmed") else "NOT_CONFIRMED"
                         ) if symbol in last_verdicts else "not yet checked",
                         "Trigger condition": s.get("trigger_condition"),
-                        "Copilot's reasoning": reasoning,
+                        "Clerk's reasoning": reasoning,
                     }
                 )
-            st.dataframe(pd.DataFrame(rows), hide_index=True)
+            st.dataframe(
+                pd.DataFrame(rows), hide_index=True, key=f"clerk_pending_table_{_clerk_content_gen}"
+            )
 
         last_status = exec_state.get("last_status")
         last_attempt = exec_state.get("last_attempt_utc")
@@ -723,14 +1182,14 @@ def _render_copilot_execution_panel() -> None:
         if live_message:
             st.caption(f":blue[↻ Running now — {live_message}]")
         elif last_status == "success" and last_attempt:
-            st.caption(f":green[✓ Last check ({last_attempt} UTC): {exec_state.get('last_detail', 'succeeded')}.]")
+            st.caption(f":green[✓ Last check ({_format_last_run(last_attempt)}): {exec_state.get('last_detail', 'succeeded')}.]")
         elif last_status == "blocked" and last_attempt:
-            st.caption(f":orange[⚠ Last check ({last_attempt} UTC) executed nothing: {exec_state.get('last_detail', '')}]")
+            st.caption(f":orange[⚠ Last check ({_format_last_run(last_attempt)}) executed nothing: {exec_state.get('last_detail', '')}]")
         elif last_status == "disabled" and last_attempt:
-            st.caption(f"Last check ({last_attempt} UTC): skipped — the clerk was disabled.")
+            st.caption(f"Last check ({_format_last_run(last_attempt)}): skipped — the clerk was disabled.")
 
 
-_render_copilot_execution_panel = st.fragment(run_every=5)(_render_copilot_execution_panel)
+_render_clerk_execution_panel = st.fragment(run_every=1)(_render_clerk_execution_panel)
 
 
 def _render_allocation_chart(allocation: dict[str, AllocationEntry]) -> None:
@@ -1008,6 +1467,138 @@ st.set_page_config(
     page_title="Quant Advisor", page_icon=":material/monitoring:", layout="wide"
 )
 
+
+@st.cache_resource
+def _app_session_token() -> str:
+    """A random token generated exactly ONCE per running server process
+    (st.cache_resource is process-wide, shared by every session/device,
+    not per-tab like st.session_state) — regenerates fresh only when the
+    app itself is restarted. This is what lets a browser refresh skip
+    the password prompt (see _require_password) while a real app
+    restart still forces it again, matching the user's own exact
+    request 2026-09-02: "ask for password when app is turned on for
+    first time or restarted, not on every page refresh." """
+    return secrets.token_urlsafe(24)
+
+
+def _check_password() -> None:
+    entered = st.session_state.get("_password_attempt", "")
+    if entered and secrets.compare_digest(entered, config.QUANT2_WEBAPP_PASSWORD):
+        st.session_state["_authenticated"] = True
+        st.session_state["_password_wrong"] = False
+        # Stashes the current process's own token into the URL so a
+        # plain browser refresh (which reloads the same URL, query
+        # params included, and starts a brand-new st.session_state)
+        # still recognizes this browser as already-authenticated —
+        # see _app_session_token's own docstring for why a restart
+        # still forces a fresh prompt despite this.
+        st.query_params["auth"] = _app_session_token()
+    else:
+        st.session_state["_password_wrong"] = True
+
+
+def _require_password() -> None:
+    """Login gate — direct user request 2026-09-02, added alongside
+    Tailscale-based remote/mobile access. Streamlit has no built-in
+    authentication of its own, and this app can place real orders on a
+    live funded FTMO account, so mere reachability (even over a private
+    Tailscale network — this is meant as a SECOND, independent layer
+    behind that, not a replacement for it) must never be the only thing
+    standing between a stranger and the account.
+
+    Persists across a plain browser refresh via a URL query param
+    (`?auth=<token>`), not st.session_state alone — real user complaint
+    2026-09-02: a hard refresh starts a brand-new Streamlit session with
+    empty session_state, so a session-only gate re-prompted on every
+    single page reload on the PC, which felt broken rather than secure.
+    The token itself is regenerated only on an actual app restart (see
+    _app_session_token), so "stays logged in across refreshes" and "asks
+    again after a restart" are both satisfied by the same mechanism.
+
+    Security note: the token lives in the URL, not an HttpOnly cookie —
+    on this app's private-Tailscale-only threat model that's an
+    accepted, pragmatic tradeoff (no new dependency needed), but it does
+    mean the exact post-login URL is itself sensitive for as long as the
+    app keeps running — don't share that specific link.
+
+    Fails OPEN (skips the gate entirely) when config.QUANT2_WEBAPP_
+    PASSWORD is empty/unset — the default, matching this app's original
+    local-only-no-auth behavior — never a silent bypass once a real
+    password has actually been configured. Uses secrets.compare_digest
+    for the actual password check so a wrong guess can't be timed to
+    narrow down the real password character by character."""
+    if not config.QUANT2_WEBAPP_PASSWORD:
+        return
+    if st.session_state.get("_authenticated"):
+        return
+    if secrets.compare_digest(st.query_params.get("auth", ""), _app_session_token()):
+        st.session_state["_authenticated"] = True
+        return
+
+    st.title("Quant Advisor")
+    st.text_input(
+        "Password", type="password", key="_password_attempt", on_change=_check_password
+    )
+    if st.session_state.get("_password_wrong"):
+        st.error("Incorrect password.")
+    st.stop()
+
+
+_require_password()
+
+
+@st.cache_resource
+def _configure_clerk_and_mega_logging() -> None:
+    """Wires up persistent file logging for the Clerk and mega-session
+    machinery when they run IN-PROCESS inside the webapp (a manual
+    button click, or the auto-poll fragment) — added 2026-09-04, direct
+    user request after a real incident (a USDCHF position oscillated
+    across three separate tickets within about an hour, on a chart with
+    no real trend to explain it) had to be reconstructed entirely from
+    raw MT5 deal timestamps, because nothing durable ever recorded the
+    Clerk's own actual reasoning: this module never called logging.
+    basicConfig, so every logger.info/.warning call throughout ai/
+    clerk_execution.py, risk/apply_suggestion.py, etc. reached Python's
+    own "last resort" handler and vanished — INFO silently dropped
+    entirely, WARNING+ only ever printed to a console nobody was
+    watching, never saved anywhere. The standalone scheduled-job
+    scripts (clerk_execution_job.py, mega_analysis_job.py) already log
+    correctly to clerk_execution_log.txt/mega_analysis_log.txt — this
+    gives the interactive, webapp-driven path (the ONLY path this
+    account actually uses; scheduled tasks were explicitly declined)
+    the exact same durable record, in the exact same two files, so
+    "what did the Clerk actually decide, and why" is a log read from
+    now on instead of an hour of MT5 forensics.
+
+    Attaches directly to each module's own named logger (not the root
+    logger via logging.basicConfig) so this can't fight over global
+    logging config with anything else that might configure it later in
+    the process, and doesn't affect log records from unrelated modules.
+    @st.cache_resource makes this run exactly ONCE per running server
+    process, not on every Streamlit script rerun (which happens on
+    nearly every user interaction) — attaching a fresh FileHandler on
+    every rerun would both duplicate every log line and leak file
+    handles for the life of the process."""
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    root = Path(__file__).resolve().parent
+
+    clerk_handler = logging.FileHandler(root / "clerk_execution_log.txt", encoding="utf-8")
+    clerk_handler.setFormatter(formatter)
+    for name in ("ai.clerk_execution", "risk.apply_suggestion", "ai.ollama_client", "data.mt5_source", "ai.chart_overlay"):
+        target = logging.getLogger(name)
+        target.setLevel(logging.INFO)
+        target.addHandler(clerk_handler)
+
+    mega_handler = logging.FileHandler(root / "mega_analysis_log.txt", encoding="utf-8")
+    mega_handler.setFormatter(formatter)
+    for name in ("ai.ftmo_suggest", "ai.portfolio_suggest", "ai.mega_analysis", "ai.psx_suggest"):
+        target = logging.getLogger(name)
+        target.setLevel(logging.INFO)
+        target.addHandler(mega_handler)
+
+
+_configure_clerk_and_mega_logging()
+
 # Fluid typography: headings/descriptions/metrics scale continuously with
 # viewport width via clamp(min, preferred-vw, max) instead of Streamlit's
 # fixed default sizes, so a narrower window (not just a literal mobile
@@ -1206,6 +1797,36 @@ def _render_live_positions(selected_exchange: str) -> None:
     Overview" bordered container established above — a fragment's
     periodic reruns only refill its own slot in the page, so it stays
     nested there across every tick, not just the first render."""
+    if st.session_state.pop("_close_position_just_opened", False):
+        # A row's "✕" button just fired (see _open_close_position_confirm)
+        # — this function runs inside a run_every fragment, and a widget
+        # interaction INSIDE a fragment only triggers a FRAGMENT-scoped
+        # rerun by default, not a full-app one, but the `if session_
+        # state[...]: _show_close_position_confirm_dialog()` check that
+        # actually opens the dialog lives at the top level of the script,
+        # outside this fragment — without forcing a full rerun here, that
+        # check would never run again after the click and the dialog
+        # would silently never open (same real bug, and same fix, as
+        # _open_watchlist_detail's own docstring documents for the
+        # watchlist tiles). Checked before the live data fetch below so
+        # the about-to-be-discarded fetch on this tick is skipped
+        # entirely. Popped, not just read, so this fires exactly once per
+        # click, never again on a later refresh tick while the dialog
+        # stays open.
+        st.rerun()
+    if st.session_state.pop("_pos_table_clear_selection", False):
+        # Clears the dataframe's own row-selection state left over from
+        # the click that just opened the confirm dialog (see below) — a
+        # widget's session_state entry can't be reassigned in the SAME
+        # run that already instantiated it (Streamlit raises
+        # StreamlitAPIException: "cannot be modified after the widget...
+        # is instantiated" — hit this live), so the reset has to happen
+        # here, before pos_table_select's own st.dataframe call below
+        # creates it fresh on this run. Without this, re-clicking the
+        # same row later wouldn't fire on_select again, since Streamlit
+        # only reruns on a SELECTION CHANGE.
+        st.session_state["pos_table_select"] = {"selection": {"rows": []}}
+
     live_positions: list = []
     live_pending: list = []
     live_closed_trades: list = []
@@ -1232,6 +1853,15 @@ def _render_live_positions(selected_exchange: str) -> None:
             "Merges what used to be a separate 'Positions Dashboard' "
             "section, since the two were showing the same positions twice."
         )
+        # One-shot result banner for whatever the close-position confirm
+        # dialog last did — popped so it shows exactly once, right after
+        # the dialog closes and this rerun lands here (same pattern as
+        # the Apply Suggestion execution-outcome banner elsewhere on this
+        # page).
+        _close_outcome = st.session_state.pop("_close_position_outcome", None)
+        if _close_outcome is not None:
+            _outcome_ok, _outcome_msg = _close_outcome
+            (st.success if _outcome_ok else st.error)(_outcome_msg)
 
         if selected_exchange == "PSX":
             st.caption(
@@ -1257,7 +1887,21 @@ def _render_live_positions(selected_exchange: str) -> None:
                 m3.metric("Winning", len(winners))
                 m4.metric("Losing", len(losers))
 
-                df = pd.DataFrame(
+                # Genuinely the SAME widget the Pending Orders table below
+                # uses (st.dataframe, same construction: a plain
+                # pd.DataFrame, hide_index=True, zero custom CSS) — not an
+                # approximation. That's the only way to get truly
+                # identical font/border/spacing/header rendering, since
+                # st.dataframe draws its grid on a <canvas>, not styleable
+                # HTML text. Trade-off: it can't hold a real button, so
+                # closing works by clicking a row (single-row selection,
+                # which shows Streamlit's own built-in checkbox indicator
+                # on that row) rather than a dedicated "✕" — the click
+                # immediately opens the same reconfirmation dialog used
+                # elsewhere, and the selection is reset right after (via
+                # the _pos_table_clear_selection flag handled at the top
+                # of this function) so the same row can be clicked again.
+                _pos_df = pd.DataFrame(
                     [
                         {
                             "Symbol": p.symbol,
@@ -1271,8 +1915,29 @@ def _render_live_positions(selected_exchange: str) -> None:
                         for p in live_positions
                     ]
                 )
-
-                st.dataframe(df.style.map(_color_pnl, subset=["P&L"]), hide_index=True)
+                st.caption("Click a row's checkbox to select it and close that position.")
+                _pos_event = st.dataframe(
+                    _pos_df.style.map(_color_pnl, subset=["P&L"]),
+                    hide_index=True,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key="pos_table_select",
+                )
+                _pos_selected_rows = (
+                    _pos_event.selection.rows if _pos_event is not None else []
+                )
+                if _pos_selected_rows:
+                    _sel_pos = live_positions[_pos_selected_rows[0]]
+                    st.session_state["_pos_table_clear_selection"] = True
+                    _open_close_position_confirm(
+                        _sel_pos.ticket,
+                        _sel_pos.symbol,
+                        _sel_pos.side,
+                        _sel_pos.volume,
+                        _sel_pos.price_open,
+                        _sel_pos.profit,
+                    )
+                    st.rerun()
             else:
                 st.write("No open positions.")
 
@@ -1332,12 +1997,17 @@ def _render_live_positions(selected_exchange: str) -> None:
                 )
 
     if selected_exchange in ("PMEX", "FTMO"):
-        with st.container(border=True):
-            st.subheader("Trade History")
+        with st.expander("Trade History", icon=":material/history:", expanded=False):
             st.caption(
-                "Real closed trades from this account's own MT5 history — "
-                "net P&L per position (every leg's profit, swap, and "
-                "commission combined), most recent first."
+                "Real closed trades from this account's own MT5 history, most "
+                "recent first. **Net P&L** is the true realized result (every "
+                "leg's profit, swap, and commission combined) — what actually "
+                "moved the account balance. **Gross P&L** and **Change %** "
+                "deliberately match the MT5 terminal's own \"Profit\"/\"Change\" "
+                "columns instead (raw instrument profit only, before costs, as "
+                "a % of the position's own notional value) — the two P&L "
+                "columns are expected to differ by the position's total "
+                "commission+swap, not a bug."
             )
             if live_closed_trades:
                 realized_pnl = sum(t.profit for t in live_closed_trades)
@@ -1349,8 +2019,26 @@ def _render_live_positions(selected_exchange: str) -> None:
                 h3.metric("Won", len(won))
                 h4.metric("Lost", len(lost))
 
-                history_df = pd.DataFrame(
-                    [
+                # One get_contract_spec() call per DISTINCT symbol this
+                # render, not per trade — several closed trades commonly
+                # share a symbol (e.g. two AUDUSD round-trips), and this
+                # is a live MT5 round-trip each time.
+                spec_cache: dict[str, object] = {}
+                history_rows = []
+                for t in live_closed_trades:
+                    if t.symbol not in spec_cache:
+                        spec_cache[t.symbol] = get_contract_spec(t.symbol)
+                    spec = spec_cache[t.symbol]
+                    # Same formula MT5's own terminal uses for its "Change"
+                    # column (confirmed live against this account's real
+                    # trade history to 2 decimal places): raw (gross)
+                    # profit as a % of the position's own notional value
+                    # at entry. None (blank in the table) when this
+                    # symbol's contract spec isn't available right now,
+                    # rather than a fabricated/misleading 0%.
+                    notional = t.open_price * t.volume * spec.trade_contract_size if spec is not None else 0.0
+                    pct_change = (t.gross_profit / notional * 100) if notional else None
+                    history_rows.append(
                         {
                             "Symbol": t.symbol,
                             "Side": t.side,
@@ -1360,17 +2048,138 @@ def _render_live_positions(selected_exchange: str) -> None:
                             "Opened At": t.opened_at.strftime("%Y-%m-%d %H:%M:%S"),
                             "Closed At": t.closed_at.strftime("%Y-%m-%d %H:%M:%S"),
                             "Duration": str(t.duration),
-                            "P&L": t.profit,
+                            "Gross P&L": t.gross_profit,
+                            "Net P&L": t.profit,
+                            "Change %": pct_change,
                         }
-                        for t in live_closed_trades
-                    ]
-                )
+                    )
+                history_df = pd.DataFrame(history_rows)
 
                 st.dataframe(
-                    history_df.style.map(_color_pnl, subset=["P&L"]), hide_index=True
+                    history_df.style
+                    .map(_color_pnl, subset=["Gross P&L", "Net P&L", "Change %"])
+                    .format({"Change %": "{:.2f}%"}, na_rep="—"),
+                    hide_index=True,
                 )
             else:
                 st.write("No closed trades on record yet.")
+
+
+def _open_close_position_confirm(
+    ticket: int, symbol: str, side: str, volume: float, price_open: float, profit: float
+) -> None:
+    """st.button's on_click callback for a position row's close ("✕")
+    button — just records which ticket was clicked, matching this app's
+    existing "click records intent, a separate @st.dialog does the real
+    work" pattern (see _open_watchlist_detail). The actual close only
+    ever happens after explicit reconfirmation in
+    _show_close_position_confirm_dialog below, never directly from this
+    click — these snapshot values are shown immediately while the dialog
+    opens, but the dialog itself re-fetches the live position fresh
+    before actually closing anything, since price/P&L can move (or the
+    position can already be closed via its own SL/TP) in the time
+    between this click and the user confirming.
+
+    Also sets a one-shot "just opened" flag — real bug found live
+    2026-09-08 (same class as _open_watchlist_detail's own documented
+    one): this button lives inside a run_every fragment, and a widget
+    interaction INSIDE a fragment only triggers a FRAGMENT-scoped rerun
+    by default, not a full-app one, but the `if session_state[...]:
+    _show_close_position_confirm_dialog()` check that actually opens the
+    dialog lives at the top level of the script, outside this fragment —
+    without forcing a full rerun (see _render_live_positions's own
+    handling of this exact flag), that check never ran again after the
+    click and the dialog silently never opened, which is exactly why the
+    "✕" button did nothing."""
+    st.session_state["_close_position_ticket"] = ticket
+    st.session_state["_close_position_symbol"] = symbol
+    st.session_state["_close_position_side"] = side
+    st.session_state["_close_position_volume"] = volume
+    st.session_state["_close_position_price_open"] = price_open
+    st.session_state["_close_position_profit"] = profit
+    st.session_state["_close_position_just_opened"] = True
+
+
+def _clear_close_position_confirm() -> None:
+    """Shared by the dialog's own Cancel button AND @st.dialog's
+    on_dismiss hook — same real-bug rationale as
+    _clear_watchlist_detail's own docstring: without on_dismiss wired up,
+    dismissing via the dialog's native X/Esc/outside-click would leave
+    _close_position_ticket stuck set forever, since only an explicit
+    button click would otherwise ever clear it."""
+    st.session_state["_close_position_ticket"] = None
+
+
+@st.dialog("Confirm Close Position", on_dismiss=_clear_close_position_confirm)
+def _show_close_position_confirm_dialog() -> None:
+    """Reconfirmation dialog for a manual position close — direct user
+    request. Re-fetches the position fresh by ticket rather than trusting
+    the snapshot the row's own button click captured, since price/P&L
+    move continuously and the position may have already closed on its
+    own (hit its real SL/TP) in the time between the click and this
+    confirmation — closing a stale snapshot's "current price" would be
+    misleading, and closing a ticket that no longer exists would just
+    fail confusingly instead of explaining what actually happened."""
+    ticket = st.session_state.get("_close_position_ticket")
+    if not ticket:
+        return
+    symbol = st.session_state.get("_close_position_symbol")
+
+    try:
+        current_positions = get_open_positions()
+    except MT5ConnectionError as e:
+        st.error(f"Could not refresh live position data: {e}")
+        if st.button("Close"):
+            _clear_close_position_confirm()
+            st.rerun()
+        return
+
+    matching = next((p for p in current_positions if p.ticket == ticket), None)
+    if matching is None:
+        st.warning(
+            f"This position (ticket {ticket}, {symbol}) is no longer open — "
+            "it likely already closed via its own stop-loss or take-profit."
+        )
+        if st.button("Close"):
+            _clear_close_position_confirm()
+            st.rerun()
+        return
+
+    st.markdown(
+        f"**{matching.symbol}** — {matching.side} {matching.volume:g} lots @ "
+        f"{matching.price_open:g}, current price {matching.price_current:g}"
+    )
+    st.markdown(
+        f"Current P&L: <span style='{_color_pnl(matching.profit)}'>{matching.profit:+.2f}</span>",
+        unsafe_allow_html=True,
+    )
+    st.warning(
+        "This closes the position at the current market price immediately. "
+        "This cannot be undone."
+    )
+
+    confirm_col, cancel_col = st.columns(2)
+    with confirm_col:
+        if st.button("Yes, close it", type="primary", icon=":material/close:"):
+            try:
+                result = close_position(matching)
+            except MT5ConnectionError as e:
+                result = OrderResult(False, None, str(e), None)
+            st.session_state["_close_position_outcome"] = (
+                (True, f"{matching.symbol} (ticket {matching.ticket}) closed successfully.")
+                if result.success
+                else (False, f"Failed to close {matching.symbol}: {result.comment}")
+            )
+            _clear_close_position_confirm()
+            st.rerun()
+    with cancel_col:
+        if st.button("Cancel"):
+            _clear_close_position_confirm()
+            st.rerun()
+
+
+if st.session_state.get("_close_position_ticket"):
+    _show_close_position_confirm_dialog()
 
 
 # Broker-provided top-level symbol-path categories (data.mt5_source.
@@ -1486,6 +2295,23 @@ _WATCHLIST_TILE_STYLE = """
     0% { background-color: transparent; border-color: rgba(128, 128, 128, 0.3); }
     20% { background-color: rgba(220, 38, 38, 0.26); border-color: #dc2626; }
     100% { background-color: transparent; border-color: rgba(128, 128, 128, 0.3); }
+}
+/* Direct user complaint 2026-09-02: the Execution Clerk panel's own
+   tables visually "jerk" — Streamlit just replaces them wholesale on
+   every 1-second tick. Each table's own key (see _render_clerk_
+   execution_panel's own _clerk_content_gen comment) only actually
+   CHANGES when there's genuinely new content to show, which is what
+   makes this fade animation replay meaningfully instead of playing
+   every single second regardless — same key-remount technique as the
+   wl-pulse rules above, applied as a one-shot fade-in instead of a
+   repeating pulse. */
+[class*="st-key-clerk_imm_table_"],
+[class*="st-key-clerk_pending_table_"] {
+    animation: clerk-fade-in 0.5s ease-out;
+}
+@keyframes clerk-fade-in {
+    from { opacity: 0.25; }
+    to { opacity: 1; }
 }
 </style>
 """
@@ -1671,6 +2497,163 @@ if _watchlist_expander.open:
             _render_watchlist_grid(selected_exchange)
         else:
             st.caption("No live MT5 feed for PSX — this grid is PMEX/FTMO only.")
+
+
+def _list_researcher_symbols() -> list[str]:
+    """Every symbol with at least one saved Researcher report, sorted
+    alphabetically. Report filenames are "<SYMBOL>_<YYYY-MM-DD>_
+    <HHMMSS>.md" (see ai.researcher.save_research_report) — the symbol
+    itself never contains an underscore, so splitting on the FIRST one
+    reliably recovers it even though the timestamp portion has its own
+    underscore between the date and time."""
+    records_dir = Path(config.RESEARCHER_RECORDS_DIR)
+    if not records_dir.exists():
+        return []
+    symbols = {path.name.split("_", 1)[0] for path in records_dir.glob("*.md")}
+    return sorted(symbols)
+
+
+@st.cache_resource
+def _researcher_timer_state() -> dict:
+    """Process-lifetime holder so _fire_scheduled_job_once never spawns a
+    redundant second in-process thread on back-to-back fragment ticks —
+    same shape/reasoning as _clerk_timer_state(), except Researcher's
+    actual due-ness decision is delegated entirely to ai.researcher.
+    is_researcher_due (already built, already tested, driven by real
+    persisted state) rather than a second, in-memory-only countdown —
+    this dict holds nothing but the "thread" key _fire_scheduled_job_once
+    itself manages."""
+    return {}
+
+
+def _run_researcher_check_with_timeout() -> None:
+    """The actual work _fire_scheduled_job_once runs on a background
+    thread for Researcher's in-app periodic trigger — same reasoning as
+    _run_clerk_check_with_timeout: run_researcher_check does not self-
+    bound its own runtime (every other caller wraps it in run_with_timeout
+    itself), so this does too, just from the background thread."""
+    timed_out = object()
+    result = run_with_timeout(
+        run_researcher_check, config.RESEARCHER_RUN_TIMEOUT_SECONDS, default=timed_out, catch_exceptions=False,
+    )
+    if result is timed_out:
+        logger.error(
+            "Periodic Researcher check timed out after %.0f minutes",
+            config.RESEARCHER_RUN_TIMEOUT_SECONDS / 60,
+        )
+
+
+# Read-only DISPLAY (Phase 1 of the Researcher agent — see ai/
+# researcher.py's own module docstring): what's rendered below only
+# reads and shows whatever Researcher has already saved to disk, for a
+# human to read. It does not feed into, and is not fed by, either the
+# Mega Session's or Clerk's own decisions — that "Phase 2" wiring is a
+# deliberately separate, not-yet-built step. The TRIGGER that actually
+# produces those saved reports is a different matter, fixed here
+# (direct user report 2026-09-14, "the researcher doesn't auto run after
+# 1 hour"): ai/researcher.py's own run_researcher_check was fully built
+# but never wired into anything that calls it automatically — no Windows
+# Scheduled Task exists for ANY of this project's three agents (direct,
+# deliberate user choice recorded elsewhere in this file: "webapp-only,
+# no independent Clerk task"), so the in-app st.fragment(run_every=...)
+# + _fire_scheduled_job_once pattern Mega Session/Clerk already use is
+# the actual, sole trigger mechanism in this app — Researcher simply
+# never had its own copy of that wiring. Every prior "hourly run" this
+# session was a manual python -c invocation, never a real automatic one.
+def _render_researcher_panel() -> None:
+    now_utc = datetime.now(timezone.utc)
+    if read_researcher_enabled():
+        # _fire_scheduled_job_once's own acquire_lock call (cross-process,
+        # PID-liveness-aware) is what actually prevents two overlapping
+        # runs — this is purely the "is it time yet" decision, backed by
+        # is_researcher_due's own real persisted state (the SAME check
+        # researcher_job.py's own OS-level path would use, so the in-app
+        # trigger and that standalone script can never both think it's
+        # simultaneously due and double-fire within the same window).
+        if is_researcher_due(now_utc):
+            _fire_scheduled_job_once(
+                _run_researcher_check_with_timeout,
+                _researcher_timer_state(),
+                RESEARCHER_LOCK_PATH,
+                RESEARCHER_LOCK_STALE_AFTER_SECONDS,
+            )
+
+    st.header(":material/travel_explore: Researcher", divider=True)
+    _researcher_open_key = "_researcher_section_open"
+    _researcher_expander = st.expander(
+        "Show research reports",
+        icon=":material/travel_explore:",
+        expanded=st.session_state.get(_researcher_open_key, False),
+        on_change="rerun",
+    )
+    if _researcher_expander.open is not None:
+        st.session_state[_researcher_open_key] = _researcher_expander.open
+    if _researcher_expander.open:
+        with _researcher_expander:
+            st.caption(
+                "Independent, local-only per-symbol research (real fetched "
+                "headlines + a local model's synthesis and sentiment lean) — "
+                "generated on its own schedule, separately from the Mega "
+                "Session and Clerk above. Purely for you to read; it isn't "
+                "consumed by either agent yet."
+            )
+            _researcher_state = read_researcher_state()
+            _researcher_total_runs = _researcher_state.get("total_runs", 0)
+            _researcher_last_attempt = _researcher_state.get("last_attempt_utc")
+            if not read_researcher_enabled():
+                _next_check_caption = "auto-run disabled."
+            else:
+                _next_check = next_researcher_check_utc(now_utc)
+                _remaining = max(0, int((_next_check - now_utc).total_seconds()))
+                if _remaining <= 0:
+                    _next_check_caption = "next check due now."
+                elif _remaining >= 3600:
+                    _rem_hours, _rem_rest = divmod(_remaining, 3600)
+                    _rem_minutes = _rem_rest // 60
+                    _next_check_caption = f"next check in {_rem_hours}h {_rem_minutes}m."
+                else:
+                    _rem_minutes, _rem_seconds = divmod(_remaining, 60)
+                    _next_check_caption = f"next check in {_rem_minutes}m {_rem_seconds:02d}s."
+            if _researcher_last_attempt:
+                st.caption(
+                    f"Runs so far: {_researcher_total_runs} · last run "
+                    f"({_format_last_run(_researcher_last_attempt)}): "
+                    f"{_researcher_state.get('last_detail') or _researcher_state.get('last_status', '')} · "
+                    f"{_next_check_caption}"
+                )
+            else:
+                st.caption(f"Runs so far: {_researcher_total_runs} · {_next_check_caption}")
+            _researcher_symbols = _list_researcher_symbols()
+            if not _researcher_symbols:
+                st.info(
+                    "No research reports yet — run researcher_job.py (or call "
+                    "ai.researcher.run_researcher_check() directly) to generate some."
+                )
+            else:
+                for _symbol in _researcher_symbols:
+                    _report_text = latest_research_report(_symbol)
+                    if not _report_text:
+                        continue
+                    _sentiment = parse_researcher_sentiment(_report_text)
+                    _emoji = _SENTIMENT_EMOJI.get(_sentiment, "❔")
+                    # Collapsed by default (expanded=False, not tied to
+                    # session state) — direct user request: every symbol's
+                    # own dropdown starts closed regardless of whether the
+                    # outer section itself is open.
+                    with st.expander(f"{_emoji} {_symbol}", expanded=False):
+                        st.markdown(_report_text)
+
+
+# 30s: frequent enough to catch is_researcher_due's own once-daily
+# trigger window comfortably (see RESEARCHER_GRACE_MINUTES) without
+# re-running every second the way Clerk's own live-countdown-focused
+# panel does — Researcher only fires once a day, so that level of tick
+# rate would be pure overhead here.
+_render_researcher_panel = st.fragment(run_every=30)(_render_researcher_panel)
+_SENTIMENT_EMOJI = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}
+
+if selected_exchange == "FTMO":
+    _render_researcher_panel()
 
 
 _SETUP_BADGE_COLORS = {
@@ -2560,6 +3543,18 @@ with _portfolio_controls_box:
             st.session_state["_mega_analysis_enabled_last_synced"] = (
                 st.session_state["mega_analysis_enabled_toggle"]
             )
+        else:
+            # Live cross-device sync — this toggle lives in the OUTER
+            # script (see the comment above for why), so a pull here
+            # only actually shows up when a full rerun happens for some
+            # reason. _watch_for_external_mega_toggle_change below is
+            # what forces that rerun to happen within a couple of
+            # seconds even with zero other interaction on this tab.
+            _sync_pull_from_file(
+                "mega_analysis_enabled_toggle",
+                "_mega_analysis_enabled_last_synced",
+                read_mega_analysis_enabled(),
+            )
         mega_analysis_enabled = st.toggle(
             "Automated daily analysis",
             key="mega_analysis_enabled_toggle",
@@ -2569,6 +3564,7 @@ with _portfolio_controls_box:
         if mega_analysis_enabled != st.session_state["_mega_analysis_enabled_last_synced"]:
             set_mega_analysis_enabled(mega_analysis_enabled)
             st.session_state["_mega_analysis_enabled_last_synced"] = mega_analysis_enabled
+        _watch_for_external_mega_toggle_change()
     button_col, model_col, apply_col = st.columns([2, 1, 1])
     with button_col:
         suggest_clicked = st.button(
@@ -2659,7 +3655,7 @@ with _portfolio_controls_box:
     # manual controls now that they share its box.
 
 if selected_exchange == "FTMO":
-    _render_copilot_execution_panel()
+    _render_clerk_execution_panel()
 
 if suggest_clicked and selected_exchange == "PSX":
     error_message = None
@@ -2747,77 +3743,72 @@ if suggest_clicked and selected_exchange == "PSX":
 elif suggest_clicked and selected_exchange == "FTMO":
     error_message = None
     warning_message = None
+    already_running_message = None
     suggestion = None
     analyses = None
 
     with st.status("Building an FTMO portfolio suggestion...", expanded=True) as status:
-        try:
-            st.write("Fetching FTMO account and market data...")
-            ftmo_account = get_account_summary()
-            ftmo_assets = get_market_watch()
-            # Recomputed fresh from this click's own account fetch, not
-            # reused from the top-of-page snapshot — see fetch_ftmo_status's
-            # own docstring for why a compliance-critical number shouldn't
-            # silently reason over slightly stale data from earlier in the
-            # same script run.
-            fresh_ftmo_status = fetch_ftmo_status(ftmo_account)
-        except MT5ConnectionError as e:
-            error_message = str(e)
+        # Same lock run_scheduled_mega_analysis (via _fire_scheduled_job_
+        # once) already uses — see _MEGA_ANALYSIS_LOCK_PATH's own comment
+        # above. Wrapping the WHOLE run in it (not just the Clerk hand-off
+        # below, which already had its own separate EXECUTION_LOCK_PATH)
+        # is the actual fix for two real, reported bugs that turned out
+        # to share one root cause: this branch used to call analyze_ftmo_
+        # assets/build_ftmo_summary/suggest_ftmo_portfolio directly,
+        # inline, completely bypassing run_mega_analysis() — so a manual
+        # click never wrote to the shared progress file (see
+        # ai.mega_analysis._write_step/_write_current_activity):
+        # (1) no live status ever showed in the shared Mega Session
+        # section the way a scheduled run's does, and (2) mega_session_
+        # is_live() — what the Clerk panel's own "paused" display and
+        # firing logic both depend on — had nothing to go on, so Clerk's
+        # periodic check never actually paused for a manual run either.
+        # Calling the SAME run_mega_analysis() the scheduled trigger uses
+        # fixes both at once, for free — no separate UI code needed here.
+        if not acquire_lock(_MEGA_ANALYSIS_LOCK_PATH, _MEGA_ANALYSIS_LOCK_STALE_AFTER_SECONDS):
+            already_running_message = (
+                "A mega session is already running (the daily schedule, or another "
+                "tab's own click) — see its live progress in the Mega Market Analysis "
+                "section above; this click will not start a second, overlapping run."
+            )
         else:
-            if not ftmo_assets:
-                warning_message = (
-                    "No instruments are visible in this FTMO account's MT5 "
-                    "Market Watch — add some symbols there first."
-                )
-            else:
-                # An updating placeholder (not one st.write() line per
-                # instrument) — this loop now does real per-symbol work
-                # (Yahoo resolution, H4/H1 fetch, chart structure, real
-                # trading cost) across up to 21+ instruments, previously
-                # with zero progress visibility for the whole step.
-                analysis_placeholder = st.empty()
+            st.write(
+                "Running now — live step-by-step progress is shown in the Mega "
+                "Market Analysis section above, exactly like a scheduled run."
+            )
+            try:
+                _captured_analyses: list = []
+                suggestion = run_mega_analysis(model=selected_model, on_analyses=_captured_analyses.append)
+                analyses = _captured_analyses[0] if _captured_analyses else None
+            except MT5ConnectionError as e:
+                error_message = str(e)
+            except RuntimeError as e:
+                # e.g. "No instruments are visible in this FTMO account's
+                # MT5 Market Watch." — a data-availability issue, not a
+                # connection failure, same distinction the old inline
+                # check made before delegating this check to
+                # run_mega_analysis() itself.
+                warning_message = str(e)
+            finally:
+                release_lock(_MEGA_ANALYSIS_LOCK_PATH)
 
-                def _on_analysis_progress(msg: str) -> None:
-                    analysis_placeholder.markdown(msg)
-
-                analyses = analyze_ftmo_assets(ftmo_assets, on_progress=_on_analysis_progress)
-                ftmo_summary_text = build_ftmo_summary(
-                    ftmo_account, ftmo_assets, fresh_ftmo_status,
-                    positions=positions, analyses=analyses, pending_orders=pending_orders,
-                )
-
-                audit_placeholder = {"box": None}
-
-                def _on_stage(msg: str) -> None:
-                    st.write(msg)
-                    if msg.startswith("Sending the draft to"):
-                        audit_placeholder["box"] = st.empty()
-
-                def _on_audit_progress(text: str) -> None:
-                    box = audit_placeholder["box"]
-                    if box is not None:
-                        box.markdown(text)
-
-                suggestion = suggest_ftmo_portfolio(
-                    ftmo_summary_text,
-                    on_stage=_on_stage,
-                    on_audit_progress=_on_audit_progress,
-                    model=selected_model,
-                    save_record=True,
-                )
+            if suggestion is not None:
                 if suggestion == CLI_MISSING_MESSAGE or suggestion.startswith(CLI_FAILED_PREFIX):
                     error_message = suggestion
                 else:
+                    def _on_stage(msg: str) -> None:
+                        st.write(msg)
+
                     # Manual and scheduled runs differ only in what
                     # triggers them, never in what they produce or feed
                     # downstream (direct user correction 2026-08-23) —
                     # this mirrors mega_analysis_job.py's own inline
                     # wiring exactly, down to sharing the literal same
                     # lock, so a manual click and the standalone poll
-                    # can never run Copilot's execution-check at
+                    # can never run the Clerk's execution-check at
                     # once. Skips gracefully (not blocking) if the
                     # standalone poll already holds the lock right now.
-                    _on_stage("Handing off to Copilot for an immediate execution-check...")
+                    _on_stage("Handing off to the Clerk for an immediate execution-check...")
                     if acquire_lock(EXECUTION_LOCK_PATH, EXECUTION_LOCK_STALE_AFTER_SECONDS):
                         try:
                             # Same hard timeout ceiling and sentinel
@@ -2825,25 +3816,25 @@ elif suggest_clicked and selected_exchange == "FTMO":
                             # inline call — a hang here must never
                             # freeze this whole Streamlit session
                             # indefinitely.
-                            _copilot_timed_out = object()
-                            _copilot_result = run_with_timeout(
-                                lambda: run_copilot_execution_check(on_stage=_on_stage),
-                                config.COPILOT_EXECUTION_RUN_TIMEOUT_SECONDS,
-                                default=_copilot_timed_out,
+                            _clerk_timed_out = object()
+                            _clerk_result = run_with_timeout(
+                                lambda: run_clerk_execution_check(on_stage=_on_stage),
+                                config.CLERK_EXECUTION_RUN_TIMEOUT_SECONDS,
+                                default=_clerk_timed_out,
                                 catch_exceptions=False,
                             )
-                            if _copilot_result is _copilot_timed_out:
+                            if _clerk_result is _clerk_timed_out:
                                 _on_stage(
-                                    "Copilot's execution-check timed out after "
-                                    f"{config.COPILOT_EXECUTION_RUN_TIMEOUT_SECONDS / 60:.0f} minutes."
+                                    "The Clerk's execution-check timed out after "
+                                    f"{config.CLERK_EXECUTION_RUN_TIMEOUT_SECONDS / 60:.0f} minutes."
                                 )
                         except Exception as e:
-                            _on_stage(f"Copilot's execution-check failed: {e}")
+                            _on_stage(f"The Clerk's execution-check failed: {e}")
                         finally:
                             release_lock(EXECUTION_LOCK_PATH)
                     else:
                         _on_stage(
-                            "Copilot's execution check is already running right now — "
+                            "The Clerk's execution check is already running right now — "
                             "it will pick this up on its own next run instead."
                         )
 
@@ -2851,6 +3842,8 @@ elif suggest_clicked and selected_exchange == "FTMO":
             status.update(label="Failed", state="error")
         elif warning_message:
             status.update(label="No FTMO data available", state="error")
+        elif already_running_message:
+            status.update(label="Skipped — already running", state="complete")
         else:
             status.update(label="Suggestion ready", state="complete")
 
@@ -2860,6 +3853,7 @@ elif suggest_clicked and selected_exchange == "FTMO":
     # Suggestion" look enabled against the wrong account, and vice versa.
     st.session_state["ftmo_suggestion_error"] = error_message
     st.session_state["ftmo_suggestion_warning"] = warning_message
+    st.session_state["ftmo_suggestion_already_running"] = already_running_message
     if suggestion is not None and not error_message:
         allocation = parse_final_allocation(suggestion, require_side=True)
         display_text = strip_pending_setups_block(strip_allocation_block(suggestion))
@@ -2867,7 +3861,7 @@ elif suggest_clicked and selected_exchange == "FTMO":
             display_text = suggestion
         display_text = strip_leading_process_narration(display_text)
         st.session_state["ftmo_last_suggestion_text"] = display_text
-        st.session_state["ftmo_last_suggestion_generated_at"] = datetime.now()
+        st.session_state["ftmo_last_suggestion_generated_at"] = datetime.now(timezone.utc)
         st.session_state["ftmo_last_suggestion_analyses"] = analyses
         if allocation:
             st.session_state["ftmo_suggested_allocation"] = allocation
@@ -3042,33 +4036,131 @@ with st.expander("Latest Suggestion", icon=":material/insights:", expanded=False
             st.error(st.session_state["ftmo_suggestion_error"])
         elif st.session_state.get("ftmo_suggestion_warning"):
             st.warning(st.session_state["ftmo_suggestion_warning"])
-        elif st.session_state.get("ftmo_last_suggestion_text"):
-            _ftmo_generated_at = st.session_state.get("ftmo_last_suggestion_generated_at")
-            if _ftmo_generated_at is not None:
-                st.badge(
-                    f"Generated {_ftmo_generated_at:%Y-%m-%d %H:%M:%S}",
-                    icon=":material/schedule:",
-                    color="blue",
-                )
-            ftmo_allocation = st.session_state.get("ftmo_suggested_allocation")
-            if ftmo_allocation:
-                _render_allocation_chart(ftmo_allocation)
-                _render_capital_at_risk_chart(ftmo_allocation, pct_is_risk=True)
-            _render_ai_report(st.session_state["ftmo_last_suggestion_text"])
+        elif st.session_state.get("ftmo_suggestion_already_running"):
+            st.info(st.session_state["ftmo_suggestion_already_running"])
+        else:
+            # Two candidate sources: THIS session's own manual click (if
+            # any) vs the most recent saved records/*.md transcript, which
+            # ANY successful run — manual OR automated, in any process —
+            # always writes (see save_portfolio_session). Direct user
+            # report 2026-09-05 (two rounds): (1) after a genuinely NEWER
+            # automated run had completed, this panel kept showing an
+            # OLDER manual click's own session-local suggestion instead —
+            # a prior fix (2026-09-01) added a persisted-file fallback for
+            # when session_state was EMPTY, but once session_state held
+            # anything at all it unconditionally took priority forever
+            # after, regardless of which was actually more recent; (2) the
+            # first attempt at fixing that read the DERIVED, simplified
+            # mega_analysis_latest_suggestion.json (built for Copilot's
+            # execution job, see _write_latest_suggestion) and rendered
+            # bare tables from it instead of the real report — that file
+            # never carried the full prose or a chart-ready allocation
+            # shape. This reuses _load_latest_saved_suggestion (the same
+            # helper the cold-start loader below already uses) to read the
+            # actual saved transcript instead, giving this fallback the
+            # exact same rich rendering (allocation chart, capital-at-risk
+            # chart, full AI report text) as a fresh manual click — not a
+            # second, poorer-quality rendering path.
+            _session_generated_at = st.session_state.get("ftmo_last_suggestion_generated_at")
+            if _session_generated_at is not None and _session_generated_at.tzinfo is None:
+                # Defensive: this can still be naive here — either a value
+                # written by an OLDER version of this code (Streamlit
+                # re-execs app.py fresh on every rerun, but session_state
+                # itself persists across reruns within the same browser
+                # session) from before that fix, or the cold-start
+                # loader's own value (populated from _load_latest_saved_
+                # suggestion, which parses a naive LOCAL timestamp from
+                # the saved file's own NAME). Either way it represents
+                # this SYSTEM's local time, not UTC — .astimezone() on a
+                # naive datetime is documented Python behavior to
+                # interpret it that way and convert correctly (unlike
+                # .replace(tzinfo=...), which would mislabel a local value
+                # as UTC without adjusting the actual time).
+                _session_generated_at = _session_generated_at.astimezone(timezone.utc)
 
-            # FtmoAssetAnalysis wraps a PMEX-shape AssetAnalysis as `.base` —
-            # unwrap it here so _render_instrument_chart (built for that
-            # shape) works unchanged, same reuse as PMEX's own chart loop.
-            ftmo_analyses = st.session_state.get("ftmo_last_suggestion_analyses") or []
-            ftmo_chartable = [
-                a.base
-                for a in ftmo_analyses
-                if a.base.display_name is not None and not a.base.prices.empty
-            ]
-            if ftmo_chartable:
-                with st.expander(f"Instrument charts ({len(ftmo_chartable)})"):
-                    for a in ftmo_chartable:
-                        _render_instrument_chart(a)
+            _persisted_loaded = _load_latest_saved_suggestion(Path(config.FTMO_RECORDS_DIR))
+            _persisted_generated_at = None
+            if _persisted_loaded is not None:
+                # generated_at here is parsed from the FILENAME, written
+                # via naive local datetime.now() (save_portfolio_session)
+                # — .astimezone() on a naive datetime is documented Python
+                # behavior to interpret it as this SYSTEM's own local time
+                # and convert correctly, making it comparable to the
+                # UTC-aware session timestamp above.
+                _persisted_generated_at = _persisted_loaded[1].astimezone(timezone.utc)
+
+            _use_persisted = _persisted_loaded is not None and (
+                not st.session_state.get("ftmo_last_suggestion_text")
+                or _session_generated_at is None
+                or (_persisted_generated_at is not None and _persisted_generated_at > _session_generated_at)
+            )
+
+            if not _use_persisted and st.session_state.get("ftmo_last_suggestion_text"):
+                if _session_generated_at is not None:
+                    st.badge(
+                        f"Generated {_session_generated_at:%Y-%m-%d %H:%M:%S} UTC",
+                        icon=":material/schedule:",
+                        color="blue",
+                    )
+                ftmo_allocation = st.session_state.get("ftmo_suggested_allocation")
+                if ftmo_allocation:
+                    _render_allocation_chart(ftmo_allocation)
+                    _render_capital_at_risk_chart(ftmo_allocation, pct_is_risk=True)
+                _render_ai_report(st.session_state["ftmo_last_suggestion_text"])
+
+                # FtmoAssetAnalysis wraps a PMEX-shape AssetAnalysis as
+                # `.base` — unwrap it here so _render_instrument_chart
+                # (built for that shape) works unchanged, same reuse as
+                # PMEX's own chart loop.
+                ftmo_analyses = st.session_state.get("ftmo_last_suggestion_analyses") or []
+                ftmo_chartable = [
+                    a.base
+                    for a in ftmo_analyses
+                    if a.base.display_name is not None and not a.base.prices.empty
+                ]
+                if ftmo_chartable:
+                    with st.expander(f"Instrument charts ({len(ftmo_chartable)})"):
+                        for a in ftmo_chartable:
+                            _render_instrument_chart(a)
+            elif _persisted_loaded is not None:
+                # Direct user report 2026-09-01: after a genuinely
+                # successful AUTOMATED mega session (the in-app auto-
+                # trigger, running on a background thread — see
+                # _fire_scheduled_job_once), this whole panel showed
+                # nothing at all — a background thread has no browser
+                # session to write ftmo_last_suggestion_text into, so an
+                # automated run's real, successful, freshly-written
+                # suggestion was invisible here even though the Execution
+                # Clerk panel below (which reads its own persisted file
+                # directly on every tick) and the real MT5 account were
+                # both already correctly reflecting it.
+                _final_answer, _ = _persisted_loaded
+                _display_text = strip_pending_setups_block(strip_allocation_block(_final_answer))
+                if len(_display_text) < 200 and len(_final_answer) > 200:
+                    _display_text = _final_answer
+                _display_text = strip_leading_process_narration(_display_text)
+                _persisted_allocation = parse_final_allocation(_final_answer)
+
+                if _persisted_generated_at is not None:
+                    st.badge(
+                        f"Generated {_persisted_generated_at:%Y-%m-%d %H:%M:%S} UTC",
+                        icon=":material/schedule:",
+                        color="blue",
+                    )
+                st.caption(
+                    "This came from the automated daily mega session, not a manual click "
+                    "in this browser tab — showing the saved suggestion directly. See the "
+                    "Execution Clerk section below for live status and any orders it's "
+                    "already acted on."
+                )
+                if _persisted_allocation:
+                    _render_allocation_chart(_persisted_allocation)
+                    _render_capital_at_risk_chart(_persisted_allocation, pct_is_risk=True)
+                _render_ai_report(_display_text)
+                # No instrument charts here — those need the live
+                # FtmoAssetAnalysis objects (price history, chart
+                # structure) a saved .md transcript never persists; only
+                # a session that actually just ran the analysis has them.
     else:
         if st.session_state.get("suggestion_error"):
             # Covers both the MT5 connection error and the claude -p call itself
@@ -3125,6 +4217,9 @@ if apply_clicked:
                 price_sanity_band_pct=config.PRICE_SANITY_BAND_PCT,
                 pending_orders=fresh_pending_orders,
                 amend_tolerance_pct=config.AMEND_TOLERANCE_PCT,
+                max_pending_order_age_hours=config.MAX_PENDING_ORDER_AGE_HOURS,
+                min_stop_distance_pct=config.MIN_STOP_DISTANCE_PCT,
+                held_position_size_tolerance_pct=config.HELD_POSITION_SIZE_TOLERANCE_PCT,
             )
             if not plan:
                 st.info("Nothing to do — the account already matches the suggested mix.")
@@ -3219,7 +4314,7 @@ if st.session_state.get(f"{_execution_state_prefix}rebalance_plan"):
 
         # See risk/apply_suggestion.py::check_execution_safety_gates'
         # own docstring for why this is a shared, pure function now
-        # rather than inline logic here — the unattended Copilot
+        # rather than inline logic here — the unattended Clerk
         # execution job needs the exact same three gates, and this logic
         # must never drift between two independently-maintained copies.
         execution_ok, block_reason = check_execution_safety_gates(

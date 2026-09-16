@@ -1,5 +1,5 @@
 """Shared PID-liveness-aware lock-file mechanism for this project's
-unattended scheduled jobs (mega_analysis_job.py, copilot_execution_job.py)
+unattended scheduled jobs (mega_analysis_job.py, clerk_execution_job.py)
 — extracted from mega_analysis_job.py, where it first shipped after a
 real live incident (see acquire_lock's own docstring), so a second
 scheduled job doesn't copy-paste a second, independently-drifting copy

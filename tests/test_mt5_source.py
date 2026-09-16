@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -8,17 +8,22 @@ import pytest
 import config
 from data.mt5_source import (
     MT5ConnectionError,
+    CancelledPendingOrder,
     HistoricalDeal,
     _ensure_symbol_selected,
     connect,
     fetch_mt5_price_history,
+    fetch_mt5_price_history_range,
+    get_cancelled_pending_orders,
     get_contract_spec,
     get_current_bid_ask,
     get_history_deals,
     get_market_watch,
+    get_pending_orders,
     get_symbol_category,
     get_trade_economics,
     group_closed_trades,
+    is_symbol_tradable_now,
     is_trading_permitted,
 )
 
@@ -458,6 +463,82 @@ def test_get_symbol_category_uncategorized_when_no_symbol_info(mock_symbol_info,
 
 
 @patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info")
+def test_is_symbol_tradable_now_crypto_always_true(mock_symbol_info, mock_select):
+    mock_symbol_info.return_value = _make_forex_info(path="Crypto I CFD\\BTCUSD")
+    # Saturday — every other category is closed, crypto never is.
+    saturday = datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc)
+    assert is_symbol_tradable_now("BTCUSD", saturday) is True
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info")
+def test_is_symbol_tradable_now_forex_closed_saturday(mock_symbol_info, mock_select):
+    mock_symbol_info.return_value = _make_forex_info(path="Forex\\Majors\\EURUSD")
+    saturday = datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc)
+    assert is_symbol_tradable_now("EURUSD", saturday) is False
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info")
+def test_is_symbol_tradable_now_forex_closed_friday_after_close_hour(mock_symbol_info, mock_select):
+    mock_symbol_info.return_value = _make_forex_info(path="Forex\\Majors\\EURUSD")
+    friday_late = datetime(2026, 9, 11, 22, 0, tzinfo=timezone.utc)
+    assert is_symbol_tradable_now("EURUSD", friday_late) is False
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info")
+def test_is_symbol_tradable_now_forex_open_friday_before_close_hour(mock_symbol_info, mock_select):
+    mock_symbol_info.return_value = _make_forex_info(path="Forex\\Majors\\EURUSD")
+    friday_morning = datetime(2026, 9, 11, 8, 0, tzinfo=timezone.utc)
+    assert is_symbol_tradable_now("EURUSD", friday_morning) is True
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info")
+def test_is_symbol_tradable_now_forex_closed_sunday_before_reopen(mock_symbol_info, mock_select):
+    mock_symbol_info.return_value = _make_forex_info(path="Forex\\Majors\\EURUSD")
+    sunday_early = datetime(2026, 9, 13, 12, 0, tzinfo=timezone.utc)
+    assert is_symbol_tradable_now("EURUSD", sunday_early) is False
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info")
+def test_is_symbol_tradable_now_forex_open_sunday_after_reopen(mock_symbol_info, mock_select):
+    mock_symbol_info.return_value = _make_forex_info(path="Forex\\Majors\\EURUSD")
+    sunday_evening = datetime(2026, 9, 13, 23, 0, tzinfo=timezone.utc)
+    assert is_symbol_tradable_now("EURUSD", sunday_evening) is True
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info")
+def test_is_symbol_tradable_now_other_category_closed_all_weekend(mock_symbol_info, mock_select):
+    mock_symbol_info.return_value = _make_forex_info(path="Metals CFD\\XAUUSD")
+    saturday = datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc)
+    sunday_evening = datetime(2026, 9, 13, 23, 0, tzinfo=timezone.utc)
+    assert is_symbol_tradable_now("XAUUSD", saturday) is False
+    # Unlike forex, "other" categories stay closed even after forex reopens.
+    assert is_symbol_tradable_now("XAUUSD", sunday_evening) is False
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info")
+def test_is_symbol_tradable_now_other_category_open_monday(mock_symbol_info, mock_select):
+    mock_symbol_info.return_value = _make_forex_info(path="Equities I CFD\\INTC")
+    monday = datetime(2026, 9, 14, 8, 0, tzinfo=timezone.utc)
+    assert is_symbol_tradable_now("INTC", monday) is True
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info")
+def test_is_symbol_tradable_now_weekday_always_open(mock_symbol_info, mock_select):
+    mock_symbol_info.return_value = _make_forex_info(path="Equities I CFD\\INTC")
+    wednesday = datetime(2026, 9, 9, 15, 0, tzinfo=timezone.utc)
+    assert is_symbol_tradable_now("INTC", wednesday) is True
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
 @patch("MetaTrader5.symbol_info_tick")
 def test_get_current_bid_ask_returns_both_sides(mock_tick, mock_select):
     mock_tick.return_value = _make_tick(1.1000, 1.1005)
@@ -660,7 +741,7 @@ def test_connect_skips_verification_when_no_login_given(mock_initialize, mock_ac
     mock_account_info.assert_not_called()
 
 
-def _make_deal(ticket, time, symbol, profit, swap, commission, volume):
+def _make_deal(ticket, time, symbol, profit, swap, commission, volume, entry=0):
     d = MagicMock()
     d.ticket = ticket
     d.time = time
@@ -669,12 +750,13 @@ def _make_deal(ticket, time, symbol, profit, swap, commission, volume):
     d.swap = swap
     d.commission = commission
     d.volume = volume
+    d.entry = entry
     return d
 
 
 @patch("MetaTrader5.history_deals_get")
 def test_get_history_deals_sums_profit_swap_and_commission(mock_history):
-    ts = int(datetime(2026, 8, 10, 12, 0, 0).timestamp())
+    ts = int(datetime(2026, 8, 10, 12, 0, 0, tzinfo=timezone.utc).timestamp())
     mock_history.return_value = [_make_deal(1, ts, "EURUSD", 50.0, -1.5, -2.0, 0.5)]
 
     deals = get_history_deals(datetime(2026, 8, 1), datetime(2026, 8, 15))
@@ -682,7 +764,147 @@ def test_get_history_deals_sums_profit_swap_and_commission(mock_history):
     assert len(deals) == 1
     assert deals[0].symbol == "EURUSD"
     assert deals[0].profit == pytest.approx(46.5)  # 50.0 - 1.5 - 2.0
+    # raw_profit (added 2026-09-02) keeps the pre-swap/commission figure
+    # too — this is what the MT5 terminal's own "Profit" column shows.
+    assert deals[0].raw_profit == pytest.approx(50.0)
     assert deals[0].volume == 0.5
+
+
+@patch("MetaTrader5.history_deals_get")
+def test_get_history_deals_time_is_timezone_aware_utc_not_machine_local(mock_history):
+    # Real bug found live 2026-09-01: datetime.fromtimestamp(d.time) with
+    # no tz= rendered each deal's raw (timezone-independent) Unix epoch
+    # in whatever timezone the RUNNING MACHINE happened to be set to —
+    # the same real trade displayed a different wall-clock time in the
+    # app's own Trade History table depending on which computer ran it,
+    # up to several hours off from what the MT5 terminal itself shows
+    # (UTC). A fixed epoch must always decode to the same UTC instant
+    # regardless of machine timezone.
+    epoch = 1788262221  # a real deal timestamp from the incident that found this bug
+    mock_history.return_value = [_make_deal(1, epoch, "AUDUSD", 0.0, 0.0, -0.28, 0.11)]
+
+    deals = get_history_deals(datetime(2026, 8, 1), datetime(2026, 9, 15))
+
+    assert deals[0].time == datetime(2026, 9, 1, 11, 30, 21, tzinfo=timezone.utc)
+    assert deals[0].time.tzinfo is not None
+
+
+@patch("MetaTrader5.orders_get")
+def test_get_pending_orders_time_setup_is_timezone_aware_utc_not_machine_local(mock_orders):
+    # Real bug found live 2026-09-04: the exact same naive-datetime
+    # mistake as get_history_deals' own time field (fixed 2026-09-01)
+    # recurred here — datetime.fromtimestamp(o.time_setup) with no tz=
+    # rendered in the running machine's own local timezone. This one
+    # actually crashed a real poll: risk/apply_suggestion.py::compute_
+    # rebalance_plan's pending-order-age check compares this against
+    # datetime.now(timezone.utc) and raised "can't subtract offset-naive
+    # and offset-aware datetimes" the first time it ran against a real
+    # order fetched here.
+    order = MagicMock(
+        symbol="XAUUSD", volume_current=0.1, type=2, price_open=2000.0,
+        sl=1980.0, tp=2050.0, ticket=123, time_setup=1788262221,
+    )
+    mock_orders.return_value = [order]
+
+    orders = get_pending_orders()
+
+    assert orders[0].time_setup == datetime(2026, 9, 1, 11, 30, 21, tzinfo=timezone.utc)
+    assert orders[0].time_setup.tzinfo is not None
+    assert orders[0].order_type == "buy limit"
+
+
+def _make_order(ticket, symbol, order_type, state, price_open, sl, tp, volume_initial, time_setup, time_done):
+    return MagicMock(
+        ticket=ticket, symbol=symbol, type=order_type, state=state,
+        price_open=price_open, sl=sl, tp=tp, volume_initial=volume_initial,
+        time_setup=time_setup, time_done=time_done,
+    )
+
+
+@patch("MetaTrader5.history_orders_get")
+def test_get_cancelled_pending_orders_returns_canceled_and_expired_only(mock_orders):
+    # Real incident this was built for: an INTC buy-limit order sitting
+    # well below a fast-moving market, cancelled without ever filling —
+    # get_history_deals/get_pending_orders alone have no way to see this.
+    import MetaTrader5 as mt5
+
+    setup_ts = int(datetime(2026, 9, 8, 16, 50, 16, tzinfo=timezone.utc).timestamp())
+    done_ts = int(datetime(2026, 9, 9, 12, 0, 0, tzinfo=timezone.utc).timestamp())
+    mock_orders.return_value = [
+        _make_order(1, "INTC", mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_STATE_CANCELED, 95.82, 93.4, 97.7, 8.0, setup_ts, done_ts),
+        _make_order(2, "AMD", mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_STATE_EXPIRED, 481.0, 473.5, 497.25, 2.0, setup_ts, done_ts),
+        # These two must be excluded: a real fill and a broker-side rejection
+        # are both genuinely different situations, not a missed opportunity.
+        _make_order(3, "EURUSD", mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_STATE_FILLED, 1.09, 1.08, 1.11, 1.0, setup_ts, done_ts),
+        _make_order(4, "GBPUSD", mt5.ORDER_TYPE_SELL_LIMIT, mt5.ORDER_STATE_REJECTED, 1.30, 1.31, 1.28, 1.0, setup_ts, done_ts),
+    ]
+
+    orders = get_cancelled_pending_orders(datetime(2026, 9, 1))
+
+    assert {o.symbol for o in orders} == {"INTC", "AMD"}
+    intc = next(o for o in orders if o.symbol == "INTC")
+    assert intc.side == "buy"
+    assert intc.order_type == "buy limit"
+    assert intc.price_open == 95.82
+    assert intc.sl == 93.4
+    assert intc.tp == 97.7
+    assert intc.volume == 8.0
+    assert intc.time_setup == datetime(2026, 9, 8, 16, 50, 16, tzinfo=timezone.utc)
+    assert intc.time_setup.tzinfo is not None
+    assert intc.time_done == datetime(2026, 9, 9, 12, 0, 0, tzinfo=timezone.utc)
+    assert intc.time_done.tzinfo is not None
+
+
+@patch("MetaTrader5.history_orders_get", return_value=[])
+def test_get_cancelled_pending_orders_empty_when_nothing_cancelled(mock_orders):
+    assert get_cancelled_pending_orders(datetime(2026, 9, 1)) == []
+
+
+@patch("MetaTrader5.last_error", return_value=(-2, "not connected"))
+@patch("MetaTrader5.history_orders_get", return_value=None)
+def test_get_cancelled_pending_orders_empty_on_failure(mock_orders, mock_last_error, caplog):
+    with caplog.at_level(logging.WARNING):
+        result = get_cancelled_pending_orders(datetime(2026, 9, 1))
+    assert result == []
+    assert "not connected" in caplog.text
+
+
+@patch("MetaTrader5.history_orders_get")
+def test_get_cancelled_pending_orders_side_detected_for_sell_types(mock_orders):
+    import MetaTrader5 as mt5
+
+    setup_ts = int(datetime(2026, 9, 8, 4, 34, 17, tzinfo=timezone.utc).timestamp())
+    done_ts = int(datetime(2026, 9, 9, 12, 35, 21, tzinfo=timezone.utc).timestamp())
+    mock_orders.return_value = [
+        _make_order(5, "USDCNH", mt5.ORDER_TYPE_SELL_LIMIT, mt5.ORDER_STATE_CANCELED, 6.714, 6.7185, 6.701, 0.04, setup_ts, done_ts),
+    ]
+
+    orders = get_cancelled_pending_orders(datetime(2026, 9, 1))
+
+    assert orders[0].side == "sell"
+
+
+@patch("MetaTrader5.history_orders_get")
+def test_get_cancelled_pending_orders_returns_newest_first(mock_orders):
+    # Real bug found on self-review: mt5.history_orders_get() gives no
+    # ordering guarantee (ticket/time-ascending in practice), yet
+    # ai.curiosity.score_missed_opportunities slices its input assuming
+    # "most recent pool_size first" -- mirrors group_closed_trades' own
+    # explicit newest-first sort so that assumption is actually true.
+    import MetaTrader5 as mt5
+
+    oldest = int(datetime(2026, 9, 1, 0, 0, 0, tzinfo=timezone.utc).timestamp())
+    middle = int(datetime(2026, 9, 5, 0, 0, 0, tzinfo=timezone.utc).timestamp())
+    newest = int(datetime(2026, 9, 9, 0, 0, 0, tzinfo=timezone.utc).timestamp())
+    mock_orders.return_value = [
+        _make_order(1, "OLDEST", mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_STATE_CANCELED, 1.0, None, None, 1.0, oldest, oldest),
+        _make_order(2, "NEWEST", mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_STATE_CANCELED, 1.0, None, None, 1.0, middle, newest),
+        _make_order(3, "MIDDLE", mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_STATE_CANCELED, 1.0, None, None, 1.0, oldest, middle),
+    ]
+
+    orders = get_cancelled_pending_orders(datetime(2026, 9, 1))
+
+    assert [o.symbol for o in orders] == ["NEWEST", "MIDDLE", "OLDEST"]
 
 
 @patch("MetaTrader5.last_error", return_value=(-2, "not connected"))
@@ -709,11 +931,11 @@ def test_group_closed_trades_sums_every_leg_onto_the_position():
     deals = [
         HistoricalDeal(
             1, datetime(2026, 8, 18, 9, 47, 28), "XAUUSD", -1.51, 0.49,
-            position_id=100, price=4407.58, side="buy",
+            position_id=100, price=4407.58, side="buy", entry=0,
         ),
         HistoricalDeal(
             2, datetime(2026, 8, 18, 10, 2, 56), "XAUUSD", -333.24, 0.49,
-            position_id=100, price=4400.81, side="sell",
+            position_id=100, price=4400.81, side="sell", entry=1,
         ),
     ]
     trades = group_closed_trades(deals)
@@ -745,13 +967,54 @@ def test_group_closed_trades_excludes_non_trade_balance_deals():
 
 def test_group_closed_trades_sorts_newest_first():
     deals = [
-        HistoricalDeal(1, datetime(2026, 8, 1), "EURUSD", -1.0, 1.0, position_id=1),
-        HistoricalDeal(2, datetime(2026, 8, 2), "EURUSD", 5.0, 1.0, position_id=1),
-        HistoricalDeal(3, datetime(2026, 8, 10), "GBPUSD", -1.0, 1.0, position_id=2),
-        HistoricalDeal(4, datetime(2026, 8, 11), "GBPUSD", 20.0, 1.0, position_id=2),
+        HistoricalDeal(1, datetime(2026, 8, 1), "EURUSD", -1.0, 1.0, position_id=1, entry=0),
+        HistoricalDeal(2, datetime(2026, 8, 2), "EURUSD", 5.0, 1.0, position_id=1, entry=1),
+        HistoricalDeal(3, datetime(2026, 8, 10), "GBPUSD", -1.0, 1.0, position_id=2, entry=0),
+        HistoricalDeal(4, datetime(2026, 8, 11), "GBPUSD", 20.0, 1.0, position_id=2, entry=1),
     ]
     trades = group_closed_trades(deals)
     assert [t.position_id for t in trades] == [2, 1]
+
+
+def test_group_closed_trades_handles_multiple_partial_closes_correctly():
+    # Real bug found live 2026-09-01, comparing this account's own MT5
+    # terminal against the app's Trade History table: a position opened
+    # at 0.11 lots, then closed across THREE separate exit legs (two
+    # tactical partial-close DEFEND actions, then a final close) — the
+    # old code picked the LAST deal by time as "the closing leg" and
+    # used only ITS volume/price for the whole row, showing 0.04 lots
+    # (the final leg alone) instead of the real 0.11 lots actually
+    # traded, and a close price that ignored the other two exits.
+    # These are the exact real numbers from that incident.
+    deals = [
+        HistoricalDeal(1, datetime(2026, 9, 1, 11, 30, 21), "AUDUSD", -0.28, 0.11,
+                        position_id=500, price=0.71501, side="buy", entry=0, raw_profit=0.0),
+        HistoricalDeal(2, datetime(2026, 9, 1, 12, 55, 36), "AUDUSD", -2.26, 0.04,
+                        position_id=500, price=0.71447, side="sell", entry=1, raw_profit=-2.16),
+        HistoricalDeal(3, datetime(2026, 9, 1, 14, 0, 17), "AUDUSD", -2.15, 0.03,
+                        position_id=500, price=0.71432, side="sell", entry=1, raw_profit=-2.07),
+        HistoricalDeal(4, datetime(2026, 9, 1, 15, 59, 15), "AUDUSD", 0.66, 0.04,
+                        position_id=500, price=0.71520, side="sell", entry=1, raw_profit=0.76),
+    ]
+    trades = group_closed_trades(deals)
+
+    assert len(trades) == 1
+    trade = trades[0]
+    assert trade.side == "buy"
+    assert trade.volume == pytest.approx(0.11)  # total actually closed, not just the last leg
+    assert trade.open_price == pytest.approx(0.71501)
+    # Volume-weighted average across all three exit legs — matches what
+    # the real MT5 terminal itself displayed for this exact position
+    # (0.71469455) to 5 decimal places.
+    assert trade.close_price == pytest.approx(0.7146945, abs=1e-6)
+    assert trade.opened_at == datetime(2026, 9, 1, 11, 30, 21)
+    assert trade.closed_at == datetime(2026, 9, 1, 15, 59, 15)
+    assert trade.profit == pytest.approx(-0.28 - 2.26 - 2.15 + 0.66)  # -4.03, every leg summed
+    # gross_profit (raw, no commission/swap) matches what the real MT5
+    # terminal itself displayed in its own "Profit" column for this
+    # exact position: -3.47 — confirming the app's net figure and MT5's
+    # gross figure are both correct, just measuring different things.
+    assert trade.gross_profit == pytest.approx(0.0 - 2.16 - 2.07 + 0.76)  # -3.47
 
 
 @patch("MetaTrader5.history_deals_get", return_value=[])
@@ -812,6 +1075,67 @@ def test_fetch_mt5_price_history_empty_on_no_data(mock_copy_rates, mock_select, 
 def test_fetch_mt5_price_history_rejects_unsupported_timeframe():
     with pytest.raises(ValueError, match="Unsupported timeframe"):
         fetch_mt5_price_history("EURUSD", "M15")
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.copy_rates_range")
+def test_fetch_mt5_price_history_range_shapes_dataframe_and_uses_bounds(mock_copy_rates_range, mock_select):
+    import numpy as np
+
+    dtype = np.dtype(
+        [
+            ("time", "i8"), ("open", "f8"), ("high", "f8"), ("low", "f8"),
+            ("close", "f8"), ("tick_volume", "i8"), ("spread", "i4"), ("real_volume", "i8"),
+        ]
+    )
+    ts = int(datetime(2026, 8, 10, 12, 0, 0).timestamp())
+    rates = np.array([_make_rate(ts, 1.1, 1.2, 1.05, 1.15, 1000)], dtype=dtype)
+    mock_copy_rates_range.return_value = rates
+
+    date_from = datetime(2026, 8, 10, 6, 0, 0)
+    date_to = datetime(2026, 8, 10, 18, 0, 0)
+    df = fetch_mt5_price_history_range("EURUSD", "H1", date_from, date_to)
+
+    assert list(df.columns) == ["Open", "High", "Low", "Close", "Volume"]
+    assert df.iloc[0]["Close"] == pytest.approx(1.15)
+    assert isinstance(df.index, pd.DatetimeIndex)
+    mock_select.assert_called_once_with("EURUSD", True)
+    call_args = mock_copy_rates_range.call_args.args
+    assert call_args[2] == date_from
+    assert call_args[3] == date_to
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.copy_rates_range")
+def test_fetch_mt5_price_history_range_strips_aware_datetimes_to_naive(mock_copy_rates_range, mock_select):
+    mock_copy_rates_range.return_value = None
+    aware_from = datetime(2026, 8, 10, 6, 0, 0, tzinfo=timezone.utc)
+    aware_to = datetime(2026, 8, 10, 18, 0, 0, tzinfo=timezone.utc)
+
+    fetch_mt5_price_history_range("EURUSD", "H1", aware_from, aware_to)
+
+    call_args = mock_copy_rates_range.call_args.args
+    assert call_args[2].tzinfo is None
+    assert call_args[3].tzinfo is None
+
+
+@patch("MetaTrader5.last_error", return_value=(-2, "no history"))
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.copy_rates_range", return_value=None)
+def test_fetch_mt5_price_history_range_empty_on_no_data(mock_copy_rates_range, mock_select, mock_last_error, caplog):
+    with caplog.at_level(logging.WARNING):
+        df = fetch_mt5_price_history_range(
+            "UNKNOWN", "D1", datetime(2026, 8, 1), datetime(2026, 8, 10)
+        )
+    assert df.empty
+    assert list(df.columns) == ["Open", "High", "Low", "Close", "Volume"]
+    assert "UNKNOWN" in caplog.text
+    assert "no history" in caplog.text
+
+
+def test_fetch_mt5_price_history_range_rejects_unsupported_timeframe():
+    with pytest.raises(ValueError, match="Unsupported timeframe"):
+        fetch_mt5_price_history_range("EURUSD", "M15", datetime(2026, 8, 1), datetime(2026, 8, 10))
 
 
 def _make_terminal_info(trade_allowed=True):

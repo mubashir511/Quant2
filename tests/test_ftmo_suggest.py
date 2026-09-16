@@ -8,22 +8,28 @@ import config
 from ai.claude_cli import CLI_FAILED_PREFIX, CLI_MISSING_MESSAGE
 from ai.ftmo_suggest import (
     AUDIT_INSTRUCTION,
+    MIN_VIABLE_SIZE_ATR_MULTIPLE,
     FtmoAssetAnalysis,
     _MN1_BACKTEST_BARS,
+    _build_bare_base_analysis,
     _enrich_with_native_d1,
     _fetch_current_ftmo_price,
     _ftmo_commission_pct_round_turn,
     _real_backtest_execution_kwargs,
+    _tactical_trend_vs_regime_conflict,
     analyze_ftmo_asset_live,
     analyze_ftmo_assets,
     build_ftmo_stage1_instruction,
     build_ftmo_stage2_instruction,
     build_ftmo_summary,
+    build_trend_radar,
     classify_long_term_alignment,
     compute_ftmo_correlation_pairs,
     format_ftmo_asset_context,
     format_ftmo_correlation_context,
     format_ftmo_status_context,
+    format_ftmo_held_position_sizing_rates,
+    format_ftmo_min_viable_size,
     format_ftmo_trade_cost,
     format_long_term_alignment,
     format_long_term_alignment_short,
@@ -32,12 +38,13 @@ from ai.ftmo_suggest import (
 )
 from ai.ftmo_suggest import _write_latest_suggestion
 from ai.portfolio_suggest import AssetAnalysis, AuditResult
+from analysis.backtest import FavorableExcursionStats, RSIReactionBacktest
 from analysis.chart_structure import ChartStructureSnapshot, SRLevel, SRLevelsResult
 from analysis.technical import TechnicalStats, compute_technical_stats
-from data.mt5_source import AccountSummary, ContractSpec, MarketAsset, PendingOrder, TradeCost
+from data.mt5_source import AccountSummary, ContractSpec, MarketAsset, PendingOrder, Position, TradeCost
 
 
-def _ts(market_regime=None, last_price=None, trend=None, momentum_acceleration=None) -> TechnicalStats:
+def _ts(market_regime=None, last_price=None, trend=None, momentum_acceleration=None, atr=None) -> TechnicalStats:
     """Minimal TechnicalStats with only a few fields set — everything
     format_long_term_alignment/its tests need, without needing a real
     price series shaped to produce a specific regime. Built by keyword,
@@ -48,7 +55,7 @@ def _ts(market_regime=None, last_price=None, trend=None, momentum_acceleration=N
         last_price=last_price, sma20=None, pct_vs_sma20=None, trend=trend,
         change_1m_pct=None, change_3m_pct=None, change_6m_pct=None,
         volatility_annualized_pct=None, support=None, resistance=None,
-        range_width_pct=None, market_regime=market_regime, atr=None,
+        range_width_pct=None, market_regime=market_regime, atr=atr,
         atr_pct=None, rsi=None, volume_trend_pct=None,
         momentum_acceleration=momentum_acceleration,
     )
@@ -68,6 +75,17 @@ def _no_real_past_lessons():
     so every suggest_ftmo_portfolio()-calling test stays fast and
     network-free."""
     with patch("ai.ftmo_suggest.build_past_lessons", return_value=""):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _no_real_curiosity_report():
+    """Same rationale as _no_real_past_lessons above: build_curiosity_report
+    does real MT5 deal-history I/O, real file I/O against records/ftmo/
+    and records/ftmo_curiosity/, and a real OpenRouter model call — patch
+    it to inert by default so every suggest_ftmo_portfolio()-calling test
+    stays fast and network-free."""
+    with patch("ai.ftmo_suggest.build_curiosity_report", return_value=""):
         yield
 
 
@@ -187,6 +205,30 @@ def test_enrich_with_native_d1_leaves_bare_when_mt5_also_has_nothing(mock_fetch)
 
     assert result is base
     assert result.display_name is None
+
+
+@patch("ai.ftmo_suggest.is_symbol_tradable_now")
+@patch("ai.ftmo_suggest.get_contract_spec", return_value=None)
+def test_build_bare_base_analysis_sets_market_open(mock_contract_spec, mock_tradable):
+    mock_tradable.return_value = False
+    base = _build_bare_base_analysis(MarketAsset("EURUSD", "Euro vs US Dollar", 1.1000, 1.1005))
+    assert base.market_open is False
+    mock_tradable.assert_called_once()
+    assert mock_tradable.call_args.args[0] == "EURUSD"
+
+
+@patch("ai.ftmo_suggest.fetch_mt5_price_history")
+def test_enrich_with_native_d1_preserves_market_open_from_base(mock_fetch):
+    # _enrich_with_native_d1 rebuilds a fresh AssetAnalysis from scratch
+    # on the real-backfill path -- must carry market_open over from the
+    # bare base rather than silently dropping back to its own default.
+    base = _make_base_analysis(display_name=None)
+    base.market_open = False
+    mock_fetch.return_value = _make_intraday_history(n=300)
+
+    result = _enrich_with_native_d1(base)
+
+    assert result.market_open is False
 
 
 @patch("ai.ftmo_suggest.backtest_support_resistance_reaction")
@@ -318,6 +360,23 @@ def test_analyze_ftmo_assets_adds_d1_and_monthly_structure(
     # D1, H4, H1, then MN1 (with its own bar count), all for this symbol.
     assert mock_fetch_history.call_args_list[3].args == ("EURUSD", "MN1")
     assert mock_fetch_history.call_args_list[3].kwargs == {"count": _MN1_BACKTEST_BARS}
+
+
+@patch("ai.ftmo_suggest.is_symbol_tradable_now")
+@patch("ai.ftmo_suggest.get_trade_economics")
+@patch("ai.ftmo_suggest.get_contract_spec")
+@patch("ai.ftmo_suggest.fetch_mt5_price_history")
+def test_analyze_ftmo_asset_live_sets_market_open(
+    mock_fetch_history, mock_contract_spec, mock_trade_economics, mock_tradable
+):
+    mock_fetch_history.return_value = _make_intraday_history(n=300)
+    mock_contract_spec.return_value = None
+    mock_trade_economics.return_value = _make_trade_cost()
+    mock_tradable.return_value = False
+
+    result = analyze_ftmo_asset_live("EURUSD", bid=1.1000, ask=1.1005, description="Euro vs US Dollar")
+
+    assert result.base.market_open is False
 
 
 @patch("ai.ftmo_suggest.get_trade_economics")
@@ -869,7 +928,7 @@ def test_long_term_alignment_none_when_no_real_backdrop_direction():
 
 def test_long_term_alignment_none_when_h4_itself_flat_or_missing():
     flat = _analysis_with_regimes("sideways", "trending_up", "trending_up")
-    assert "no real short-term direction" in format_long_term_alignment(flat)
+    assert "no real net direction" in format_long_term_alignment(flat)
 
     missing = _analysis_with_regimes(None, "trending_up", "trending_up")
     assert "not available" in format_long_term_alignment(missing)
@@ -881,6 +940,105 @@ def test_format_ftmo_asset_context_includes_monthly_and_long_term_alignment():
     assert "Monthly technical" in text
     assert "Long-term alignment" in text
     assert "STRUCTURALLY BACKED" in text
+
+
+# --- _tactical_trend_vs_regime_conflict / conflict warning, added
+# 2026-09-11 after a real incident: a BTCUSD buy cited STRUCTURALLY
+# BACKED (market_regime agreed with D1/Monthly) while H1 and H4's own
+# TREND fields (a genuinely different metric, format_mtf_confluence's
+# own H4-vs-H1 line) both explicitly read downtrend underneath it,
+# unaddressed in the thesis.
+
+
+def _analysis_with_trends(h4_trend, h1_trend, h4_regime, d1_regime, mn1_regime) -> FtmoAssetAnalysis:
+    base = AssetAnalysis(
+        symbol="BTCUSD", description="Bitcoin vs US Dollar", bid=78327.46, ask=78328.46,
+        display_name="Bitcoin vs US Dollar", stats=_ts(market_regime=d1_regime),
+    )
+    return FtmoAssetAnalysis(
+        base=base,
+        h4_stats=_ts(market_regime=h4_regime, trend=h4_trend),
+        h1_stats=_ts(market_regime=None, trend=h1_trend),
+        h4_structure=_empty_chart_structure(),
+        h1_structure=_empty_chart_structure(),
+        trade_cost=None,
+        mn1_stats=_ts(market_regime=mn1_regime),
+    )
+
+
+def test_tactical_regime_conflict_fires_on_the_real_btcusd_pattern():
+    # Exact real incident reconstruction: H1 and H4 TREND both read
+    # downtrend, but market_regime (choppy_up, backed by D1/Monthly
+    # trending_up) reads STRUCTURALLY BACKED upward.
+    analysis = _analysis_with_trends(
+        h4_trend="downtrend", h1_trend="downtrend",
+        h4_regime="choppy_up", d1_regime="trending_up", mn1_regime="trending_up",
+    )
+    warning = _tactical_trend_vs_regime_conflict(analysis, "up")
+    assert warning is not None
+    assert "TACTICAL/REGIME CONFLICT" in warning
+    assert "DOWNward" in warning
+    assert "BTCUSD" in warning  # cites the real incident by name
+
+    text = format_long_term_alignment(analysis)
+    assert "STRUCTURALLY BACKED" in text
+    assert "TACTICAL/REGIME CONFLICT" in text
+
+
+def test_tactical_regime_conflict_silent_when_trend_and_regime_agree():
+    analysis = _analysis_with_trends(
+        h4_trend="uptrend", h1_trend="uptrend",
+        h4_regime="trending_up", d1_regime="trending_up", mn1_regime="trending_up",
+    )
+    assert _tactical_trend_vs_regime_conflict(analysis, "up") is None
+    assert "TACTICAL/REGIME CONFLICT" not in format_long_term_alignment(analysis)
+
+
+def test_tactical_regime_conflict_silent_when_h1_and_h4_trend_disagree_with_each_other():
+    # No real, un-hedged tactical read to compare against the regime at
+    # all -- H1 and H4 themselves don't even agree.
+    analysis = _analysis_with_trends(
+        h4_trend="uptrend", h1_trend="downtrend",
+        h4_regime="choppy_up", d1_regime="trending_up", mn1_regime="trending_up",
+    )
+    assert _tactical_trend_vs_regime_conflict(analysis, "up") is None
+
+
+def test_tactical_regime_conflict_silent_when_trend_is_flat():
+    analysis = _analysis_with_trends(
+        h4_trend="flat", h1_trend="flat",
+        h4_regime="choppy_up", d1_regime="trending_up", mn1_regime="trending_up",
+    )
+    assert _tactical_trend_vs_regime_conflict(analysis, "up") is None
+
+
+def test_tactical_regime_conflict_silent_when_regime_direction_is_flat():
+    # Real bug caught on self-review before this ever shipped: wording a
+    # "conflict" against a FLAT regime direction (H4's own regime shows
+    # no real net direction) would be misleading -- there's nothing
+    # genuinely opposite for the tactical read to conflict WITH.
+    analysis = _analysis_with_trends(
+        h4_trend="downtrend", h1_trend="downtrend",
+        h4_regime="sideways", d1_regime="trending_up", mn1_regime="trending_up",
+    )
+    assert _tactical_trend_vs_regime_conflict(analysis, "flat") is None
+
+
+def test_tactical_regime_conflict_silent_when_regime_direction_is_none():
+    analysis = _analysis_with_trends(
+        h4_trend="downtrend", h1_trend="downtrend",
+        h4_regime=None, d1_regime="trending_up", mn1_regime="trending_up",
+    )
+    assert _tactical_trend_vs_regime_conflict(analysis, None) is None
+
+
+def test_long_term_alignment_regime_wording_distinguishes_from_trend_line():
+    # Real incident, 2026-09-11: the old "the H4 {dir}ward move" wording
+    # read as flatly restating format_mtf_confluence's own H4-vs-H1
+    # TREND line, when the two are genuinely different metrics.
+    analysis = _analysis_with_regimes("trending_up", "trending_up", "choppy_up")
+    text = format_long_term_alignment(analysis)
+    assert "medium-term REGIME direction" in text
 
 
 # --- format_long_term_alignment_short / classify_long_term_alignment ---
@@ -924,6 +1082,107 @@ def test_long_term_alignment_short_and_long_never_disagree_on_state():
     analysis = _analysis_with_regimes("choppy_up", "trending_down", "choppy_down")
     assert "COUNTER-TREND SPIKE" in format_long_term_alignment(analysis)
     assert "short spike" in format_long_term_alignment_short(analysis)
+
+
+# --- build_trend_radar ---
+# Direct root-cause fix, 2026-09-05: a real mega session left EURUSD/
+# GBPUSD excluded (99.1% cash overall) despite each reading a live H1
+# trend_intact setup — real, computed evidence that was correctly there
+# but never surfaced saliently enough among ~300 lines of per-instrument
+# detail to be genuinely engaged with. These tests lock in that a
+# genuine trend setup gets caught and labeled, and that a non-trending
+# instrument is correctly left out rather than padding the list.
+
+
+def _trend_radar_analysis(symbol, h1_regime, h1_trend, h4_regime=None, h4_trend=None) -> FtmoAssetAnalysis:
+    """h4 defaults to mirroring h1 (the common case — a clean trend reads
+    the same way on both timeframes); pass h4_regime/h4_trend explicitly
+    to build a genuine H4-vs-H1 conflict/partial case instead. base.stats
+    and mn1_stats are left at their real defaults (market_regime=None),
+    so classify_long_term_alignment always resolves to "no_backdrop"
+    here — this fixture is about the H1/H4 setup + alignment read, not
+    the longer-term backdrop, which format_long_term_alignment's own
+    tests above already cover directly. last_price=1.0 on both stats —
+    classify_setups bails to [] immediately when last_price is None
+    (_ts()'s own default), which would silently defeat every case here."""
+    h4_regime = h1_regime if h4_regime is None else h4_regime
+    h4_trend = h1_trend if h4_trend is None else h4_trend
+    base = AssetAnalysis(symbol=symbol, description=symbol, bid=1.0, ask=1.0005, display_name=symbol)
+    return FtmoAssetAnalysis(
+        base=base,
+        h4_stats=_ts(market_regime=h4_regime, trend=h4_trend, last_price=1.0),
+        h1_stats=_ts(market_regime=h1_regime, trend=h1_trend, last_price=1.0),
+        h4_structure=_empty_chart_structure(),
+        h1_structure=_empty_chart_structure(),
+        trade_cost=None,
+    )
+
+
+def test_build_trend_radar_flags_a_clean_trend_with_alignment_labels():
+    analysis = _trend_radar_analysis("EURUSD", "trending_up", "uptrend")
+    radar = build_trend_radar([analysis])
+    assert "EURUSD" in radar
+    assert "trend_intact" in radar
+    assert "H4/H1 ALIGNED" in radar
+    assert "no long-term backdrop available" in radar
+
+
+def test_build_trend_radar_flags_h4_h1_conflict():
+    analysis = _trend_radar_analysis(
+        "GBPUSD", h1_regime="trending_up", h1_trend="uptrend",
+        h4_regime="trending_down", h4_trend="downtrend",
+    )
+    radar = build_trend_radar([analysis])
+    assert "GBPUSD" in radar
+    assert "H4/H1 CONFLICTING" in radar
+
+
+def test_build_trend_radar_empty_string_when_nothing_qualifies():
+    # sideways regime, no momentum-acceleration override -> no rule in
+    # classify_setups fires (confirmed against analysis/setup_classifier.py
+    # directly: in_progress_move ALSO needs sideways, but additionally
+    # requires momentum_acceleration in ("accelerating_up",
+    # "accelerating_down"), which _ts()'s own default (None) never is).
+    analysis = _trend_radar_analysis("USDCHF", "sideways", "flat")
+    assert build_trend_radar([analysis]) == ""
+
+
+def test_build_trend_radar_omits_non_trending_instruments_and_asks_for_specific_reasons():
+    trending = _trend_radar_analysis("EURUSD", "trending_up", "uptrend")
+    flat = _trend_radar_analysis("USDCHF", "sideways", "flat")
+    radar = build_trend_radar([trending, flat])
+    assert "EURUSD" in radar
+    assert "USDCHF" not in radar
+    assert "SPECIFIC technical reason" in radar
+
+
+@patch("ai.ftmo_suggest.build_macro_snapshot", return_value="MACRO")
+@patch("ai.ftmo_suggest.format_book_wisdom", return_value="WISDOM")
+def test_build_ftmo_summary_includes_trend_radar_when_present(mock_wisdom, mock_macro):
+    account = AccountSummary(balance=100_000.0, equity=100_000.0, free_margin=90_000.0, currency="USD")
+    analyses = [_trend_radar_analysis("EURUSD", "trending_up", "uptrend")]
+    summary = build_ftmo_summary(
+        account,
+        assets=[MarketAsset("EURUSD", "Euro", 1.1, 1.1005)],
+        ftmo_status=_make_status(),
+        analyses=analyses,
+    )
+    assert "Trend Radar" in summary
+    assert "EURUSD: trend_intact" in summary
+
+
+@patch("ai.ftmo_suggest.build_macro_snapshot", return_value="MACRO")
+@patch("ai.ftmo_suggest.format_book_wisdom", return_value="WISDOM")
+def test_build_ftmo_summary_omits_trend_radar_when_nothing_qualifies(mock_wisdom, mock_macro):
+    account = AccountSummary(balance=100_000.0, equity=100_000.0, free_margin=90_000.0, currency="USD")
+    analyses = [_trend_radar_analysis("USDCHF", "sideways", "flat")]
+    summary = build_ftmo_summary(
+        account,
+        assets=[MarketAsset("USDCHF", "Swissy", 0.81, 0.8101)],
+        ftmo_status=_make_status(),
+        analyses=analyses,
+    )
+    assert "Trend Radar" not in summary
 
 
 # --- _ftmo_commission_pct_round_turn / format_ftmo_trade_cost ---
@@ -1201,6 +1460,227 @@ def test_format_ftmo_trade_cost_equities_no_longer_flagged_as_unknown():
     assert f"{config.FTMO_COMMISSION_EQUITIES_PCT_ROUND_TURN:.4f}%" in text
 
 
+# --- format_ftmo_min_viable_size, added 2026-09-11 after a real
+# incident: several real positions were sized so small (against a small
+# aggregate-heat budget split across too many names) that their real
+# risk distance couldn't clear the broker's own minimum lot at all --
+# "Risking 0.1% of equity against this stop distance can't afford even
+# the minimum 0.01-lot for this instrument" -- discovered only AFTER the
+# mega session had already committed to including them.
+
+
+def _analysis_for_min_viable_size(volume_min=0.01, trade_contract_size=100.0, atr=None) -> FtmoAssetAnalysis:
+    spec = ContractSpec(
+        volume_min=volume_min, volume_step=0.01, volume_max=500.0,
+        trade_contract_size=trade_contract_size, currency_margin="USD", margin_initial=1000.0,
+    )
+    base = AssetAnalysis(
+        symbol="XAUUSD", description="Gold", bid=4370.0, ask=4370.5,
+        display_name=None, contract_spec=spec,
+    )
+    return FtmoAssetAnalysis(
+        base=base, h4_stats=_ts(), h1_stats=_ts(atr=atr),
+        h4_structure=_empty_chart_structure(), h1_structure=_empty_chart_structure(),
+        trade_cost=None,
+    )
+
+
+def test_min_viable_size_computes_the_real_minimum_pct():
+    # Hand-verified: stop_distance = 1.5 x 30.0 = 45.0; min_pct =
+    # (0.01 lot x 45.0 x 100.0 contract_size) / 10,000 equity x 100 =
+    # 45.0 / 10,000 x 100 = 0.45%.
+    analysis = _analysis_for_min_viable_size(atr=30.0)
+    text = format_ftmo_min_viable_size(analysis, account_equity=10_000.0)
+    assert text is not None
+    assert f"{MIN_VIABLE_SIZE_ATR_MULTIPLE:g}x H1 ATR" in text
+    assert "45" in text  # the real stop distance in price units
+    assert "0.45%" in text
+
+
+def test_min_viable_size_scales_with_min_lot_and_contract_size():
+    # Doubling volume_min must exactly double the required pct -- pure
+    # linear relationship, a real regression guard on the formula itself.
+    base_text = format_ftmo_min_viable_size(_analysis_for_min_viable_size(volume_min=0.01, atr=30.0), 10_000.0)
+    doubled_text = format_ftmo_min_viable_size(_analysis_for_min_viable_size(volume_min=0.02, atr=30.0), 10_000.0)
+    assert "0.45%" in base_text
+    assert "0.90%" in doubled_text
+
+
+def test_min_viable_size_none_without_contract_spec():
+    analysis = _analysis_for_min_viable_size(atr=30.0)
+    analysis.base.contract_spec = None
+    assert format_ftmo_min_viable_size(analysis, account_equity=10_000.0) is None
+
+
+def test_min_viable_size_none_without_atr():
+    analysis = _analysis_for_min_viable_size(atr=None)
+    assert format_ftmo_min_viable_size(analysis, account_equity=10_000.0) is None
+
+
+def test_min_viable_size_none_without_account_equity():
+    analysis = _analysis_for_min_viable_size(atr=30.0)
+    assert format_ftmo_min_viable_size(analysis, account_equity=None) is None
+    assert format_ftmo_min_viable_size(analysis, account_equity=0.0) is None
+
+
+def test_min_viable_size_wired_into_asset_context():
+    analysis = _analysis_for_min_viable_size(atr=30.0)
+    text = format_ftmo_asset_context([analysis], account_equity=10_000.0)
+    assert "minimum viable size" in text
+    assert "0.45%" in text
+
+
+def test_min_viable_size_absent_from_asset_context_when_unavailable():
+    # Real bug class this guards against: a bare None accidentally joined
+    # into the output as the literal string "None".
+    analysis = _analysis_for_min_viable_size(atr=None)
+    text = format_ftmo_asset_context([analysis], account_equity=10_000.0)
+    assert "minimum viable size" not in text
+    assert "\nNone\n" not in text
+    assert not text.rstrip().endswith("None")
+
+
+def test_format_ftmo_asset_context_can_exclude_favorable_excursion_for_clerk():
+    # Real gap caught on a self-recheck (2026-09-12): ai/clerk_execution.py's
+    # own _fetch_technical_context reuses this exact function's output as
+    # `technical_context` for its tactical-verdict prompts, which never
+    # include this file's own _INSTRUCTION_HEAD — the ONLY place the
+    # favorable-excursion figure's critical misread warning and HOLDING
+    # HORIZON scale-mismatch caveat actually live. Locks in that
+    # include_favorable_excursion=False threads all the way from
+    # format_ftmo_asset_context down through format_enriched_asset_context
+    # to format_backtests, while leaving the underlying win-rate/avg-R
+    # backtest line untouched.
+    base = AssetAnalysis(
+        symbol="XAUUSD", description="Gold", bid=4370.0, ask=4370.5,
+        display_name="Gold", stats=_ts(last_price=4370.0),
+        rsi_overbought_backtest=RSIReactionBacktest(
+            "overbought", 70.0, 6, 5, 1, 0, 83.3, 1.5, 1.5, 3.0, 10,
+            excursion=FavorableExcursionStats(sample_size=8, avg_r=4.53, median_r=3.81, horizon_bars=90),
+        ),
+    )
+    analysis = FtmoAssetAnalysis(
+        base=base, h4_stats=_ts(), h1_stats=_ts(),
+        h4_structure=_empty_chart_structure(), h1_structure=_empty_chart_structure(),
+        trade_cost=None,
+    )
+
+    text = format_ftmo_asset_context([analysis], account_equity=10_000.0, include_favorable_excursion=False)
+    assert "historical favorable-excursion magnitude" not in text
+    assert "6 distinct past episodes" in text
+    assert "win rate 83%" in text
+
+
+def test_format_ftmo_asset_context_can_exclude_market_status_entirely():
+    # Same real gap, same fix pattern as the favorable-excursion
+    # exclusion test above: ai/clerk_execution.py's own tactical prompts
+    # never include _INSTRUCTION_HEAD, the only place "market CLOSED" is
+    # explained/actionable, and Clerk never proposes new trades at all --
+    # confirms include_market_status=False threads all the way through.
+    base = AssetAnalysis(
+        symbol="EURUSD", description="Euro", bid=1.09, ask=1.0905,
+        display_name="Euro", stats=_ts(last_price=1.09), market_open=False,
+    )
+    analysis = FtmoAssetAnalysis(
+        base=base, h4_stats=_ts(), h1_stats=_ts(),
+        h4_structure=_empty_chart_structure(), h1_structure=_empty_chart_structure(),
+        trade_cost=None,
+    )
+
+    text = format_ftmo_asset_context([analysis], account_equity=10_000.0, include_market_status=False)
+    assert "market CLOSED" not in text
+
+
+# --- format_ftmo_held_position_sizing_rates, added 2026-09-11 after a
+# real incident: a held NVDA position's own revised stop was reported at
+# pct=0.02%, a razor-thin 17% short of the 0.0242% that exact distance
+# actually needed to reach even ONE whole share -- every clerk poll since
+# then failed to "infeasible" for hours, leaving the real position stuck
+# on its old, stretched stop/target the entire time.
+
+
+def _position_and_analysis_for_sizing_rate(volume=1.0, trade_contract_size=1.0) -> tuple[Position, FtmoAssetAnalysis]:
+    spec = ContractSpec(
+        volume_min=1.0, volume_step=1.0, volume_max=1000.0,
+        trade_contract_size=trade_contract_size, currency_margin="USD", margin_initial=21.79,
+    )
+    base = AssetAnalysis(
+        symbol="NVDA", description="Nvidia", bid=218.30, ask=218.35,
+        display_name=None, contract_spec=spec,
+    )
+    analysis = FtmoAssetAnalysis(
+        base=base, h4_stats=_ts(), h1_stats=_ts(),
+        h4_structure=_empty_chart_structure(), h1_structure=_empty_chart_structure(),
+        trade_cost=None,
+    )
+    position = Position(
+        symbol="NVDA", volume=volume, side="buy", price_open=217.85, price_current=218.30,
+        sl=216.92, profit=0.45, opened_at=None, ticket=99, tp=232.0,
+    )
+    return position, analysis
+
+
+def test_held_position_sizing_rate_matches_the_real_nvda_incident():
+    # Hand-verified against the real incident: rate = (1.0 lot x 1.0
+    # contract_size) / 9933.43 equity x 100 = 0.010067...%. At the real
+    # 2.40 stop distance Claude actually chose, that's 0.024161% -- the
+    # true floor, versus the 0.02% Claude actually reported (the exact
+    # razor-thin miss that blocked every poll for hours).
+    position, analysis = _position_and_analysis_for_sizing_rate()
+    text = format_ftmo_held_position_sizing_rates([position], [analysis], account_equity=9933.43)
+    assert text != ""
+    assert "NVDA sizing rate" in text
+    assert "0.010067%" in text
+    # A distance of 2.40 (the real one Claude actually used) x this rate
+    # = 0.024161% -- the real minimum Claude's own reported 0.02% missed.
+    # Not asserted against the text directly (the function only prints
+    # 1.00/5.00 worked examples), verified here as a standalone sanity
+    # check that the rate itself is right.
+    rate = (1.0 * 1.0) / 9933.43 * 100
+    assert rate * 2.40 == pytest.approx(0.024161, abs=0.000001)
+    assert f"{rate * 5:.4f}%" in text  # the "distance of 5.00" worked example
+
+
+def test_held_position_sizing_rate_scales_with_volume_and_contract_size():
+    position, analysis = _position_and_analysis_for_sizing_rate(volume=2.0, trade_contract_size=100.0)
+    text = format_ftmo_held_position_sizing_rates([position], [analysis], account_equity=10_000.0)
+    # rate = (2.0 x 100.0) / 10,000 x 100 = 2.0% per unit of stop distance.
+    assert "2.000000%" in text
+
+
+def test_held_position_sizing_rate_empty_without_positions():
+    _, analysis = _position_and_analysis_for_sizing_rate()
+    assert format_ftmo_held_position_sizing_rates([], [analysis], account_equity=10_000.0) == ""
+
+
+def test_held_position_sizing_rate_empty_without_equity():
+    position, analysis = _position_and_analysis_for_sizing_rate()
+    assert format_ftmo_held_position_sizing_rates([position], [analysis], account_equity=None) == ""
+    assert format_ftmo_held_position_sizing_rates([position], [analysis], account_equity=0.0) == ""
+
+
+def test_held_position_sizing_rate_skips_a_position_with_no_contract_spec():
+    position, analysis = _position_and_analysis_for_sizing_rate()
+    analysis.base.contract_spec = None
+    assert format_ftmo_held_position_sizing_rates([position], [analysis], account_equity=10_000.0) == ""
+
+
+def test_held_position_sizing_rate_skips_a_position_with_no_matching_analysis():
+    position, _ = _position_and_analysis_for_sizing_rate()
+    unrelated_analysis = _analysis_for_min_viable_size(atr=30.0)  # symbol XAUUSD, not NVDA
+    assert format_ftmo_held_position_sizing_rates([position], [unrelated_analysis], account_equity=10_000.0) == ""
+
+
+def test_held_position_sizing_rate_wired_into_build_ftmo_summary():
+    position, analysis = _position_and_analysis_for_sizing_rate()
+    asset = MarketAsset(symbol="NVDA", description="Nvidia", bid=218.30, ask=218.35)
+    account = AccountSummary(balance=9933.0, equity=9933.43, free_margin=9900.0, currency="USD")
+    status = _make_status()
+    text = build_ftmo_summary(account, [asset], status, positions=[position], analyses=[analysis])
+    assert "Held-position sizing rates" in text
+    assert "NVDA sizing rate" in text
+
+
 # --- format_ftmo_status_context ---
 
 
@@ -1469,6 +1949,23 @@ def test_ftmo_stage1_instruction_requires_per_instrument_holding_period_debate()
 def test_ftmo_stage1_instruction_requires_per_instrument_position_size_debate():
     text = build_ftmo_stage1_instruction()
     assert "DEBATE THE POSITION SIZE" in text
+
+
+def test_ftmo_stage1_instruction_checks_current_market_open_status():
+    text = build_ftmo_stage1_instruction()
+    assert "CHECK WHETHER THIS INSTRUMENT'S MARKET IS EVEN OPEN RIGHT NOW" in text
+    assert "market CLOSED (weekend)" in text
+    assert "reopen Sunday evening UTC" in text
+    assert "Do NOT propose a NEW immediate allocation or a NEW pending setup on an instrument marked CLOSED" in text
+
+
+def test_ftmo_stage1_instruction_warns_against_doomed_weekend_pending_setups():
+    text = build_ftmo_stage1_instruction()
+    assert "HEADING INTO A WEEKEND" in text
+    # Crypto is explicitly exempted -- it genuinely trades through the
+    # weekend, unlike every other instrument on this account.
+    assert "BTCUSD/ETHUSD" in text
+    assert "does NOT apply to crypto" in text
     # The five real inputs the sizing debate must actually weigh.
     assert "conviction" in text.lower()
     assert "feasibility ceiling" in text.lower()
@@ -1504,7 +2001,16 @@ def test_ftmo_stage1_instruction_mentions_asset_category_diversification():
     text = build_ftmo_stage1_instruction()
     for category in ("forex", "metals", "indices", "crypto"):
         assert category in text.lower()
-    assert "1-2 instruments" in text
+    # Direct user instruction 2026-09-05: don't artificially cap a
+    # category's own instrument count -- a prior version of this prompt
+    # explicitly told Claude to "aim for roughly 1-2 instruments per
+    # represented category," which was concentrating the mix into 1-2
+    # positions even when several genuinely trending, independently-
+    # supported instruments sat excluded. Assert the new policy is
+    # present and the old numeric cap is gone.
+    assert "1-2 instruments" not in text
+    assert "many small" in text.lower()
+    assert "position-count" in text.lower()
 
 
 def test_ftmo_stage1_instruction_states_best_effort_reconstruction_caveat():
@@ -1522,6 +2028,42 @@ def test_ftmo_stage2_instruction_synth_variant_references_audits():
 def test_ftmo_stage2_instruction_self_review_variant_discloses_unavailable_audit():
     text = build_ftmo_stage2_instruction(audit_available=False)
     assert "not available this run" in text.lower()
+
+
+def test_ftmo_stage2_synth_instruction_requires_reconciling_data_backed_objections():
+    # A backtest win-rate or a live trend-classification disagreement is a
+    # checkable fact, not a subjective judgment call an audit's model-size
+    # weighting is allowed to discount into silence (see the XAUUSD
+    # incident this instruction quotes: two audits caught a mismatched H1
+    # trend read and a 14-17% historical win rate, and the final revision
+    # kept the same thesis anyway).
+    text = build_ftmo_stage2_instruction(audit_available=True)
+    assert "NOT OPTIONAL TO WEIGH AWAY" in text
+    assert "backtest" in text.lower()
+    assert "is required, not merely internal process" in text
+
+
+def test_ftmo_stage1_instruction_warns_against_chasing_ratio_over_missing_the_trend():
+    # Real incident: an NVDA pending buy limit sat unfilled for days as
+    # price ran 11%+ past it and past its own take-profit, each session
+    # just re-asserting "not yet invalidated" instead of re-examining
+    # anything -- direct user request not to hard-code a mechanical
+    # override, but to require honest disclosure and let the model judge.
+    text = build_ftmo_stage1_instruction()
+    assert "DON'T LET CHASING A BETTER RATIO BECOME AN EXCUSE TO MISS THE" in text
+    assert "how long it's been resting" in text
+    assert "ORIGINAL TARGET" in text
+
+
+def test_ftmo_stage1_instruction_requires_equal_research_depth_across_categories():
+    text = build_ftmo_stage1_instruction()
+    assert "EQUAL research depth across" in text
+    assert "forex ending up" in text.lower() or "forex ending up" in text
+
+
+def test_ftmo_audit_instruction_covers_stale_carried_forward_levels():
+    assert "STALE CARRIED-FORWARD LEVELS" in AUDIT_INSTRUCTION
+    assert "ORIGINAL TARGET" in AUDIT_INSTRUCTION
 
 
 def test_ftmo_audit_instruction_covers_trailing_vs_static_and_zero_grace_period():
@@ -1555,6 +2097,14 @@ def test_ftmo_audit_instruction_requires_recomputing_pending_setups_arithmetic()
     # from the JSON's own numbers, not just eyeball plausibility.
     assert "RECOMPUTE the stop distance" in AUDIT_INSTRUCTION
     assert "gross R:R" in AUDIT_INSTRUCTION
+
+
+def test_ftmo_audit_instruction_flags_new_proposals_on_closed_markets():
+    assert "market is CLOSED right now" in AUDIT_INSTRUCTION
+    assert "it cannot fill" in AUDIT_INSTRUCTION
+    # Must not penalize managing an existing position on a now-closed
+    # instrument -- that's a separate, legitimate decision.
+    assert "EXISTING position on a currently-closed instrument" in AUDIT_INSTRUCTION
 
 
 def test_ftmo_audit_instruction_has_no_beta_backtest_carveout():
@@ -1822,6 +2372,38 @@ def test_suggest_ftmo_portfolio_scopes_past_lessons_to_ftmo_records_dir(
     suggest_ftmo_portfolio("summary")
     _, kwargs = mock_lessons.call_args
     assert kwargs["records_dir"] == Path(config.FTMO_RECORDS_DIR)
+
+
+@patch("ai.ftmo_suggest.build_curiosity_report", return_value="CURIOSITY REPORT TEXT")
+@patch("ai.ftmo_suggest.build_audit_block", return_value=AuditResult(block="", audit_available=False))
+@patch("ai.ftmo_suggest.run_claude")
+def test_suggest_ftmo_portfolio_includes_curiosity_report_in_stage1_draft_prompt(
+    mock_run_claude, mock_audit, mock_curiosity
+):
+    # Direct user request 2026-09-05: the curiosity function's own report
+    # card must be compulsory (always attempted, folded into the same
+    # past_lessons text the draft prompt already includes), not an
+    # opt-in extra.
+    mock_run_claude.side_effect = ["draft", "final"]
+    suggest_ftmo_portfolio("some ftmo summary")
+    draft_prompt = mock_run_claude.call_args_list[0].args[0]
+    assert "CURIOSITY REPORT TEXT" in draft_prompt
+
+
+@patch("ai.ftmo_suggest.build_curiosity_report", return_value="")
+@patch("ai.ftmo_suggest.build_past_lessons", return_value="PAST LESSONS TEXT")
+@patch("ai.ftmo_suggest.build_audit_block", return_value=AuditResult(block="", audit_available=False))
+@patch("ai.ftmo_suggest.run_claude")
+def test_suggest_ftmo_portfolio_empty_curiosity_report_leaves_past_lessons_untouched(
+    mock_run_claude, mock_audit, mock_lessons, mock_curiosity
+):
+    # build_curiosity_report degrading to "" (no qualifying trades this
+    # week, e.g.) must never blank out or otherwise disturb whatever
+    # build_past_lessons already contributed.
+    mock_run_claude.side_effect = ["draft", "final"]
+    suggest_ftmo_portfolio("some ftmo summary")
+    draft_prompt = mock_run_claude.call_args_list[0].args[0]
+    assert "PAST LESSONS TEXT" in draft_prompt
 
 
 @patch("ai.ftmo_suggest.build_audit_block", return_value=AuditResult(block="", audit_available=False))

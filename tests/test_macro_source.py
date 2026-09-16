@@ -7,6 +7,7 @@ import requests
 from data.macro_source import (
     _leg_vs_12m_ma,
     _match_pring_stage,
+    fetch_country_fiscal_indicators,
     fetch_country_indicators,
     fetch_fx_rate_to_usd,
     fetch_macro_cycle_diagnostic,
@@ -122,6 +123,44 @@ def test_default_country_coverage_includes_all_ten_major_economies():
 
     default_countries = inspect.signature(fn).parameters["countries"].default
     assert set(default_countries) == {"US", "GB", "FR", "DE", "JP", "CN", "IN", "KR", "SA", "AE"}
+
+
+@patch("requests.get")
+def test_fetch_country_fiscal_indicators_parses_world_bank_response(mock_get):
+    mock_get.return_value = _fake_worldbank_response(3.2)
+
+    results = fetch_country_fiscal_indicators(countries=("US",))
+    assert len(results) == 1
+    assert results[0].country == "United States"
+    assert results[0].debt_to_gdp_pct == 3.2
+    assert results[0].fiscal_balance_pct == 3.2
+    assert results[0].current_account_pct == 3.2
+
+
+@patch("requests.get", side_effect=RuntimeError("network down"))
+def test_fetch_country_fiscal_indicators_tolerates_request_failure(mock_get):
+    results = fetch_country_fiscal_indicators(countries=("US",))
+    assert len(results) == 1
+    assert results[0].debt_to_gdp_pct is None
+    assert results[0].fiscal_balance_pct is None
+    assert results[0].current_account_pct is None
+
+
+@patch("requests.get")
+def test_fetch_country_fiscal_indicators_maps_parallel_results_to_correct_country(mock_get):
+    debt_by_country = {"US": 115.0, "GB": 130.0, "JP": 260.0}
+
+    def get_side_effect(url, params=None, timeout=None):
+        country_code = url.split("/country/")[1].split("/indicator/")[0]
+        return _fake_worldbank_response(debt_by_country[country_code])
+
+    mock_get.side_effect = get_side_effect
+
+    results = fetch_country_fiscal_indicators(countries=tuple(debt_by_country.keys()))
+    result_by_country = {r.country: r for r in results}
+    assert result_by_country["United States"].debt_to_gdp_pct == 115.0
+    assert result_by_country["United Kingdom"].debt_to_gdp_pct == 130.0
+    assert result_by_country["Japan"].debt_to_gdp_pct == 260.0
 
 
 @patch("yfinance.Ticker")

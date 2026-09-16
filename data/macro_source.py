@@ -46,6 +46,27 @@ INDICATOR_CODES = {
     "unemployment_pct": "SL.UEM.TOTL.ZS",
 }
 
+# Real fiscal/policy-backdrop indicators, same free World Bank API as
+# INDICATOR_CODES above — added for ai.researcher's fundamental analysis
+# (direct user request 2026-09-14): a country's debt load, budget
+# balance, and external balance are real, standard fundamental inputs a
+# fund manager's own country view would weigh, distinct from the growth/
+# inflation/unemployment cycle indicators above. Deliberately NOT added
+# to INDICATOR_CODES itself / CountryIndicators itself — a new, separate
+# dataclass and fetch function instead, so ai.portfolio_suggest.
+# build_macro_snapshot() (which the Mega Session's own Claude prompt
+# already depends on) is completely untouched; ai.researcher calls this
+# new function directly. A real, live-confirmed policy-RATE figure (the
+# actual Fed funds rate, ECB deposit rate, etc.) is NOT included here —
+# no free, structured, per-country API for that was found (see
+# ai.researcher's own module docstring); this is fiscal-position data,
+# not central-bank-rate data.
+FISCAL_INDICATOR_CODES = {
+    "debt_to_gdp_pct": "GC.DOD.TOTL.GD.ZS",  # Central government debt, total (% of GDP)
+    "fiscal_balance_pct": "GC.BAL.CASH.GD.ZS",  # Cash surplus/deficit (% of GDP) -- negative = deficit
+    "current_account_pct": "BN.CAB.XOKA.GD.ZS",  # Current account balance (% of GDP)
+}
+
 
 @dataclass
 class MarketIndicators:
@@ -63,6 +84,14 @@ class CountryIndicators:
     gdp_growth_pct: float | None
     inflation_pct: float | None
     unemployment_pct: float | None
+
+
+@dataclass
+class CountryFiscalIndicators:
+    country: str
+    debt_to_gdp_pct: float | None
+    fiscal_balance_pct: float | None
+    current_account_pct: float | None
 
 
 @dataclass
@@ -441,6 +470,44 @@ def fetch_country_indicators(
             gdp_growth_pct=values_by_country[code].get("gdp_growth_pct"),
             inflation_pct=values_by_country[code].get("inflation_pct"),
             unemployment_pct=values_by_country[code].get("unemployment_pct"),
+        )
+        for code in countries
+    ]
+
+
+def fetch_country_fiscal_indicators(
+    countries: tuple[str, ...] = ("US", "GB", "FR", "DE", "JP", "CN", "IN", "KR", "SA", "AE")
+) -> list[CountryFiscalIndicators]:
+    """Latest available government debt-to-GDP / fiscal balance / current
+    account balance per country, via the same World Bank free, keyless
+    public API as fetch_country_indicators — identical shape and
+    concurrency reasoning, just a different, fiscal-position indicator
+    set (see FISCAL_INDICATOR_CODES's own comment for why this is a
+    separate function rather than added onto fetch_country_indicators/
+    CountryIndicators directly). Any missing indicator for a country is
+    left as None rather than dropping that country — the World Bank's
+    own fiscal series have real, disclosed reporting gaps for some
+    countries/years, never papered over with a guess."""
+    indicator_keys = list(FISCAL_INDICATOR_CODES.keys())
+    jobs = [(code, key) for code in countries for key in indicator_keys]
+
+    def _run(job: tuple[str, str]) -> float | None:
+        code, key = job
+        return _fetch_latest_indicator_value(code, FISCAL_INDICATOR_CODES[key])
+
+    with ThreadPoolExecutor(max_workers=min(len(jobs), 5) or 1) as pool:
+        values = list(pool.map(_run, jobs)) if jobs else []
+
+    values_by_country = {code: {} for code in countries}
+    for (code, key), value in zip(jobs, values):
+        values_by_country[code][key] = value
+
+    return [
+        CountryFiscalIndicators(
+            country=COUNTRY_NAMES.get(code, code),
+            debt_to_gdp_pct=values_by_country[code].get("debt_to_gdp_pct"),
+            fiscal_balance_pct=values_by_country[code].get("fiscal_balance_pct"),
+            current_account_pct=values_by_country[code].get("current_account_pct"),
         )
         for code in countries
     ]

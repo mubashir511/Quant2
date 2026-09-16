@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -20,10 +20,10 @@ def _get_spec_for(specs: dict):
     return lambda symbol: specs.get(symbol)
 
 
-def _position(symbol="GO10OZ", side="buy", volume=1.0, ticket=1, sl=None, tp=None):
+def _position(symbol="GO10OZ", side="buy", volume=1.0, ticket=1, sl=None, tp=None, price_open=2000.0):
     return Position(
-        symbol=symbol, volume=volume, side=side, price_open=2000.0,
-        price_current=2000.0, sl=sl, profit=0.0, opened_at=datetime.now(), ticket=ticket, tp=tp,
+        symbol=symbol, volume=volume, side=side, price_open=price_open,
+        price_current=price_open, sl=sl, profit=0.0, opened_at=datetime.now(), ticket=ticket, tp=tp,
     )
 
 
@@ -31,10 +31,13 @@ def _asset(symbol="GO10OZ", bid=1999.0, ask=2000.0):
     return MarketAsset(symbol=symbol, description=symbol, bid=bid, ask=ask)
 
 
-def _pending_order(symbol="GO10OZ", order_type="buy limit", volume=1.0, price_open=2000.0, sl=None, tp=None, ticket=501):
+def _pending_order(
+    symbol="GO10OZ", order_type="buy limit", volume=1.0, price_open=2000.0, sl=None, tp=None,
+    ticket=501, time_setup=None,
+):
     return PendingOrder(
         symbol=symbol, volume=volume, order_type=order_type, price_open=price_open,
-        sl=sl, tp=tp, ticket=ticket,
+        sl=sl, tp=tp, ticket=ticket, time_setup=time_setup,
     )
 
 
@@ -78,9 +81,16 @@ def test_drops_a_take_profit_on_the_wrong_side_of_entry():
 
 def test_take_profit_survives_price_clamping_when_still_valid():
     # The take-profit check must compare against the CLAMPED entry price,
-    # not the AI's original (possibly out-of-band) proposed one.
+    # not the AI's original (possibly out-of-band) proposed one. A buy
+    # proposed way ABOVE the live ask clamps hard to the ask itself (see
+    # compute_rebalance_plan's own "wrong side of the market" comment),
+    # so stop_loss must sit below THAT (1950), not above it. stop_loss
+    # is 50 below the PROPOSED price (5000), not the clamped one — added
+    # 2026-09-10: the stop is now re-derived to preserve this original
+    # 50-point distance from wherever the entry actually clamps to
+    # (2000), landing back on the same 1950 this test already expects.
     allocation = {
-        "GO10OZ": AllocationEntry(pct=10.0, price=5000.0, stop_loss=2050.0, take_profit=2200.0)
+        "GO10OZ": AllocationEntry(pct=10.0, price=5000.0, stop_loss=4950.0, take_profit=2200.0)
     }
     plan = compute_rebalance_plan(
         positions=[], account=ACCOUNT, allocation=allocation,
@@ -89,7 +99,7 @@ def test_take_profit_survives_price_clamping_when_still_valid():
         price_sanity_band_pct=5.0,
     )
     order = plan[0]
-    assert order.price == pytest.approx(2000.0 * 1.05)  # clamped
+    assert order.price == 2000.0  # clamped hard to the live ask
     assert order.take_profit == 2200.0  # still above the clamped entry, so kept
 
 
@@ -104,11 +114,19 @@ def test_take_profit_absent_when_not_given():
 
 
 def test_clamps_an_unreasonable_proposed_price_to_the_sanity_band():
-    # stop_loss picked so the CLAMPED price (2100) still leaves a stop
-    # distance affordable at this pct/equity/contract_size (50 points ->
-    # 2 lots) — a too-wide distance would make this genuinely infeasible
-    # by real risk math, which isn't what this test is checking.
-    allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=5000.0, stop_loss=2050.0)}
+    # A buy proposed way ABOVE the live ask is the "wrong side" case for a
+    # limit order (see the real 2026-09-07 incident documented on
+    # compute_rebalance_plan's own clamping logic) -- clamped hard to the
+    # live ask itself (2000.0), not to ask*(1+band), since a buy limit
+    # can never be validly priced above market. stop_loss is 50 below the
+    # PROPOSED price (5000), not the clamped one — the re-derivation
+    # (added 2026-09-10) preserves that original 50-point distance from
+    # wherever the entry actually clamps to (2000), landing back on the
+    # same 1950 this test already expects — still affordable at this
+    # pct/equity/contract_size (50 points -> 2 lots); a too-wide distance
+    # would make this genuinely infeasible by real risk math, which isn't
+    # what this test is checking.
+    allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=5000.0, stop_loss=4950.0)}
     plan = compute_rebalance_plan(
         positions=[], account=ACCOUNT, allocation=allocation,
         get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
@@ -116,8 +134,208 @@ def test_clamps_an_unreasonable_proposed_price_to_the_sanity_band():
         price_sanity_band_pct=5.0,
     )
     order = plan[0]
-    assert order.price == 2000.0 * 1.05
+    assert order.price == 2000.0
     assert "clamped" in order.reason.lower()
+
+
+# Real incident, 2026-09-07: three real immediate-allocation orders (a
+# buy priced above the live ask, a sell priced below the live bid) were
+# rejected outright by MT5 with "Invalid price" and never placed at all —
+# the clamp above used to allow BOTH directions symmetrically regardless
+# of side, so whenever the model's own suggested entry had already been
+# overtaken by live price in the FAVORABLE direction (price ran toward
+# the target before execution ever happened), the "clamped" result still
+# came out on the wrong side of the spread for that order type. These two
+# tests lock in the fix: the favorable side is now capped hard at the
+# live reference price itself, never past it, regardless of how far past
+# it the proposed price was.
+
+
+def test_clamps_a_buy_price_above_ask_to_the_ask_not_past_it():
+    allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=2010.0, stop_loss=1950.0)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+        price_sanity_band_pct=5.0,
+    )
+    order = plan[0]
+    assert order.price == 2000.0
+    assert order.price <= 2000.0  # never past the live ask -- a buy limit MT5 would accept
+    assert "wrong side of the current market" in order.reason.lower()
+
+
+def test_clamps_a_sell_price_below_bid_to_the_bid_not_past_it():
+    allocation = {
+        "GO10OZ": AllocationEntry(side="sell", pct=10.0, price=1990.0, stop_loss=2050.0)
+    }
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(bid=1999.0, ask=2000.0)},
+        price_sanity_band_pct=5.0,
+    )
+    order = plan[0]
+    assert order.price == 1999.0
+    assert order.price >= 1999.0  # never past the live bid -- a sell limit MT5 would accept
+    assert "wrong side of the current market" in order.reason.lower()
+
+
+# Real, severe incident, 2026-09-08: a live EURUSD sell position (opened
+# from a real mega-session immediate allocation) got repeatedly resized
+# by the Clerk — 9 separate tickets opened and torn down via dozens of
+# tiny partial fills/closes inside 3.5 hours, each leg paying its own
+# real spread/commission for zero strategic reason. Root cause: once the
+# sell limit filled, live price naturally sat right around/through that
+# level afterward, and the (correct, needed) "Invalid price" fix above —
+# capping clamped_price hard at the live bid/ask — meant clamped_price
+# kept re-tracking the live tick on EVERY poll for this ALREADY-FILLED
+# position. With a tight stop distance (a few pips, typical for an
+# intraday FX entry), even ordinary tick noise swings the IMPLIED stop
+# distance — and therefore target_lots — by a large percentage, so the
+# "is this basically unchanged, just hold" check almost never matched,
+# forcing a spurious "increase"/"reduce" nearly every single poll. The
+# fix: for an already-held position, sizing anchors to the position's
+# own real, fixed price_open (sizing_price) instead of clamped_price's
+# live-tracking value — clamped_price itself is untouched for what an
+# actual NEW order leg would be priced at.
+def test_already_held_position_sizing_ignores_live_price_drift_and_holds():
+    contract_size_100k = ContractSpec(
+        volume_min=0.01, volume_step=0.01, volume_max=100.0,
+        trade_contract_size=100_000.0, currency_margin="USD", margin_initial=1000.0,
+    )
+    # Same thesis the mega session originally sized against: entry
+    # 1.16270, stop 1.16360 (sell, stop above entry), 0.3% of 100k equity
+    # -> $300 risk / (0.00090 distance x 100k contract) = 3.33 lots,
+    # exactly matching the already-held position's own real volume below.
+    positions = [
+        _position(symbol="EURUSD", side="sell", volume=3.33, ticket=777, price_open=1.16270, sl=1.16360)
+    ]
+    allocation = {"EURUSD": AllocationEntry(side="sell", pct=0.3, price=1.16270, stop_loss=1.16360)}
+    # Live price has since drifted UP toward the stop (ordinary intraday
+    # noise, not a new mega-session thesis) -- the proposed entry
+    # (1.16270) now sits BELOW the live bid, the "wrong side" for a sell
+    # limit, which is exactly the condition that used to make
+    # clamped_price re-track the live bid every poll.
+    market_prices = {"EURUSD": _asset(symbol="EURUSD", bid=1.16330, ask=1.16340)}
+
+    plan = compute_rebalance_plan(
+        positions, ACCOUNT, allocation, _get_spec_for({"EURUSD": contract_size_100k}), market_prices,
+    )
+
+    assert len(plan) == 1
+    assert plan[0].action == "hold"
+
+
+# --- Stop re-derivation on entry-price clamping + minimum-distance
+# floor, added 2026-09-10 after a real incident: a suggested XAUUSD
+# entry/stop (4415.00 / 4370.00, an intentional $45/1.38x-ATR risk) kept
+# getting its ENTRY re-clamped down toward the live market as gold fell
+# all day, while the absolute STOP price stayed fixed at 4370.00 -- the
+# real risk silently shrank to $3.48, then $0.65 (stopped out in 5
+# seconds by ordinary noise on an instrument moving several dollars a
+# minute). See compute_rebalance_plan's own docstring/comments for the
+# full mechanism.
+
+
+def test_stop_is_rederived_to_preserve_the_original_distance_after_clamping():
+    # Proposed entry (2050) sits above the live ask (2000) -- a buy limit
+    # can't price above market, so it clamps hard to the ask itself (see
+    # the "wrong side of the market" clamp above). The ORIGINAL 45-point
+    # distance (2050 - 2005) must now be preserved from the NEW, clamped
+    # entry (2000), landing the stop at 1955 -- not the stale 2005
+    # (which would even be on the wrong side of the clamped entry).
+    allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=2050.0, stop_loss=2005.0)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+        price_sanity_band_pct=5.0,
+    )
+    order = plan[0]
+    assert order.price == 2000.0
+    assert order.stop_loss == 1955.0  # 2000 - 45, the ORIGINAL distance preserved
+    assert "stop re-derived" in order.reason.lower()
+
+
+def test_stop_is_not_rederived_when_the_entry_was_never_clamped():
+    # No clamping happens here (2000 is already within the sanity band of
+    # the 2000 ask) -- the stop must pass through completely unchanged,
+    # with no re-derivation note at all.
+    allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=2000.0, stop_loss=1950.0)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+    )
+    order = plan[0]
+    assert order.stop_loss == 1950.0
+    assert "re-derived" not in order.reason.lower()
+
+
+def test_stop_not_rederived_for_an_already_held_positions_tactical_amend():
+    # sizing_price for an already-held position is its own real price_open
+    # (see compute_rebalance_plan's own docstring), NOT the live-tracking
+    # clamped_price -- a tactical DEFEND's entry.price is set to that same
+    # price_open, so sizing_price == proposed_price and re-derivation must
+    # never fire: this stop is already the deliberately-computed final
+    # value (e.g. from _compute_tactical_signals' own ATR candidate), not
+    # something to rescale a second time.
+    # pct=4.0 (not the naive 10.0) so target_lots at the NEW 40-point
+    # stop distance (2000-1960) still comes out to the SAME 1.0 lot
+    # already held -- same "amend-in-place, not a resize" fixture
+    # convention test_position_amend_when_stop_loss_changed_but_size_
+    # unchanged already uses just above.
+    positions = [_position(symbol="GO10OZ", side="buy", volume=1.0, price_open=2000.0, sl=1950.0)]
+    allocation = {"GO10OZ": AllocationEntry(pct=4.0, price=2000.0, stop_loss=1960.0)}
+    plan = compute_rebalance_plan(
+        positions, ACCOUNT, allocation,
+        _get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        {"GO10OZ": _asset(ask=2010.0)},  # live price has since moved -- irrelevant to sizing here
+    )
+    order = plan[0]
+    assert order.action == "amend_position"
+    assert order.stop_loss == 1960.0  # the tactical target, verbatim
+    assert "re-derived" not in order.reason.lower()
+
+
+def test_minimum_stop_distance_floor_rejects_a_near_zero_distance():
+    # Real incident this guards against directly: the second real XAUUSD
+    # fill had a stop just $0.65 (0.015%) from its own entry on an
+    # instrument moving several dollars a minute -- stopped out in 5
+    # seconds by ordinary noise, not a real adverse move. Proposed entry
+    # (2050) clamps hard to the 2000 ask; proposed stop (2049.9) is only
+    # 0.1 from the ORIGINAL entry, so even after re-derivation the
+    # preserved distance (0.1 from 2000 = 0.005%) is nowhere near the
+    # default 0.1% floor.
+    allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=2050.0, stop_loss=2049.9)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+        price_sanity_band_pct=5.0,
+    )
+    order = plan[0]
+    assert order.action == "infeasible"
+    assert order.stop_loss is None
+    assert "minimum sane distance" in order.reason.lower()
+
+
+def test_minimum_stop_distance_floor_is_configurable():
+    # A distance that clears a smaller explicit floor must NOT be rejected
+    # -- same fixture as the rejection test above, just with the floor
+    # lowered below the real 0.005% distance it produces.
+    allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=2050.0, stop_loss=2049.9)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+        price_sanity_band_pct=5.0,
+        min_stop_distance_pct=0.001,
+    )
+    order = plan[0]
+    assert order.action == "open"
+    assert order.stop_loss == pytest.approx(1999.9)  # 2000 - 0.1, re-derived and kept
 
 
 def test_drops_a_stop_loss_on_the_wrong_side_of_entry():
@@ -138,10 +356,18 @@ def test_drops_a_stop_loss_on_the_wrong_side_of_entry():
     assert "wrong side" in order.reason.lower()
 
 
-def test_increase_when_target_exceeds_current_lots():
+def test_never_auto_increases_an_already_held_position():
+    # Real, severe incident found live 2026-09-08: this account's MT5
+    # terminal runs in HEDGING mode, which can't net an "increase" into
+    # an existing ticket -- every increase used to open a genuinely NEW,
+    # separate position, and SymbolSettlement's own single order_ticket
+    # field then silently started tracking only the new one, orphaning
+    # the old ticket from all further review (invalidation, tactical
+    # defense). A target that wants MORE than what's already held now
+    # resolves to "hold" instead -- a real reason to size up needs a
+    # fresh mega-session decision or a manually-reviewed Apply
+    # Suggestion, never an automatic top-up.
     positions = [_position(volume=1.0, ticket=1)]
-    # stop 100 points away: 20% of 100k = $20,000 risked / (100 x 100) = 2
-    # lots target, vs. 1 lot currently held -> increase by 1.
     allocation = {"GO10OZ": AllocationEntry(pct=20.0, price=2000.0, stop_loss=1900.0)}
     plan = compute_rebalance_plan(
         positions=positions, account=ACCOUNT, allocation=allocation,
@@ -149,8 +375,8 @@ def test_increase_when_target_exceeds_current_lots():
         market_prices={"GO10OZ": _asset(ask=2000.0)},
     )
     order = plan[0]
-    assert order.action == "increase"
-    assert order.volume == 1.0  # target 2 lots - current 1 lot
+    assert order.action == "hold"
+    assert order.volume == 1.0  # the currently-held size, unchanged
 
 
 def test_reduce_when_target_is_below_current_lots():
@@ -255,14 +481,19 @@ def test_genuinely_mixed_both_sides_position_is_closed_fully():
     assert order.tickets_to_close == [(1, 1.0), (9, 2.0)]
 
 
-def test_existing_short_with_matching_short_target_is_resized_not_closed():
+def test_existing_short_with_matching_short_target_is_not_closed():
     # The core behavior this whole change replaces the old blanket
     # "any short gets closed" rule with: a clean, single-direction short
-    # that matches its own target gets resized like a long would, not
-    # force-closed just for being a short.
+    # that matches its own target is left alone like a long would be,
+    # not force-closed just for being a short. A target that wants MORE
+    # than what's held now resolves to "hold", not "increase" (see
+    # test_never_auto_increases_an_already_held_position's own comment
+    # for why) -- this test's own real point is just that it's never
+    # force-closed either.
     positions = [_position(side="sell", volume=2.0, ticket=9)]
     # short stop 50 pts above entry: 15% of 100k / (50 x 100) = 3 lots
-    # target, vs. 2 lots held -> increase by 1, not close.
+    # target, vs. 2 lots held -> target exceeds held, but never auto-
+    # increased or closed.
     allocation = {"GO10OZ": AllocationEntry(side="sell", pct=15.0, price=1999.0, stop_loss=2049.0)}
     plan = compute_rebalance_plan(
         positions=positions, account=ACCOUNT, allocation=allocation,
@@ -271,9 +502,9 @@ def test_existing_short_with_matching_short_target_is_resized_not_closed():
     )
     assert len(plan) == 1
     order = plan[0]
-    assert order.action == "increase"
+    assert order.action == "hold"
     assert order.side == "sell"
-    assert order.volume == 1.0
+    assert order.volume == 2.0  # the currently-held size, unchanged
 
 
 def test_opens_a_new_short_position_with_clamped_price_and_stop():
@@ -483,7 +714,15 @@ def test_compute_rebalance_plan_is_exchange_agnostic_for_ftmo_fixtures():
     # ContractSpec/MarketAsset dataclasses data/mt5_source.py already
     # defines generically for any connected account) instead of PMEX's.
     ftmo_account = AccountSummary(balance=100_000.0, equity=99_500.0, free_margin=95_000.0, currency="USD")
-    ftmo_positions = [_position(symbol="EURUSD", side="buy", volume=0.5, ticket=555001)]
+    # price_open must be a realistic EURUSD-scale price, not the generic
+    # 2000.0 GO10OZ-scale default — sizing now anchors to the ALREADY-HELD
+    # position's own real price_open (see compute_rebalance_plan's own
+    # "sizing_price" comment: a real 2026-09-08 incident where clamped_price's
+    # live-market-tracking clamp made an already-filled EURUSD position's
+    # implied lot size thrash every poll purely from ordinary tick noise),
+    # so a wildly unrealistic price_open here would size against a huge,
+    # fake stop distance instead of the real ~0.005 one this test intends.
+    ftmo_positions = [_position(symbol="EURUSD", side="buy", volume=0.5, ticket=555001, price_open=1.0995)]
     allocation = {
         "EURUSD": AllocationEntry(pct=20.0, price=1.1000, stop_loss=1.0950),
         "XAUUSD": AllocationEntry(pct=10.0, price=2000.0, stop_loss=1950.0),
@@ -502,7 +741,9 @@ def test_compute_rebalance_plan_is_exchange_agnostic_for_ftmo_fixtures():
     )
 
     by_symbol = {o.symbol: o for o in plan}
-    assert by_symbol["EURUSD"].action == "increase"  # target > currently-held 0.5 lots
+    # target > currently-held 0.5 lots, but never auto-increased (see
+    # test_never_auto_increases_an_already_held_position)
+    assert by_symbol["EURUSD"].action == "hold"
     assert by_symbol["XAUUSD"].action == "open"
     assert by_symbol["XAUUSD"].price == pytest.approx(2000.0)
     assert by_symbol["XAUUSD"].stop_loss == pytest.approx(1950.0)
@@ -687,6 +928,175 @@ def test_pending_order_held_when_target_matches_existing_terms_exactly():
     assert plan[0].action == "hold"
 
 
+def test_stale_pending_order_cancelled_even_when_terms_still_match():
+    # Real incident: a resting GTC entry from one mega session sat
+    # unfilled for 23+ hours (no next-day session ever re-ran) and then
+    # filled into conditions its own thesis never anticipated. An
+    # unchanged target must NOT be read as "still fine" once the order
+    # has aged past the same-session ceiling.
+    now = datetime(2026, 8, 28, 19, 0, tzinfo=timezone.utc)
+    order = _pending_order(
+        price_open=2000.0, sl=1900.0, tp=None, volume=1.0, ticket=777,
+        time_setup=now - timedelta(hours=25),
+    )
+    allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=2000.0, stop_loss=1900.0)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+        pending_orders=[order],
+        now=now,
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "cancel"
+    assert plan[0].pending_tickets_to_cancel == [777]
+    assert "24" in plan[0].reason
+
+
+def test_pending_order_within_age_ceiling_still_held_normally():
+    now = datetime(2026, 8, 28, 19, 0, tzinfo=timezone.utc)
+    order = _pending_order(
+        price_open=2000.0, sl=1900.0, tp=None, volume=1.0, ticket=777,
+        time_setup=now - timedelta(hours=23),
+    )
+    allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=2000.0, stop_loss=1900.0)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+        pending_orders=[order],
+        now=now,
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "hold"
+
+
+def test_pending_order_with_unknown_age_not_treated_as_stale():
+    # time_setup=None (a broker/API gap, not a real incident) must never
+    # be silently guessed at as either fresh or stale.
+    order = _pending_order(price_open=2000.0, sl=1900.0, tp=None, volume=1.0, ticket=777, time_setup=None)
+    allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=2000.0, stop_loss=1900.0)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+        pending_orders=[order],
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "hold"
+
+
+def test_stale_pending_order_ceiling_is_configurable():
+    now = datetime(2026, 8, 28, 19, 0, tzinfo=timezone.utc)
+    order = _pending_order(
+        price_open=2000.0, sl=1900.0, tp=None, volume=1.0, ticket=777,
+        time_setup=now - timedelta(hours=5),
+    )
+    allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=2000.0, stop_loss=1900.0)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+        pending_orders=[order],
+        now=now,
+        max_pending_order_age_hours=4.0,
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "cancel"
+
+
+def test_pre_weekend_cancels_a_non_crypto_pending_order_regardless_of_age():
+    # Real incident: an INTC pending limit order and a USDCHF one both
+    # survived into a weekend because the only existing cancel trigger
+    # never fired in time. This order is only 1 hour old (well within
+    # every other ceiling/tolerance) and its terms still match the
+    # target exactly -- is_pre_weekend=True must still cancel it,
+    # unconditionally, since EURUSD isn't in weekend_tradable_symbols.
+    now = datetime(2026, 9, 11, 18, 0, tzinfo=timezone.utc)
+    order = _pending_order(
+        symbol="EURUSD", price_open=2000.0, sl=1900.0, tp=None, volume=1.0, ticket=777,
+        time_setup=now - timedelta(hours=1),
+    )
+    allocation = {"EURUSD": AllocationEntry(pct=10.0, price=2000.0, stop_loss=1900.0)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"EURUSD": _spec(margin_initial=10000.0)}),
+        market_prices={"EURUSD": _asset(ask=2000.0)},
+        pending_orders=[order],
+        now=now,
+        is_pre_weekend=True,
+        weekend_tradable_symbols=set(),
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "cancel"
+    assert plan[0].pending_tickets_to_cancel == [777]
+    assert "weekend" in plan[0].reason.lower()
+
+
+def test_pre_weekend_leaves_a_crypto_pending_order_alone():
+    now = datetime(2026, 9, 11, 18, 0, tzinfo=timezone.utc)
+    order = _pending_order(
+        symbol="BTCUSD", price_open=2000.0, sl=1900.0, tp=None, volume=1.0, ticket=778,
+        time_setup=now - timedelta(hours=1),
+    )
+    allocation = {"BTCUSD": AllocationEntry(pct=10.0, price=2000.0, stop_loss=1900.0)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"BTCUSD": _spec(margin_initial=10000.0)}),
+        market_prices={"BTCUSD": _asset(ask=2000.0)},
+        pending_orders=[order],
+        now=now,
+        is_pre_weekend=True,
+        weekend_tradable_symbols={"BTCUSD"},
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "hold"
+
+
+def test_pre_weekend_false_has_no_effect_even_for_non_crypto():
+    # Default/backward-compatibility: every existing caller omits
+    # is_pre_weekend entirely -- confirms the new check is a genuine
+    # no-op unless explicitly turned on for this call.
+    now = datetime(2026, 9, 11, 18, 0, tzinfo=timezone.utc)
+    order = _pending_order(
+        symbol="EURUSD", price_open=2000.0, sl=1900.0, tp=None, volume=1.0, ticket=779,
+        time_setup=now - timedelta(hours=1),
+    )
+    allocation = {"EURUSD": AllocationEntry(pct=10.0, price=2000.0, stop_loss=1900.0)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"EURUSD": _spec(margin_initial=10000.0)}),
+        market_prices={"EURUSD": _asset(ask=2000.0)},
+        pending_orders=[order],
+        now=now,
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "hold"
+
+
+def test_pre_weekend_and_age_ceiling_dont_double_cancel_the_same_order():
+    # An order that is BOTH stale (past the 24h ceiling) AND non-crypto
+    # pre-weekend must still produce exactly one plan entry, not two --
+    # the age-ceiling check's own `continue` must win first.
+    now = datetime(2026, 9, 11, 18, 0, tzinfo=timezone.utc)
+    order = _pending_order(
+        symbol="EURUSD", price_open=2000.0, sl=1900.0, tp=None, volume=1.0, ticket=780,
+        time_setup=now - timedelta(hours=25),
+    )
+    allocation = {"EURUSD": AllocationEntry(pct=10.0, price=2000.0, stop_loss=1900.0)}
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"EURUSD": _spec(margin_initial=10000.0)}),
+        market_prices={"EURUSD": _asset(ask=2000.0)},
+        pending_orders=[order],
+        now=now,
+        is_pre_weekend=True,
+        weekend_tradable_symbols=set(),
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "cancel"
+
+
 def test_pending_order_amended_when_price_changed():
     order = _pending_order(price_open=1990.0, sl=1900.0, ticket=777)
     allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=1995.0, stop_loss=1895.0)}
@@ -785,6 +1195,86 @@ def test_position_amend_when_stop_loss_changed_but_size_unchanged():
     assert plan[0].position_tickets_to_amend == [1]
 
 
+# --- held-position size tolerance safety net, added 2026-09-11 after a
+# real incident: a held NVDA position's own revised stop (217.85 entry,
+# widened to 215.45, distance 2.40) was reported at pct=0.02% -- a
+# razor-thin 17% short of the 0.0242% that exact distance actually needed
+# to reach even ONE whole share, given NVDA's own real contract spec
+# (volume_step=1.0). raw_target_lots came out to 0.83, rounding DOWN to
+# 0 and failing every clerk poll to "infeasible" for hours, leaving the
+# REAL position stuck on its old, wider stop and stale, stretched target
+# the whole time with no error visible anywhere.
+
+
+def test_held_position_size_tolerance_reconstructs_the_real_nvda_incident():
+    # Exact real numbers: entry 217.85, old stop 216.92 (irrelevant here
+    # -- the fresh pct/stop combo doesn't explain the held 1.0 lot
+    # against the OLD stop either, so the fresh stop is trusted per the
+    # existing "distinguishing test"), new stop 215.45, pct 0.02%,
+    # equity 9933.43, NVDA's own real spec (whole shares only).
+    spec = ContractSpec(
+        volume_min=1.0, volume_step=1.0, volume_max=1000.0,
+        trade_contract_size=1.0, currency_margin="USD", margin_initial=21.79,
+    )
+    account = AccountSummary(balance=9932.99, equity=9933.43, free_margin=9900.0, currency="USD")
+    positions = [_position(symbol="NVDA", side="buy", volume=1.0, ticket=99, sl=216.92, price_open=217.85)]
+    allocation = {"NVDA": AllocationEntry(pct=0.02, price=217.85, stop_loss=215.45, take_profit=223.50)}
+    plan = compute_rebalance_plan(
+        positions=positions, account=account, allocation=allocation,
+        get_spec=_get_spec_for({"NVDA": spec}),
+        market_prices={"NVDA": _asset(symbol="NVDA", bid=218.30, ask=218.35)},
+    )
+    order = plan[0]
+    # Without the safety net this would be "infeasible", volume 0 -- the
+    # real bug. With it, the real 1-lot holding is preserved and the
+    # genuinely-intended stop/target revision actually applies.
+    assert order.action == "amend_position"
+    assert order.volume == 1.0
+    assert order.stop_loss == 215.45
+    assert order.take_profit == 223.50
+    assert order.position_tickets_to_amend == [99]
+
+
+def test_held_position_size_tolerance_does_not_swallow_a_genuine_large_reduction():
+    # 3.0 lots held, target 2.0 -- a genuine 33% reduction, comfortably
+    # outside the default 25% tolerance -- must still resolve as a real
+    # reduce, not get silently kept at the old size.
+    positions = [_position(volume=3.0, ticket=1, sl=1900.0)]
+    # stop distance 100 (2000-1900): pct=20.0 -> risk=20,000 -> 20,000/
+    # (100 x 100) = 2.0 lots.
+    allocation = {"GO10OZ": AllocationEntry(pct=20.0, price=2000.0, stop_loss=1900.0)}
+    plan = compute_rebalance_plan(
+        positions=positions, account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+    )
+    order = plan[0]
+    assert order.action == "reduce"
+    assert order.volume == 1.0  # reduced BY 1.0 lot (3.0 held -> 2.0 target)
+
+
+def test_held_position_size_tolerance_is_configurable():
+    # Same fixture as the real NVDA reconstruction, but with the
+    # tolerance tightened below the real 17% shortfall -- must NOT engage,
+    # falling through to the pre-existing "infeasible" behavior instead.
+    spec = ContractSpec(
+        volume_min=1.0, volume_step=1.0, volume_max=1000.0,
+        trade_contract_size=1.0, currency_margin="USD", margin_initial=21.79,
+    )
+    account = AccountSummary(balance=9932.99, equity=9933.43, free_margin=9900.0, currency="USD")
+    positions = [_position(symbol="NVDA", side="buy", volume=1.0, ticket=99, sl=216.92, price_open=217.85)]
+    allocation = {"NVDA": AllocationEntry(pct=0.02, price=217.85, stop_loss=215.45, take_profit=223.50)}
+    plan = compute_rebalance_plan(
+        positions=positions, account=account, allocation=allocation,
+        get_spec=_get_spec_for({"NVDA": spec}),
+        market_prices={"NVDA": _asset(symbol="NVDA", bid=218.30, ask=218.35)},
+        held_position_size_tolerance_pct=5.0,
+    )
+    order = plan[0]
+    assert order.action == "infeasible"
+    assert order.volume == 0.0
+
+
 def test_position_amend_when_take_profit_changed_but_size_unchanged():
     positions = [_position(volume=1.0, ticket=1, sl=1900.0, tp=2100.0)]
     allocation = {"GO10OZ": AllocationEntry(pct=10.0, price=2000.0, stop_loss=1900.0, take_profit=2200.0)}
@@ -867,7 +1357,7 @@ def test_pending_orders_symbol_without_allocation_entry_produces_no_planned_orde
     # allocation-block key -- exactly what a Pending-Setup-fired order
     # looks like from compute_rebalance_plan's point of view) must
     # produce ZERO PlannedOrders. Widening this would self-cancel every
-    # Pending Setup order the instant Copilot places it.
+    # Pending Setup order the instant the Clerk places it.
     order = _pending_order(symbol="EURUSD", price_open=1.09, sl=1.08, ticket=555)
     allocation = {"CASH": AllocationEntry(pct=100.0)}
     plan = compute_rebalance_plan(

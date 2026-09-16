@@ -1,6 +1,15 @@
 from dataclasses import dataclass
 
-from data.mt5_source import MT5ConnectionError, Position
+# _serialize_mt5_access wraps every function below in the SAME lock
+# mt5_source.py's own MT5-touching functions use — see that module's
+# own comment for why (a real, live full-page-hang incident once
+# in-app background threads existed). Importing the shared decorator
+# rather than defining a second, independent lock here is deliberate:
+# two different Lock objects would each correctly serialize calls
+# WITHIN their own module but do nothing to stop a mt5_source.py read
+# and a mt5_execution.py order call from racing each other, which is
+# exactly the scenario that needs preventing.
+from data.mt5_source import MT5ConnectionError, Position, _serialize_mt5_access
 
 
 @dataclass
@@ -11,6 +20,7 @@ class OrderResult:
     ticket: int | None
 
 
+@_serialize_mt5_access
 def open_position(
     symbol: str,
     side: str,
@@ -58,6 +68,7 @@ def open_position(
     )
 
 
+@_serialize_mt5_access
 def cancel_pending_order(ticket: int) -> OrderResult:
     """Cancels a still-unfilled pending order (the GTC limit order
     open_position places — see its own docstring). Nothing in this file
@@ -87,6 +98,7 @@ def cancel_pending_order(ticket: int) -> OrderResult:
     )
 
 
+@_serialize_mt5_access
 def close_position(position: Position, volume: float | None = None) -> OrderResult:
     """Closes (fully, or partially if `volume` is given) an existing
     position via an immediate market deal referencing its ticket. Exits
@@ -127,11 +139,12 @@ def close_position(position: Position, volume: float | None = None) -> OrderResu
     )
 
 
+@_serialize_mt5_access
 def modify_position_sltp(position: Position, stop_loss: float | None, take_profit: float | None) -> OrderResult:
     """Modifies the stop-loss and/or take-profit on an ALREADY-FILLED
     position IN PLACE, via TRADE_ACTION_SLTP — deliberately never a
     close-then-reopen (added 2026-08-23, direct user request to let both
-    Claude's daily mega session and the Copilot execution clerk revise an
+    Claude's daily mega session and the Execution Clerk revise an
     already-suggested position's risk management, not just open fresh
     ones). FTMO's own daily-loss/max-loss/Best-Day-Rule tracking
     (risk/ftmo_rules.py) keys off REALIZED P&L bucketed by calendar day:

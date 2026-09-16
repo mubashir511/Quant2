@@ -25,6 +25,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from analysis.chart_structure import STRUCTURE_LOOKBACK, detect_chart_patterns
 from analysis.technical import ATR_WINDOW
 
 _MIN_BETA_OBSERVATIONS = 60  # ~3 months of trading days — a shorter window is too noisy to trust
@@ -46,6 +47,21 @@ TRADE_SIM_STOP_ATR_MULTIPLE = 1.5
 TRADE_SIM_REWARD_RISK_RATIO = 2.0
 TRADE_SIM_TARGET_ATR_MULTIPLE = TRADE_SIM_STOP_ATR_MULTIPLE * TRADE_SIM_REWARD_RISK_RATIO
 TRADE_SIM_MAX_HOLDING_BARS = 10
+
+# How far the FAVORABLE move really travels, independent of the fixed
+# stop/target above — see _compute_favorable_excursion's own docstring
+# for why this is a deliberately separate measurement/window rather than
+# an extension of _simulate_trades. Deliberately its own constant, not a
+# reuse of TRADE_SIM_MAX_HOLDING_BARS (tuned for a fast tactical exit
+# decision, not for seeing a trend's real extent) or a literal equality
+# with analysis.chart_structure.STRUCTURE_LOOKBACK (same order of
+# magnitude on purpose — long enough to be a real ~9x expansion over the
+# 10-bar tactical figure, short enough to stay tied to the signal that
+# triggered it rather than degrading into "did this instrument drift up
+# over the next year") — kept independent so retuning one never silently
+# retunes the other for an unrelated reason.
+TRADE_SIM_EXCURSION_HORIZON_BARS = 90
+_MIN_EXCURSION_SAMPLE = 5  # same minimum-trustworthy-sample floor as _MIN_SR_TESTS/_PATTERN_MIN_OCCURRENCES
 
 
 def compute_beta(
@@ -99,7 +115,7 @@ def _forward_returns_pct(prices: pd.Series, positions: list[int], forward_days: 
 
 
 def _rolling_atr(ohlc: pd.DataFrame) -> pd.Series | None:
-    """Same True Range definition as analysis.technical._compute_atr (max
+    """Same True Range definition as analysis.technical.compute_atr (max
     of the bar's own high-low range and its gap from the prior close),
     computed as a rolling series across the WHOLE history rather than
     just the latest value — a historical trade simulation has to use the
@@ -109,7 +125,7 @@ def _rolling_atr(ohlc: pd.DataFrame) -> pd.Series | None:
     None if the frame has no High/Low at all — PSX's own EOD feed (see
     data/psx_source.py's own docstring) genuinely can't provide them,
     same "explicitly disclosed as unavailable, never fabricated"
-    convention analysis.technical._compute_atr already uses for exactly
+    convention analysis.technical.compute_atr already uses for exactly
     this same gap."""
     if not {"High", "Low", "Close"}.issubset(ohlc.columns):
         return None
@@ -271,6 +287,127 @@ def _summarize_trade_results(results: list[tuple[float, str]]) -> _TradeSimSumma
 
 
 @dataclass
+class FavorableExcursionStats:
+    """Real historical MAGNITUDE of the favorable move for a setup —
+    answers "how far did price actually travel in the favorable
+    direction, given real room to run", a fully separate question from
+    "did it touch the fixed stop/target" (see
+    _compute_favorable_excursion's own docstring for why this is a
+    deliberately decoupled measurement, not an extension of
+    _simulate_trades).
+
+    Computed across EVERY entry (win, loss, timeout alike) — same
+    unconditioned population _TradeSimSummary.avg_r_multiple already
+    uses. Deliberately NOT filtered to only entries that separately
+    resolved a "win" under the fixed-target simulation: gating on that
+    verdict would silently reintroduce the very artificial cap this stat
+    exists to look past (a "win" already touched >=2.0R by definition,
+    biasing the sample toward already-large moves) and would
+    survivorship-bias the figure.
+
+    avg_r/median_r are NOT netted against real trading cost/swap the way
+    avg_r_multiple is — this is a pure price-magnitude reading, not a
+    realized-trade P&L figure.
+
+    None (the whole dataclass) if fewer than _MIN_EXCURSION_SAMPLE
+    entries kept a real, FULL-length horizon_bars window — same "never
+    compute a stat from too short a window" rule as every other backtest
+    in this module. This needs meaningfully more real history than the
+    parent backtest's own min_occurrences/min_tests gate, since it looks
+    much further forward — a freshly-qualifying, thin-history instrument
+    can legitimately have a real win-rate result and still None here."""
+
+    sample_size: int
+    avg_r: float
+    median_r: float
+    horizon_bars: int
+
+
+def _compute_favorable_excursion(
+    ohlc: pd.DataFrame,
+    entry_positions: list[int],
+    side: str,
+    atr: pd.Series,
+    stop_atr_multiple: float,
+    horizon_bars: int = TRADE_SIM_EXCURSION_HORIZON_BARS,
+    min_stop_distance_pct: float = 0.0,
+) -> FavorableExcursionStats | None:
+    """Fully separate, decoupled measurement from _simulate_trades — a
+    deliberate design choice: that function's own loop BREAKS the instant
+    price touches the stop or the fixed target, so for the overwhelming
+    majority of wins it never sees a single bar after that touch. Weaving
+    a "best price reached" tracker into that same loop would make the new
+    figure nearly redundant with the existing capped avg_r_multiple, and
+    would require new branching inside tested, heavily-reused control
+    flow that existing tests destructure directly — this function instead
+    walks its OWN full horizon_bars window per entry, independent of any
+    stop/target touch, duplicating _simulate_trades' small entry/ATR/
+    stop_distance setup on purpose rather than touching that function's
+    tested return shape/behavior at all.
+
+    stop_distance uses the SAME stop_atr_multiple/min_stop_distance_pct
+    convention as _simulate_trades — this is a DISTANCE UNIT for
+    expressing the excursion, not a real stop being placed or tested: no
+    stop/target price is checked here, and this never classifies a trade
+    as a win/loss/timeout.
+
+    Requires a FULL horizon_bars window to count an entry at all — a
+    stricter truncation rule than _simulate_trades' own (which accepts a
+    partial window for a timeout). A partial window would under-measure
+    the true excursion and silently bias the average down; better to drop
+    the entry from the sample than let it quietly contribute a
+    systematically truncated number.
+
+    Returns None if fewer than _MIN_EXCURSION_SAMPLE entries got a real,
+    full window."""
+    high, low, close = ohlc["High"], ohlc["Low"], ohlc["Close"]
+    sign = 1.0 if side == "buy" else -1.0
+    excursions_r: list[float] = []
+    for pos in entry_positions:
+        end = pos + horizon_bars
+        if end >= len(ohlc):
+            continue
+        entry_atr = atr.iloc[pos]
+        if pd.isna(entry_atr) or entry_atr <= 0:
+            continue
+        entry_price = close.iloc[pos]
+        if not entry_price:
+            continue
+        stop_distance = stop_atr_multiple * entry_atr
+        min_stop_distance = min_stop_distance_pct / 100 * entry_price
+        if min_stop_distance > stop_distance:
+            stop_distance = min_stop_distance
+
+        window_high = high.iloc[pos + 1 : end + 1]
+        window_low = low.iloc[pos + 1 : end + 1]
+        # max(entry_price, ...) / min(entry_price, ...): the entry price
+        # itself is always the correct zero-excursion floor (price WAS
+        # there at time 0) — never let the reading go negative just
+        # because a straight-line loser's forward bars never once traded
+        # back above/below the entry.
+        best_favorable_price = (
+            max(entry_price, float(window_high.max()))
+            if side == "buy"
+            else min(entry_price, float(window_low.min()))
+        )
+        excursion_r = sign * (best_favorable_price - entry_price) / stop_distance
+        excursions_r.append(float(excursion_r))
+
+    if len(excursions_r) < _MIN_EXCURSION_SAMPLE:
+        return None
+
+    sorted_r = sorted(excursions_r)
+    n = len(sorted_r)
+    median_r = sorted_r[n // 2] if n % 2 == 1 else (sorted_r[n // 2 - 1] + sorted_r[n // 2]) / 2
+    return FavorableExcursionStats(
+        sample_size=n,
+        avg_r=float(sum(sorted_r) / n),
+        median_r=float(median_r),
+        horizon_bars=horizon_bars,
+    )
+
+
+@dataclass
 class RSIReactionBacktest:
     """Real trade-simulation result, replacing the old avg-forward-return
     style (see this module's own top-of-file note and _simulate_trades'
@@ -298,6 +435,7 @@ class RSIReactionBacktest:
     min_stop_distance_pct: float = 0.0
     round_trip_cost_pct: float = 0.0
     swap_pct_per_day_used: float = 0.0
+    excursion: FavorableExcursionStats | None = None
 
 
 _RSI_WINDOW = 14
@@ -337,6 +475,7 @@ def backtest_rsi_reaction(
     round_trip_cost_pct: float = 0.0,
     long_swap_pct_per_day: float = 0.0,
     short_swap_pct_per_day: float = 0.0,
+    excursion_horizon_bars: int = TRADE_SIM_EXCURSION_HORIZON_BARS,
 ) -> tuple[RSIReactionBacktest | None, RSIReactionBacktest | None]:
     """For every historical bar this instrument's own RSI crossed into
     overbought/oversold territory, simulates the REAL trade the textbook
@@ -393,6 +532,10 @@ def backtest_rsi_reaction(
         if len(trade_results) < min_occurrences:
             return None
         summary = _summarize_trade_results(trade_results)
+        excursion = _compute_favorable_excursion(
+            ohlc, positions, side, atr, stop_atr_multiple,
+            horizon_bars=excursion_horizon_bars, min_stop_distance_pct=min_stop_distance_pct,
+        )
         return RSIReactionBacktest(
             condition="overbought" if side == "sell" else "oversold",
             threshold=overbought if side == "sell" else oversold,
@@ -408,6 +551,7 @@ def backtest_rsi_reaction(
             min_stop_distance_pct=min_stop_distance_pct,
             round_trip_cost_pct=round_trip_cost_pct,
             swap_pct_per_day_used=swap_pct_per_day,
+            excursion=excursion,
         )
 
     overbought_result = _episode_result(rsi >= overbought, side="sell", swap_pct_per_day=short_swap_pct_per_day)
@@ -610,6 +754,8 @@ class SupportResistanceBacktest:
     round_trip_cost_pct: float = 0.0
     support_swap_pct_per_day_used: float = 0.0
     resistance_swap_pct_per_day_used: float = 0.0
+    support_excursion: FavorableExcursionStats | None = None
+    resistance_excursion: FavorableExcursionStats | None = None
 
 
 _SR_WINDOW = 60  # matches analysis.technical.RANGE_WINDOW, for the same support/resistance convention
@@ -628,6 +774,7 @@ def backtest_support_resistance_reaction(
     round_trip_cost_pct: float = 0.0,
     long_swap_pct_per_day: float = 0.0,
     short_swap_pct_per_day: float = 0.0,
+    excursion_horizon_bars: int = TRADE_SIM_EXCURSION_HORIZON_BARS,
 ) -> SupportResistanceBacktest | None:
     """The support/resistance lines shown elsewhere (and used to justify
     entries and stops) are computed from a rolling window — this
@@ -697,6 +844,14 @@ def backtest_support_resistance_reaction(
 
     support_summary = _summarize_trade_results(support_results)
     resistance_summary = _summarize_trade_results(resistance_results)
+    support_excursion = _compute_favorable_excursion(
+        ohlc, support_positions, "buy", atr, stop_atr_multiple,
+        horizon_bars=excursion_horizon_bars, min_stop_distance_pct=min_stop_distance_pct,
+    )
+    resistance_excursion = _compute_favorable_excursion(
+        ohlc, resistance_positions, "sell", atr, stop_atr_multiple,
+        horizon_bars=excursion_horizon_bars, min_stop_distance_pct=min_stop_distance_pct,
+    )
 
     return SupportResistanceBacktest(
         support_tests=support_summary.trades,
@@ -718,4 +873,263 @@ def backtest_support_resistance_reaction(
         round_trip_cost_pct=round_trip_cost_pct,
         support_swap_pct_per_day_used=long_swap_pct_per_day,
         resistance_swap_pct_per_day_used=short_swap_pct_per_day,
+        support_excursion=support_excursion,
+        resistance_excursion=resistance_excursion,
     )
+
+
+@dataclass
+class ChartPatternBacktest:
+    """Real trade-simulation result for one chart-pattern archetype (see
+    analysis.chart_structure.detect_chart_patterns) — same shape as
+    RSIReactionBacktest/SupportResistanceBacktest above.
+
+    IMPORTANT, disclosed simplification: "trades" here are NOT a
+    breakout-then-retest simulation. Each trade enters at the first
+    historical scan point where detect_chart_patterns' own output for a
+    window ending at that point newly reports this pattern name — not at
+    the pattern's literal second peak/trough, and not after any neckline
+    breakout or retest. Swing-point confirmation needs SWING_WINDOW bars
+    after the actual extreme before it can be detected at all, and the
+    scan itself only samples every _PATTERN_SCAN_STEP_BARS bars, so a
+    real entry lands up to roughly SWING_WINDOW + _PATTERN_SCAN_STEP_BARS
+    bars AFTER the pattern's second peak/trough, with price already
+    having moved. This measures whether this PATTERN SHAPE, as this
+    account's own existing detector already flags it, has real
+    historical follow-through in its implied direction — it does not
+    measure whether entering at any specific breakout/retest price (the
+    way a live thesis might frame it) would have worked.
+
+    double_bottom bets LONG (a bullish reversal is the textbook claim
+    being tested), double_top bets SHORT."""
+
+    pattern_name: str  # "double_bottom" or "double_top"
+    trades: int
+    wins: int
+    losses: int
+    timeouts: int
+    win_rate_pct: float | None
+    avg_r_multiple: float
+    stop_atr_multiple: float
+    target_atr_multiple: float
+    max_holding_bars: int
+    min_stop_distance_pct: float = 0.0
+    round_trip_cost_pct: float = 0.0
+    swap_pct_per_day_used: float = 0.0
+    excursion: FavorableExcursionStats | None = None
+
+
+_PATTERN_SCAN_STEP_BARS = 5  # ~weekly on D1 — see backtest_chart_pattern_reaction's own docstring for the cost tradeoff
+_PATTERN_MIN_OCCURRENCES = 5  # matches _MIN_SR_TESTS's floor above
+
+
+def backtest_chart_pattern_reaction(
+    ohlc: pd.DataFrame,
+    lookback: int = STRUCTURE_LOOKBACK,
+    scan_step_bars: int = _PATTERN_SCAN_STEP_BARS,
+    max_holding_bars: int = TRADE_SIM_MAX_HOLDING_BARS,
+    min_occurrences: int = _PATTERN_MIN_OCCURRENCES,
+    stop_atr_multiple: float = TRADE_SIM_STOP_ATR_MULTIPLE,
+    target_atr_multiple: float = TRADE_SIM_TARGET_ATR_MULTIPLE,
+    min_stop_distance_pct: float = 0.0,
+    round_trip_cost_pct: float = 0.0,
+    long_swap_pct_per_day: float = 0.0,
+    short_swap_pct_per_day: float = 0.0,
+    excursion_horizon_bars: int = TRADE_SIM_EXCURSION_HORIZON_BARS,
+) -> tuple[ChartPatternBacktest | None, ChartPatternBacktest | None]:
+    """Walks this instrument's own history in `scan_step_bars` steps,
+    re-running detect_chart_patterns against the history truncated to
+    end at each step (lookahead-safe by construction — every function in
+    analysis.chart_structure derives "current bar" solely from the last
+    row of whatever frame it's given, via _tail_reset's own .tail()
+    call, so this is exactly the read that would have existed live at
+    that bar). Reuses `lookback` = STRUCTURE_LOOKBACK by default rather
+    than a separate constant, so this backtest tests the SAME detector
+    parametrization whose live output already appears elsewhere in the
+    same prompt (compute_chart_structure's own `patterns` field) — a
+    different lookback here would silently test a differently-tuned
+    detector than the one backing the live claim.
+
+    Deliberately does NOT hand-truncate the window before calling
+    detect_chart_patterns — that function already truncates internally
+    (including a graceful degrade when lookback > available history), so
+    re-truncating manually here would only add a redundant off-by-one
+    risk surface.
+
+    A pattern name newly appearing in one step's output that wasn't in
+    the previous step's output counts as one occurrence (collapses an
+    ongoing, still-detected pattern across consecutive scan steps into
+    one entry, same "count episodes, not days" spirit as
+    _episode_start_positions above, just applied at scan-step
+    granularity). See ChartPatternBacktest's own docstring for exactly
+    what "entry" means and its real timing lag.
+
+    double_bottom and double_top are gated independently by their own
+    `min_occurrences` (like backtest_rsi_reaction, NOT the all-or-nothing
+    gate backtest_support_resistance_reaction uses) — an instrument with
+    a trend bias can legitimately form far more of one than the other,
+    and a real, statistically meaningful one-sided result shouldn't be
+    discarded just because the other side lacks data.
+
+    Real, disclosed completeness gap: a pattern that both forms AND gets
+    invalidated (displaced by a later swing point) entirely within one
+    `scan_step_bars` gap is never observed by any scan point and is
+    silently absent from the sample — this only affects a pattern with a
+    real lifetime shorter than `scan_step_bars`, which should be rare
+    given typical pattern lifetimes on daily bars, but it's a real,
+    undercounting bias, not a claim of exhaustive coverage.
+
+    Returns (double_bottom_result, double_top_result), either None below
+    `min_occurrences`, or if `ohlc` has no High/Low at all (ATR needs
+    it)."""
+    ohlc = ohlc.dropna(subset=[c for c in ("High", "Low", "Close") if c in ohlc.columns])
+    if len(ohlc) < lookback + max_holding_bars + 1:
+        return None, None
+
+    atr = _rolling_atr(ohlc)
+    if atr is None:
+        return None, None
+
+    bullish_positions: list[int] = []
+    bearish_positions: list[int] = []
+    previous_names: set[str] = set()
+    scan_end = len(ohlc) - max_holding_bars
+    for t in range(lookback, scan_end, scan_step_bars):
+        names = {p.name for p in detect_chart_patterns(ohlc.iloc[: t + 1], lookback=lookback)}
+        if "double_bottom" in names and "double_bottom" not in previous_names:
+            bullish_positions.append(t)
+        if "double_top" in names and "double_top" not in previous_names:
+            bearish_positions.append(t)
+        previous_names = names
+
+    def _pattern_result(
+        positions: list[int], side: str, pattern_name: str, swap_pct_per_day: float
+    ) -> ChartPatternBacktest | None:
+        if len(positions) < min_occurrences:
+            return None
+        trade_results = _simulate_trades(
+            ohlc, positions, side, atr, stop_atr_multiple, target_atr_multiple, max_holding_bars,
+            min_stop_distance_pct=min_stop_distance_pct, round_trip_cost_pct=round_trip_cost_pct,
+            swap_pct_per_day=swap_pct_per_day,
+        )
+        if len(trade_results) < min_occurrences:
+            return None
+        summary = _summarize_trade_results(trade_results)
+        excursion = _compute_favorable_excursion(
+            ohlc, positions, side, atr, stop_atr_multiple,
+            horizon_bars=excursion_horizon_bars, min_stop_distance_pct=min_stop_distance_pct,
+        )
+        return ChartPatternBacktest(
+            pattern_name=pattern_name,
+            trades=summary.trades,
+            wins=summary.wins,
+            losses=summary.losses,
+            timeouts=summary.timeouts,
+            win_rate_pct=summary.win_rate_pct,
+            avg_r_multiple=summary.avg_r_multiple,
+            stop_atr_multiple=stop_atr_multiple,
+            target_atr_multiple=target_atr_multiple,
+            max_holding_bars=max_holding_bars,
+            min_stop_distance_pct=min_stop_distance_pct,
+            round_trip_cost_pct=round_trip_cost_pct,
+            swap_pct_per_day_used=swap_pct_per_day,
+            excursion=excursion,
+        )
+
+    double_bottom_result = _pattern_result(bullish_positions, "buy", "double_bottom", long_swap_pct_per_day)
+    double_top_result = _pattern_result(bearish_positions, "sell", "double_top", short_swap_pct_per_day)
+    return double_bottom_result, double_top_result
+
+
+def classify_backtest_favorability(
+    side: str,
+    rsi_overbought_backtest: RSIReactionBacktest | None,
+    rsi_oversold_backtest: RSIReactionBacktest | None,
+    support_resistance_backtest: SupportResistanceBacktest | None,
+    double_bottom_backtest: ChartPatternBacktest | None,
+    double_top_backtest: ChartPatternBacktest | None,
+) -> tuple[str | None, float | None]:
+    """Deterministic SUPPORTED/CONTRADICTED/MIXED read of whether a
+    position's own real historical backtest evidence, on ITS side, backs
+    its thesis — the Python-side counterpart to the scoring Claude's own
+    AUDIT_INSTRUCTION prompt text already does in free-text reasoning
+    (ai/ftmo_suggest.py), added so ai.clerk_execution's own local, weaker
+    model gets the same real evidence as an already-resolved fact
+    instead of raw prose to re-derive.
+
+    Only the backtests relevant to `side` are considered: for "buy",
+    rsi_oversold_backtest / support_resistance_backtest.support_avg_r_
+    multiple / double_bottom_backtest; for "sell", rsi_overbought_
+    backtest / .resistance_avg_r_multiple / double_top_backtest —
+    deliberately never the counter-side backtest on the same instrument,
+    which tests a different, irrelevant direction.
+
+    Each relevant backtest's own avg_r_multiple is rounded to 2dp before
+    classifying favorable (>0) / unfavorable (<0) / neutral (==0.0) —
+    same rounding convention app.py::_render_trade_sim_metric's own
+    delta-coloring already uses, so a floating-point-noise result near
+    zero doesn't get misread as a real edge in either direction.
+
+    Returns (favorability, excursion_median_r):
+    - No relevant backtest available at all, OR every relevant one is
+      neutral (rounds to 0.00R) — (None, None). A neutral result is "no
+      real edge either way," genuinely different from a real
+      disagreement between setups, so it degrades exactly like missing
+      data rather than being folded into "mixed".
+    - At least one favorable AND at least one unfavorable — ("mixed",
+      None). No majority rule: these are independent structural
+      hypotheses (RSI reaction, S/R reaction, chart pattern), not
+      repeated samples of the same edge, so a 2-1 split is genuine
+      disagreement, not noise to vote away.
+    - All relevant, non-neutral backtests unfavorable — ("contradicted", None).
+    - At least one favorable and zero unfavorable — ("supported",
+      excursion_median_r), where excursion_median_r is pulled from THAT
+      single most-favorable backtest's own excursion/support_excursion/
+      resistance_excursion field (whichever this function used for its
+      avg_r_multiple), its .median_r if not None, else None.
+      Deliberately NEVER borrowed from a different, weaker backtest on
+      the same side even if IT has a populated excursion figure —
+      pairing a setup's own win-rate support with a DIFFERENT setup's
+      excursion reading would violate the same "read this figure
+      TOGETHER WITH that win-rate figure, same line, never a
+      substitute" discipline ai.ftmo_suggest's own AUDIT_INSTRUCTION
+      prose already establishes."""
+    candidates: list[tuple[float, FavorableExcursionStats | None]] = []
+    if side == "buy":
+        if rsi_oversold_backtest is not None:
+            candidates.append((rsi_oversold_backtest.avg_r_multiple, rsi_oversold_backtest.excursion))
+        if support_resistance_backtest is not None:
+            candidates.append((
+                support_resistance_backtest.support_avg_r_multiple,
+                support_resistance_backtest.support_excursion,
+            ))
+        if double_bottom_backtest is not None:
+            candidates.append((double_bottom_backtest.avg_r_multiple, double_bottom_backtest.excursion))
+    elif side == "sell":
+        if rsi_overbought_backtest is not None:
+            candidates.append((rsi_overbought_backtest.avg_r_multiple, rsi_overbought_backtest.excursion))
+        if support_resistance_backtest is not None:
+            candidates.append((
+                support_resistance_backtest.resistance_avg_r_multiple,
+                support_resistance_backtest.resistance_excursion,
+            ))
+        if double_top_backtest is not None:
+            candidates.append((double_top_backtest.avg_r_multiple, double_top_backtest.excursion))
+    else:
+        return None, None
+
+    if not candidates:
+        return None, None
+
+    rounded = [(round(avg_r, 2), excursion) for avg_r, excursion in candidates]
+    favorable = [c for c in rounded if c[0] > 0]
+    unfavorable = [c for c in rounded if c[0] < 0]
+
+    if favorable and unfavorable:
+        return "mixed", None
+    if favorable:
+        _best_avg_r, best_excursion = max(favorable, key=lambda c: c[0])
+        return "supported", (best_excursion.median_r if best_excursion is not None else None)
+    if unfavorable:
+        return "contradicted", None
+    return None, None  # every relevant backtest rounds to a dead-flat 0.00R

@@ -2,7 +2,10 @@ import pandas as pd
 import pytest
 
 from analysis.chart_structure import (
+    SR_CLUSTER_TOLERANCE_PCT,
+    SR_TOLERANCE_ATR_MULTIPLE,
     _cluster_prices,
+    atr_scaled_sr_tolerance,
     compute_chart_structure,
     compute_fibonacci_levels,
     compute_sr_levels,
@@ -199,6 +202,126 @@ def test_sr_levels_touches_beat_a_higher_untested_level_for_ranking():
     assert sr.resistance_levels[0].touches >= sr.resistance_levels[-1].touches
 
 
+def test_sr_levels_result_echoes_back_the_real_tolerance_actually_used():
+    # Real bug found on independent audit, fixed 2026-09-10: downstream
+    # consumers (ai/chart_overlay.py) had no way to know what tolerance
+    # was actually used to cluster a given result — SRLevelsResult must
+    # carry it, not assume the flat SR_CLUSTER_TOLERANCE_PCT default.
+    history = _make_history(_zigzag([120, 150.0, 100.0, 150.1, 100.05, 149.95, 105], 8))
+    default = compute_sr_levels(history)
+    assert default.tolerance_pct == pytest.approx(SR_CLUSTER_TOLERANCE_PCT)
+    scaled = compute_sr_levels(history, tolerance_pct=0.9)
+    assert scaled.tolerance_pct == pytest.approx(0.9)
+
+
+# --- atr_scaled_sr_tolerance (added 2026-09-09) ---
+
+
+def test_atr_scaled_sr_tolerance_stays_at_the_floor_for_a_genuinely_calm_instrument():
+    # A tiny, steady drift gives a real but small ATR% -- well under the
+    # flat floor -- so the ATR-scaled tolerance must never come back
+    # TIGHTER than the original flat convention.
+    closes = [100.0 + i * 0.01 for i in range(20)]
+    history = _make_history(closes)
+    assert atr_scaled_sr_tolerance(history) == pytest.approx(SR_CLUSTER_TOLERANCE_PCT)
+
+
+def test_atr_scaled_sr_tolerance_widens_for_a_genuinely_fast_mover():
+    # A real, large bar-to-bar range (~2% of price) must produce a WIDER
+    # tolerance than the flat floor -- the whole point of this function,
+    # real incident it targets: a flat 0.3% tolerance splitting one real
+    # liquidity zone on a fast mover into several separate low-touch
+    # "levels" (see SR_TOLERANCE_ATR_MULTIPLE's own module comment).
+    closes = [100.0 + (i % 2) * 2.0 for i in range(20)]  # oscillates 100.0/102.0 every bar
+    history = _make_history(closes)
+    tolerance = atr_scaled_sr_tolerance(history)
+    assert tolerance > SR_CLUSTER_TOLERANCE_PCT
+    assert tolerance == pytest.approx(0.98, abs=0.15)  # ~0.5 * ~1.96% atr_pct
+
+
+def test_atr_scaled_sr_tolerance_floor_when_atr_unavailable():
+    empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+    assert atr_scaled_sr_tolerance(empty) == SR_CLUSTER_TOLERANCE_PCT
+
+
+def test_compute_chart_structure_wires_atr_scaled_tolerance_into_sr_levels():
+    # Regression: sr_tolerance_pct must actually be THREADED into
+    # compute_sr_levels' own call inside compute_chart_structure, not
+    # just computed and discarded.
+    import analysis.chart_structure as chart_structure_module
+
+    history = _make_history(_zigzag([105, 100, 120, 110, 150, 133], 8))
+    captured: dict = {}
+    real_compute_sr_levels = chart_structure_module.compute_sr_levels
+
+    def _capturing_compute_sr_levels(*args, **kwargs):
+        captured["tolerance_pct"] = kwargs.get("tolerance_pct")
+        return real_compute_sr_levels(*args, **kwargs)
+
+    chart_structure_module.compute_sr_levels = _capturing_compute_sr_levels
+    try:
+        chart_structure_module.compute_chart_structure(history)
+    finally:
+        chart_structure_module.compute_sr_levels = real_compute_sr_levels
+
+    assert captured["tolerance_pct"] == pytest.approx(atr_scaled_sr_tolerance(history))
+
+
+# --- SRLevel.is_liquidity_pool (equal highs/lows, added 2026-09-09) ---
+
+
+def test_sr_levels_flags_a_tight_equal_highs_cluster_as_a_liquidity_pool():
+    from analysis.chart_structure import SwingPoint
+
+    # Two swing highs sitting almost exactly on top of each other (a real
+    # equal-highs signature) plus a third, more loosely-spread high that
+    # clears the BROAD 0.3% tolerance (so all three still merge into one
+    # reported level) but NOT the tighter liquidity-pool sub-tolerance
+    # (0.3% * SR_LIQUIDITY_POOL_TOLERANCE_FRACTION=0.35 = 0.105%) on its
+    # own — the tight 200.0/200.02 pair alone must still be enough to
+    # flag the whole merged level as a liquidity pool.
+    history = _make_history([150.0] * 5)
+    swing_highs = [
+        SwingPoint(index=0, price=200.0),
+        SwingPoint(index=1, price=200.02),  # 0.01% from 200.0 -- a real equal-high
+        SwingPoint(index=2, price=200.5),   # 0.25% from 200.0 -- broad-tolerance touch only
+    ]
+    swing_lows = [SwingPoint(index=3, price=100.0)]  # single touch -- never a liquidity pool alone
+
+    sr = compute_sr_levels(history, swing_points=(swing_highs, swing_lows))
+
+    assert sr is not None
+    assert len(sr.resistance_levels) == 1
+    assert sr.resistance_levels[0].touches == 3
+    assert sr.resistance_levels[0].is_liquidity_pool is True
+
+    assert len(sr.support_levels) == 1
+    assert sr.support_levels[0].touches == 1
+    assert sr.support_levels[0].is_liquidity_pool is False
+
+
+def test_sr_levels_no_liquidity_pool_when_touches_are_genuinely_spread_out():
+    from analysis.chart_structure import SwingPoint
+
+    # Three swing highs each ~0.15% apart from their neighbor -- close
+    # enough to merge under the broad 0.3% tolerance, but no PAIR of them
+    # is within the tight liquidity-pool sub-tolerance of each other.
+    history = _make_history([150.0] * 5)
+    swing_highs = [
+        SwingPoint(index=0, price=200.0),
+        SwingPoint(index=1, price=200.3),   # 0.15% from 200.0
+        SwingPoint(index=2, price=200.6),   # 0.15% from 200.3, 0.30% from 200.0
+    ]
+    swing_lows = [SwingPoint(index=3, price=100.0)]  # single touch -- never a liquidity pool alone
+
+    sr = compute_sr_levels(history, swing_points=(swing_highs, swing_lows))
+
+    assert sr is not None
+    assert sr.resistance_levels[0].touches == 3
+    assert sr.resistance_levels[0].is_liquidity_pool is False
+    assert sr.support_levels[0].is_liquidity_pool is False
+
+
 # --- compute_trendlines ---
 
 
@@ -343,7 +466,13 @@ def test_compute_chart_structure_still_produces_correct_results_after_sharing_sw
     history = _make_history(_zigzag([105, 100, 120, 110, 150, 133], 8))
     shared = compute_chart_structure(history)
     independent_fib = compute_fibonacci_levels(history)
-    independent_sr = compute_sr_levels(history)
+    # compute_chart_structure passes its own ATR-scaled tolerance (see
+    # atr_scaled_sr_tolerance) into compute_sr_levels, not the flat
+    # default — reuse that same real value here too, so this test keeps
+    # checking "shared computation == independent computation" rather
+    # than accidentally asserting two DIFFERENT tolerances produce
+    # identical results (they don't, for a genuinely fast instrument).
+    independent_sr = compute_sr_levels(history, tolerance_pct=atr_scaled_sr_tolerance(history))
     independent_trendlines = compute_trendlines(history)
     independent_patterns = detect_chart_patterns(history) + detect_candlestick_patterns(history)
 

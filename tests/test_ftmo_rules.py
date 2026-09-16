@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -8,6 +8,28 @@ from risk.ftmo_rules import compute_ftmo_status, would_breach_daily_loss_headroo
 
 def _deal(profit: float, day: datetime, ticket: int = 1, symbol: str = "EURUSD") -> HistoricalDeal:
     return HistoricalDeal(ticket=ticket, time=day, symbol=symbol, profit=profit, volume=1.0)
+
+
+def test_default_now_is_utc_aware_not_machine_local():
+    # Real bug found live 2026-09-01: compute_ftmo_status's own default
+    # `now=None` -> datetime.now() (naive, whatever timezone the running
+    # MACHINE happens to be set to) used to make "today" for this
+    # account's real 3%/10% daily-loss bucketing depend on which
+    # computer ran the app — the exact same HistoricalDeal.time (itself
+    # fixed to UTC the same day, see data/mt5_source.py's own fix) could
+    # bucket into a different calendar day purely from machine timezone.
+    # Deliberately omits `now=` here to exercise the real default.
+    utc_now = datetime.now(timezone.utc)
+    status = compute_ftmo_status(
+        deals=[_deal(-25.0, utc_now)],
+        initial_balance=100_000.0,
+        current_equity=99_975.0,
+        current_balance=99_975.0,
+    )
+    # If the default correctly buckets this UTC-timestamped deal into
+    # "today" (UTC), it shows up as today's realized P&L; a machine-
+    # local default could instead miss it entirely near a day boundary.
+    assert status.today_realized_pl == pytest.approx(-25.0)
 
 
 def test_fresh_account_zero_history_has_full_headroom_and_no_best_day_fields():
