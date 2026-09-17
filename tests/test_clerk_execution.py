@@ -12,12 +12,17 @@ from ai.ollama_client import FAILED_MESSAGE as OLLAMA_FAILED_MESSAGE
 from ai.clerk_execution import (
     SymbolSettlement,
     TacticalVerdict,
+    _apply_atr_stop_floor_guard,
     _apply_correlation_guard,
     _build_carried_forward_allocation,
+    _build_verdict_prompt,
+    _clerk_news_cache,
     _compute_realized_r,
     _detect_external_stop_drift,
     _detect_newly_closed_symbols,
+    _detect_ollama_outage,
     _export_closed_trade_notes,
+    _fetch_clerk_news_block,
     _fetch_correlation_closes,
     _fetch_technical_context,
     _format_closed_trade_note,
@@ -619,6 +624,88 @@ def test_order_placed_symbol_without_held_symbols_membership_stays_excluded():
     assert "USDCAD" not in carried
 
 
+# --- real INTC incident, 2026-09-10: a stale immediate_allocation cancel ---
+# --- directive must never shadow a separately-triggered, now-filled     ---
+# --- Pending-Setup position on the SAME symbol.                        ---
+
+
+def test_stale_immediate_allocation_cancel_never_shadows_a_filled_pending_setup():
+    # Real sequence: the mega session's own CURRENT suggestion still says
+    # "INTC: pct=0" (cancel a now-superseded, long-unfilled pending buy-
+    # limit) — but hours later, in the SAME cycle, a SEPARATE Pending
+    # Setup for INTC triggered, filled, and became a real position. The
+    # settlement record's own origin=="pending_setup" is the proof this
+    # real position did NOT come from the immediate_allocation entry —
+    # that entry's pct=0 is simply stale and must not force-close it.
+    immediate_allocation_raw = {"INTC": {"pct": 0, "side": "buy", "price": 100.0, "stop_loss": 95.5}}
+    settled = {
+        "INTC": {
+            "origin": "pending_setup", "state": "filled",
+            "entry": {"pct": 0.18, "side": "buy", "price": 101.90, "stop_loss": 98.50, "take_profit": 110.0},
+            "order_ticket": 555,
+        }
+    }
+    carried = _build_carried_forward_allocation(immediate_allocation_raw, settled)
+    assert carried["INTC"] == AllocationEntry(
+        pct=0.18, price=101.90, stop_loss=98.50, take_profit=110.0, side="buy"
+    )
+
+
+def test_stale_immediate_allocation_cancel_never_shadows_a_held_pending_setup_stuck_in_order_placed():
+    # Same real gap, caught the instant it fills (before _reconcile_
+    # settlement has transitioned state to "filled" yet) via held_symbols
+    # — mirrors test_held_symbol_stuck_in_order_placed_is_still_carried_
+    # forward's own reasoning, just with a stale SHADOWING immediate_
+    # allocation entry present too this time.
+    immediate_allocation_raw = {"INTC": {"pct": 0, "side": "buy", "price": 100.0, "stop_loss": 95.5}}
+    settled = {
+        "INTC": {
+            "origin": "pending_setup", "state": "order_placed",
+            "entry": {"pct": 0.18, "side": "buy", "price": 101.90, "stop_loss": 98.50, "take_profit": 110.0},
+            "order_ticket": 555,
+        }
+    }
+    carried = _build_carried_forward_allocation(immediate_allocation_raw, settled, held_symbols=frozenset({"INTC"}))
+    assert carried["INTC"] == AllocationEntry(
+        pct=0.18, price=101.90, stop_loss=98.50, take_profit=110.0, side="buy"
+    )
+
+
+def test_immediate_origin_symbol_still_wins_normally_even_when_filled():
+    # The FIX must not overreach: a symbol whose settlement record's own
+    # origin IS "immediate" (a real, ordinary top-up/hold/close case) must
+    # keep using immediate_allocation_raw exactly as before — only
+    # origin=="pending_setup" triggers the new shadow-avoidance path.
+    immediate_allocation_raw = {"XAUUSD": {"pct": 0.4, "side": "buy", "price": 2000.0, "stop_loss": 1950.0}}
+    settled = {
+        "XAUUSD": {
+            "origin": "immediate", "state": "filled",
+            "entry": {"pct": 0.3, "side": "buy", "price": 1990.0, "stop_loss": 1940.0},
+            "order_ticket": 777,
+        }
+    }
+    carried = _build_carried_forward_allocation(immediate_allocation_raw, settled)
+    assert carried["XAUUSD"].pct == 0.4  # from immediate_allocation_raw, unchanged behavior
+
+
+def test_pending_setup_origin_not_yet_filled_and_not_held_still_uses_immediate_allocation():
+    # A pending_setup-origin record that's neither "filled" nor in
+    # held_symbols (still genuinely just a resting, unfilled order) must
+    # NOT trigger the shadow-avoidance path -- immediate_allocation_raw's
+    # own pct is still the right answer for a symbol with zero real
+    # position backing it.
+    immediate_allocation_raw = {"INTC": {"pct": 0, "side": "buy", "price": 100.0, "stop_loss": 95.5}}
+    settled = {
+        "INTC": {
+            "origin": "pending_setup", "state": "order_placed",
+            "entry": {"pct": 0.18, "side": "buy", "price": 101.90, "stop_loss": 98.50, "take_profit": 110.0},
+            "order_ticket": 555,
+        }
+    }
+    carried = _build_carried_forward_allocation(immediate_allocation_raw, settled)
+    assert carried["INTC"].pct == 0  # from immediate_allocation_raw -- not yet actually held
+
+
 def test_symbol_with_no_settlement_record_is_carried_forward_normally():
     immediate_allocation_raw = {"EURUSD": {"pct": 1.5, "side": "buy", "price": 1.09, "stop_loss": 1.08}}
     carried = _build_carried_forward_allocation(immediate_allocation_raw, {})
@@ -898,6 +985,57 @@ def test_restore_acts_regardless_of_drift_direction(mock_modify):
     assert len(outcomes) == 1
     mock_modify.assert_called_once()
     assert mock_modify.call_args.kwargs["stop_loss"] == 4378.00
+
+
+# --- _detect_ollama_outage (2026-09-16, direct user request) ---
+
+
+def test_detect_ollama_outage_fires_when_every_real_attempt_failed():
+    results = [
+        (PendingSetup(symbol="MSFT", side="buy", pct=0.2, price=490.0, stop_loss=485.0, trigger_condition="x"),
+         False, OLLAMA_FAILED_MESSAGE),
+        ("XAGUSD", False, OLLAMA_FAILED_MESSAGE),
+        ("NVDA", TacticalVerdict(tier="hold"), OLLAMA_FAILED_MESSAGE),
+    ]
+    note = _detect_ollama_outage(results)
+    assert "unreachable" in note
+    assert "3/3" in note
+
+
+def test_detect_ollama_outage_silent_when_at_least_one_succeeded():
+    results = [
+        ("MSFT", False, OLLAMA_FAILED_MESSAGE),
+        ("XAGUSD", True, "FINAL_VERDICT: CONFIRMED"),
+    ]
+    assert _detect_ollama_outage(results) == ""
+
+
+def test_detect_ollama_outage_silent_when_no_attempts_at_all():
+    assert _detect_ollama_outage([]) == ""
+
+
+def test_detect_ollama_outage_excludes_deterministic_circuit_breaker_verdicts():
+    # A poll made up ENTIRELY of hard-exit/trend-flip circuit breakers
+    # never calls Ollama at all -- must never be misread as "every real
+    # attempt failed" just because none of them are real attempts.
+    results = [
+        ("NVDA", TacticalVerdict(tier="exit", hard_exit=True),
+         "[deterministic circuit-breaker — no model call made] adverse move past ceiling."),
+    ]
+    assert _detect_ollama_outage(results) == ""
+
+
+def test_detect_ollama_outage_excludes_circuit_breakers_from_the_denominator():
+    # One real Ollama failure alongside an unrelated circuit-breaker
+    # verdict this same poll -- the circuit breaker must not count
+    # toward EITHER the numerator or denominator.
+    results = [
+        ("MSFT", False, OLLAMA_FAILED_MESSAGE),
+        ("NVDA", TacticalVerdict(tier="exit", hard_exit=True),
+         "[deterministic circuit-breaker — no model call made] adverse move past ceiling."),
+    ]
+    note = _detect_ollama_outage(results)
+    assert "1/1" in note
 
 
 # --- settlement reset: cancels unfilled orders, resets tracking ---
@@ -2661,3 +2799,158 @@ def test_correlation_guard_reduces_a_real_stack_opposite_side_negative_correlati
         result = _apply_correlation_guard(allocation, positions)
 
     assert result["BTCUSD"].pct == pytest.approx(0.25)  # halved -- this really is a stacked bet
+
+
+# --- _apply_atr_stop_floor_guard (2026-09-16, real EURUSD 2026-09-07 incident) ---
+
+
+def test_atr_stop_floor_guard_widens_a_too_tight_buy_stop():
+    # Real EURUSD-shaped numbers: entry 1.16231, stop 1.1636 is on the
+    # WRONG side for a buy (that's a sell-shaped stop) -- use a real buy
+    # shape instead: H1 ATR 0.000697 (0.06% of 1.16231, per the real
+    # audit), floor = 1.5x = 0.0010455, stop only 0.0004 away (way
+    # tighter than the floor) -- must widen to exactly the floor below price.
+    allocation = {
+        "EURUSD": AllocationEntry(pct=0.5, price=1.16231, stop_loss=1.16191, side="buy", reason="thesis"),
+    }
+    cache = {"EURUSD": (_fake_ftmo_analysis(symbol="EURUSD", h1_atr=0.000697), "")}
+    result = _apply_atr_stop_floor_guard(allocation, [], cache)
+    expected_stop = 1.16231 - 1.5 * 0.000697
+    assert result["EURUSD"].stop_loss == pytest.approx(expected_stop)
+    assert "ATR stop-floor guard" in result["EURUSD"].reason
+
+
+def test_atr_stop_floor_guard_widens_a_too_tight_sell_stop_on_the_correct_side():
+    allocation = {
+        "EURUSD": AllocationEntry(pct=0.5, price=1.16231, stop_loss=1.16271, side="sell", reason="thesis"),
+    }
+    cache = {"EURUSD": (_fake_ftmo_analysis(symbol="EURUSD", h1_atr=0.000697), "")}
+    result = _apply_atr_stop_floor_guard(allocation, [], cache)
+    expected_stop = 1.16231 + 1.5 * 0.000697
+    assert result["EURUSD"].stop_loss == pytest.approx(expected_stop)
+    assert result["EURUSD"].stop_loss > 1.16231  # correct side for a sell
+
+
+def test_atr_stop_floor_guard_leaves_a_stop_already_at_the_floor_untouched():
+    atr = 0.000697
+    price, stop = 1.16231, 1.16231 - 1.5 * atr
+    allocation = {"EURUSD": AllocationEntry(pct=0.5, price=price, stop_loss=stop, side="buy", reason="thesis")}
+    cache = {"EURUSD": (_fake_ftmo_analysis(symbol="EURUSD", h1_atr=atr), "")}
+    result = _apply_atr_stop_floor_guard(allocation, [], cache)
+    assert result["EURUSD"].stop_loss == pytest.approx(stop)
+    assert result["EURUSD"].reason == "thesis"  # untouched, no guard note appended
+
+
+def test_atr_stop_floor_guard_leaves_a_stop_wider_than_the_floor_untouched():
+    atr = 0.000697
+    price, stop = 1.16231, 1.16231 - 3.0 * atr  # already much wider than the 1.5x floor
+    allocation = {"EURUSD": AllocationEntry(pct=0.5, price=price, stop_loss=stop, side="buy", reason="thesis")}
+    cache = {"EURUSD": (_fake_ftmo_analysis(symbol="EURUSD", h1_atr=atr), "")}
+    result = _apply_atr_stop_floor_guard(allocation, [], cache)
+    assert result["EURUSD"].stop_loss == pytest.approx(stop)
+
+
+def test_atr_stop_floor_guard_skips_symbol_missing_from_cache():
+    allocation = {"EURUSD": AllocationEntry(pct=0.5, price=1.16231, stop_loss=1.16225, side="buy", reason="thesis")}
+    result = _apply_atr_stop_floor_guard(allocation, [], {})
+    assert result["EURUSD"].stop_loss == 1.16225
+
+
+def test_atr_stop_floor_guard_skips_symbol_with_no_h1_atr():
+    allocation = {"EURUSD": AllocationEntry(pct=0.5, price=1.16231, stop_loss=1.16225, side="buy", reason="thesis")}
+    cache = {"EURUSD": (_fake_ftmo_analysis(symbol="EURUSD", h1_atr=None), "")}
+    result = _apply_atr_stop_floor_guard(allocation, [], cache)
+    assert result["EURUSD"].stop_loss == 1.16225
+
+
+def test_atr_stop_floor_guard_skips_entry_missing_price_or_stop():
+    allocation = {"EURUSD": AllocationEntry(pct=0.5, price=None, stop_loss=None, side="buy", reason="thesis")}
+    cache = {"EURUSD": (_fake_ftmo_analysis(symbol="EURUSD", h1_atr=0.0007), "")}
+    result = _apply_atr_stop_floor_guard(allocation, [], cache)
+    assert result["EURUSD"].price is None
+    assert result["EURUSD"].stop_loss is None
+
+
+def test_atr_stop_floor_guard_never_touches_an_already_held_symbol():
+    allocation = {"EURUSD": AllocationEntry(pct=0.5, price=1.16231, stop_loss=1.16225, side="buy", reason="thesis")}
+    positions = [_position(symbol="EURUSD", side="buy")]
+    cache = {"EURUSD": (_fake_ftmo_analysis(symbol="EURUSD", h1_atr=0.000697), "")}
+    result = _apply_atr_stop_floor_guard(allocation, positions, cache)
+    assert result["EURUSD"].stop_loss == 1.16225  # not a "candidate" -- already held
+
+
+def test_atr_stop_floor_guard_ignores_cash():
+    allocation = {"CASH": AllocationEntry(pct=99.0, side="buy", reason="")}
+    result = _apply_atr_stop_floor_guard(allocation, [], {})
+    assert result["CASH"].pct == 99.0
+
+
+# --- Clerk news feed (2026-09-17: closes the gap where local Ollama
+# models can't fulfil the verdict prompt's own "check for major news"
+# instruction) -------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_clerk_news_cache():
+    _clerk_news_cache.clear()
+    yield
+    _clerk_news_cache.clear()
+
+
+def test_fetch_clerk_news_block_returns_real_headlines():
+    with patch("ai.clerk_execution.resolve_yahoo_ticker", return_value=("Gold", "GC=F")):
+        with patch("ai.clerk_execution.fetch_recent_headlines", return_value=["Gold hits record high"]) as fetch:
+            block = _fetch_clerk_news_block("XAUUSD", "Gold vs US Dollar")
+    assert block == "- Gold hits record high"
+    fetch.assert_called_once_with("GC=F", limit=config.NEWS_HEADLINES_PER_ASSET)
+
+
+def test_fetch_clerk_news_block_empty_when_ticker_does_not_resolve():
+    with patch("ai.clerk_execution.resolve_yahoo_ticker", return_value=None):
+        with patch("ai.clerk_execution.fetch_recent_headlines") as fetch:
+            block = _fetch_clerk_news_block("UNKNOWN.c", "Some CFD")
+    assert block == ""
+    fetch.assert_not_called()
+
+
+def test_fetch_clerk_news_block_empty_when_fetch_returns_nothing():
+    with patch("ai.clerk_execution.resolve_yahoo_ticker", return_value=("Gold", "GC=F")):
+        with patch("ai.clerk_execution.fetch_recent_headlines", return_value=[]):
+            block = _fetch_clerk_news_block("XAUUSD", "Gold vs US Dollar")
+    assert block == ""
+
+
+def test_fetch_clerk_news_block_is_cached_within_the_configured_window():
+    with patch("ai.clerk_execution.resolve_yahoo_ticker", return_value=("Gold", "GC=F")):
+        with patch("ai.clerk_execution.fetch_recent_headlines", return_value=["headline one"]) as fetch:
+            first = _fetch_clerk_news_block("XAUUSD", "Gold vs US Dollar")
+            second = _fetch_clerk_news_block("XAUUSD", "Gold vs US Dollar")
+    assert first == second == "- headline one"
+    fetch.assert_called_once()
+
+
+def test_fetch_clerk_news_block_refetches_after_the_cache_window_expires():
+    from datetime import timedelta
+
+    with patch("ai.clerk_execution.resolve_yahoo_ticker", return_value=("Gold", "GC=F")):
+        with patch("ai.clerk_execution.fetch_recent_headlines", return_value=["old headline"]):
+            _fetch_clerk_news_block("XAUUSD", "Gold vs US Dollar")
+        stale_time = datetime.now(timezone.utc) - timedelta(minutes=config.CLERK_NEWS_CACHE_MINUTES + 1)
+        _clerk_news_cache["XAUUSD"] = (stale_time, "- old headline")
+        with patch("ai.clerk_execution.fetch_recent_headlines", return_value=["new headline"]) as fetch:
+            refreshed = _fetch_clerk_news_block("XAUUSD", "Gold vs US Dollar")
+    assert refreshed == "- new headline"
+    fetch.assert_called_once()
+
+
+def test_verdict_prompt_embeds_real_news_block_not_a_web_access_instruction():
+    setup = PendingSetup(symbol="XAUUSD", side="buy", pct=1.0, trigger_condition="cond")
+    prompt = _build_verdict_prompt(setup, "technical context here", 100000.0, "1 hour(s)", "- Gold hits record high")
+    assert "- Gold hits record high" in prompt
+    assert "live web access" not in prompt
+
+
+def test_verdict_prompt_shows_honest_placeholder_when_no_news_found():
+    setup = PendingSetup(symbol="XAUUSD", side="buy", pct=1.0, trigger_condition="cond")
+    prompt = _build_verdict_prompt(setup, "technical context here", 100000.0, "1 hour(s)", "")
+    assert "(no recent headlines found)" in prompt

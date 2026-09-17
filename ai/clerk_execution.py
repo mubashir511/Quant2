@@ -190,6 +190,7 @@ from ai.ftmo_suggest import (
     FtmoAssetAnalysis,
     _HIGH_CORRELATION_THRESHOLD,
     _MIN_CORRELATION_OBSERVATIONS,
+    aligned_h1_h4_trend_direction,
     analyze_ftmo_asset_live,
     fetch_ftmo_status,
     format_ftmo_asset_context,
@@ -208,6 +209,8 @@ from analysis.technical import (
     compute_regime_segments,
 )
 from data.book_wisdom import format_trend_wisdom
+from data.news_source import fetch_recent_headlines
+from data.underlying import resolve_yahoo_ticker
 from data.mt5_execution import (
     MT5ConnectionError,
     OrderResult,
@@ -1227,6 +1230,21 @@ def _build_carried_forward_allocation(
     forced close, and including it here would just resubmit a duplicate
     fresh-open order every poll instead.
 
+    Real incident, 2026-09-10 (INTC) — the OTHER direction of the same
+    "don't let one order's own bookkeeping force-close an unrelated real
+    position" family of bug: when a symbol IS a key of immediate_
+    allocation_raw for a reason unrelated to its current real position —
+    a stale "cancel this now-superseded pending order" pct=0 directive,
+    while a SEPARATE Pending Setup for the SAME symbol fired hours later
+    the SAME mega-session cycle and has since filled — this loop now
+    detects that via settlement's own origin == "pending_setup" field
+    and carries forward THAT record's real entry instead of the stale
+    immediate_allocation_raw one. Without this, the first loop's own
+    pct=0 silently won (this function runs before the merge loop's own
+    per-poll Clerk verdicts, so nothing downstream ever saw the real,
+    freshly-filled position as anything other than "target: 0%") and a
+    brand-new position was closed 3 minutes after opening.
+
     A symbol whose tactical-defense state carries a persisted_pct (see
     _validate_and_apply_tactical_verdict's own DEFEND branch) gets THAT
     reduced pct/stop/target as its baseline here instead of the raw
@@ -1247,6 +1265,34 @@ def _build_carried_forward_allocation(
             continue
         rec = settled.get(symbol)
         if rec is not None and rec.get("state") == "closed_after_fill":
+            continue
+        # Real incident, 2026-09-10 (INTC): a symbol can appear in
+        # immediate_allocation_raw for a reason entirely UNRELATED to a
+        # real, currently-held position that originated from a SEPARATE
+        # Pending Setup trigger fired later in the SAME mega-session
+        # cycle — e.g. "cancel this now-stale pending order" (pct=0), a
+        # directive about a ticket that had already gone unfilled for
+        # too long, superseded hours later by a fresh Pending Setup on
+        # the SAME symbol that then triggered, filled, and became a real
+        # position. Because this loop runs BEFORE the second one below
+        # (which is where a Pending-Setup-originated "filled" symbol
+        # would normally be carried forward from its own settlement
+        # record), and the second loop explicitly skips anything already
+        # claimed here, the STALE immediate_allocation_raw entry (still
+        # pct=0 from the old, already-cancelled ticket, since the mega
+        # session's own generated_utc hasn't changed) silently won —
+        # closing the brand-new real position 3 minutes after it filled,
+        # citing "already targeted at 0% this poll by an unrelated
+        # decision." rec.get("origin") == "pending_setup" is the exact
+        # discriminator: it means this symbol's real, live position (or
+        # its settlement record, once filled) did NOT come from this
+        # immediate_allocation entry at all, so that entry's own pct is
+        # simply stale here and must never be allowed to override the
+        # real, separately-tracked Pending-Setup target.
+        if rec is not None and rec.get("origin") == "pending_setup" and (
+            rec.get("state") == "filled" or symbol in held_symbols
+        ):
+            carried[symbol] = _allocation_entry_from_dict(rec["entry"])
             continue
         entry = _allocation_entry_from_dict(raw)
         tactical = (rec or {}).get("tactical") or {}
@@ -1305,8 +1351,47 @@ def parse_clerk_verdict(response_text: str) -> bool:
     return matches[-1].upper() == "CONFIRMED"
 
 
+# Per-symbol news cache for the Clerk's pending-setup verdict prompt —
+# see config.CLERK_NEWS_CACHE_MINUTES's own comment for why this is
+# cached rather than fetched fresh every poll. Module-level and
+# unbounded: the real key set is just Market Watch's own symbol count
+# (already capped, single digits to low dozens), never unbounded growth.
+_clerk_news_cache: dict[str, tuple[datetime, str]] = {}
+
+
+def _fetch_clerk_news_block(symbol: str, description: str) -> str:
+    """Real, live headlines for `symbol` — closes the real gap where the
+    Clerk's verdict prompt invited "checking for major news" but neither
+    local model (qwen3:8b/phi4-mini) can actually browse the web (see
+    _run_clerk_prompt's own docstring). Mirrors ai.portfolio_suggest's
+    own mega-session fetch (fetch_recent_headlines via a resolved Yahoo
+    ticker) rather than ai.researcher's heavier multi-source one — see
+    config.CLERK_NEWS_CACHE_MINUTES's own comment for why.
+
+    Cached per symbol for config.CLERK_NEWS_CACHE_MINUTES; safe to call
+    from inside the tactical/verdict thread pool (plain HTTP via
+    yfinance, no MT5 involvement, same thread-safety class as the LLM
+    calls already made from there). Returns "" (never fabricated) when
+    no Yahoo ticker resolves for this symbol or the real fetch comes
+    back empty — the caller renders an honest "no recent headlines
+    found" placeholder for that case, same convention as
+    ai.researcher's "(no category-specialty feed for ...)"."""
+    now = datetime.now(timezone.utc)
+    cached = _clerk_news_cache.get(symbol)
+    if cached is not None and (now - cached[0]) < timedelta(minutes=config.CLERK_NEWS_CACHE_MINUTES):
+        return cached[1]
+    block = ""
+    resolved = resolve_yahoo_ticker(symbol, description)
+    if resolved is not None:
+        _, yahoo_ticker = resolved
+        headlines = fetch_recent_headlines(yahoo_ticker, limit=config.NEWS_HEADLINES_PER_ASSET)
+        block = "\n".join(f"- {title}" for title in headlines)
+    _clerk_news_cache[symbol] = (now, block)
+    return block
+
+
 def _build_verdict_prompt(
-    setup: PendingSetup, technical_context: str, account_equity: float, elapsed_description: str
+    setup: PendingSetup, technical_context: str, account_equity: float, elapsed_description: str, news_block: str
 ) -> str:
     return (
         "You are an automated trading clerk for an FTMO account. A "
@@ -1323,9 +1408,8 @@ def _build_verdict_prompt(
         f"Time since that analysis was run: {elapsed_description}.\n\n"
         "Below is this symbol's REAL, LIVE technical picture right now "
         "(the same data source that powers this account's own Asset "
-        "Health analysis). Use it, plus your own live web access if "
-        "useful (e.g. checking for any major news since the analysis "
-        "ran that would invalidate this idea), to judge two things: "
+        "Health analysis), plus its real recent headlines. Use both to "
+        "judge two things: "
         "(1) has the stated trigger condition genuinely been met, and "
         "(2) does the planned stop-loss/take-profit still make sense "
         "against the current price and volatility, not just whether "
@@ -1352,6 +1436,8 @@ def _build_verdict_prompt(
         "in the UI and the log, so make it clear and specific, not "
         "generic.\n\n"
         f"{technical_context}\n\n"
+        f"Recent headlines for {setup.symbol}:\n"
+        f"{news_block if news_block else '(no recent headlines found)'}\n\n"
         f"Account equity for context: {account_equity:.2f}. This does "
         "not change your verdict on the trigger itself.\n\n"
         "End your response with exactly one line, and nothing after "
@@ -1458,12 +1544,20 @@ def _run_clerk_prompt(prompt: str, timeout: int) -> str:
     asked for the same plain FINAL_VERDICT: line, a format any capable
     instruction-following model can honor.
 
-    Known, accepted trade-off versus the old Copilot-CLI path: neither
-    local model has live web access, so the "check for breaking news
-    since the analysis ran" angle the verdict/invalidation prompts
-    invite is unavailable here — both models still mechanically judge
-    the stated condition against the real, live MT5 technical context
-    already embedded in the prompt, just without that one extra check.
+    Known, accepted gap versus the old Copilot-CLI path: neither local
+    model has live web access of its own, so the verdict/invalidation
+    prompts can't invite an open-ended "go check the web for news"
+    action. As of 2026-09-17, the pending-setup verdict prompt closes
+    the practical gap that mattered by embedding real, pre-fetched
+    headlines directly in the prompt text instead (see
+    _fetch_clerk_news_block) — the model still doesn't browse anything
+    itself, but it does see real, current news for that symbol, not a
+    dangling, unfulfillable instruction to go find some. The
+    invalidation/tactical prompts remain deliberately news-free — both
+    are narrow, mechanical trip-wire checks on a single stated
+    condition, and injecting news there would invite exactly the kind
+    of "new independent opinion" override those prompts explicitly
+    forbid.
 
     If both models fail, returns the primary's own failure message (the
     most informative single failure to surface), and the existing
@@ -1481,16 +1575,64 @@ def _run_clerk_prompt(prompt: str, timeout: int) -> str:
     return raw
 
 
+def _detect_ollama_outage(results: list[tuple]) -> str:
+    """Real gap found live 2026-09-16, direct user request: unlike the
+    AutoTrading-off gate (an immediate, visible "Execution blocked"
+    status), a fully unreachable local Ollama server had no equivalent —
+    every check still "completes" from run_clerk_execution_check's own
+    point of view (parse_clerk_verdict/parse_tactical_verdict fail safe
+    to NOT_CONFIRMED/HOLD on OLLAMA_FAILED_MESSAGE, same as any other
+    ambiguous response), so nothing otherwise distinguishes "the model
+    genuinely judged this NOT_CONFIRMED" from "Ollama itself never
+    answered."
+
+    `results` is this poll's own raw ThreadPoolExecutor results list —
+    each a (PendingSetup-or-symbol, verdict, raw_text) tuple regardless
+    of which of the three check kinds produced it (see the merge loop's
+    own docstring for why raw_text is always at index 2). Excludes this
+    poll's own deterministic circuit-breaker verdicts (hard-exit, trend-
+    flip — see _DETERMINISTIC_CIRCUIT_BREAKER_PREFIX) from the count
+    entirely: those never call Ollama at all, so a poll made up ENTIRELY
+    of them must never be misread as "every real attempt failed."
+
+    Returns a real, human-readable warning when this poll made at least
+    one genuine LLM attempt and EVERY one of them failed with Ollama's
+    own total-failure sentinel — "" (nothing to report) when there were
+    no real attempts at all, or at least one succeeded (a partial
+    failure is more likely an unlucky single call than the server being
+    down, and _run_clerk_prompt's own primary/backup cascade already
+    absorbs a single flaky model)."""
+    llm_attempts = [r[2] for r in results if not r[2].startswith(_DETERMINISTIC_CIRCUIT_BREAKER_PREFIX)]
+    ollama_failures = sum(1 for raw in llm_attempts if raw == OLLAMA_FAILED_MESSAGE)
+    if not llm_attempts or ollama_failures != len(llm_attempts):
+        return ""
+    return (
+        f"Ollama's local model server appears unreachable this poll "
+        f"({ollama_failures}/{len(llm_attempts)} check(s) got no real response) — "
+        "pending-setup/invalidation/tactical checks are all falling back to their "
+        "fail-safe verdicts (NOT_CONFIRMED/HOLD) until it's back. Check that the "
+        "Ollama server is running (localhost:11434)."
+    )
+
+
 def _run_clerk_verdict(
-    setup: PendingSetup, technical_context: str, account_equity: float, elapsed_description: str
+    setup: PendingSetup, technical_context: str, account_equity: float, elapsed_description: str, description: str
 ) -> tuple[PendingSetup, bool, str]:
     """The LLM-bound half — pure local HTTP call (with a same-server
     backup model, see _run_clerk_prompt), no MT5 involvement, safe to
     run from inside a thread pool (see run_clerk_execution_check's own
     parallel round). Returns (setup, confirmed, raw_text) — the raw
     text always travels back for the audit-trail log/UI, even on a
-    NOT_CONFIRMED or failed verdict."""
-    prompt = _build_verdict_prompt(setup, technical_context, account_equity, elapsed_description)
+    NOT_CONFIRMED or failed verdict.
+
+    `description` (the symbol's real Market Watch description, e.g.
+    "Euro vs United States Dollar") is only used to resolve a Yahoo
+    ticker for the real news fetch below — the news call itself is
+    plain HTTP (yfinance), the same thread-safety class as the LLM call
+    already made from here, so it's safe to do inline rather than
+    forcing it into the earlier, MT5-bound sequential phase."""
+    news_block = _fetch_clerk_news_block(setup.symbol, description)
+    prompt = _build_verdict_prompt(setup, technical_context, account_equity, elapsed_description, news_block)
     raw = _run_clerk_prompt(prompt, timeout=config.CLERK_LLM_TIMEOUT_SECONDS)
     return setup, parse_clerk_verdict(raw), raw
 
@@ -1625,15 +1767,26 @@ class TacticalVerdict:
     rule_citation: str = ""
     numbers_citation: str = ""
     raw_text: str = ""
-    # True ONLY for the O'Neil hard stop-loss ceiling's deterministic
-    # circuit-breaker (see _run_clerk_tactical_check/TacticalSignals.
-    # hard_exit_required) — a genuine "no exceptions" rule, not a
-    # discretionary LLM judgment call, so it must apply even while
+    # True for a deterministic circuit-breaker verdict _run_clerk_
+    # tactical_check constructs directly without an LLM call — the
+    # O'Neil hard stop-loss ceiling (TacticalSignals.hard_exit_required)
+    # or the sustained-trend-flip-against-the-position escalation
+    # (TacticalSignals.trend_flip_against_count, added 2026-09-16, name
+    # kept as "hard_exit" rather than renamed since both are the exact
+    # same kind of rule: a genuine "no exceptions" circuit-breaker, not a
+    # discretionary LLM judgment call, so both must apply even while
     # config.read_tactical_defense_enabled() is OFF (the default shadow
     # mode for every other DEFEND/EXIT verdict). See the merge loop in
     # run_clerk_execution_check for the actual bypass.
     hard_exit: bool = False
 
+
+# Shared prefix for every synthetic, no-model-call verdict this module
+# constructs directly (the O'Neil hard-exit ceiling, the trend-flip
+# partial/exit escalation) — used both to label those verdicts' own raw
+# text and to EXCLUDE them from the Ollama-health check below (a
+# deliberately-skipped model call is not a failed one).
+_DETERMINISTIC_CIRCUIT_BREAKER_PREFIX = "[deterministic circuit-breaker — no model call made] "
 
 _TACTICAL_VERDICT_PATTERN = re.compile(r"FINAL_VERDICT:\s*(HOLD|DEFEND|EXIT)", re.IGNORECASE)
 _TACTICAL_NEW_STOP_PATTERN = re.compile(r"NEW_STOP_LOSS:\s*([^\n\r]*)", re.IGNORECASE)
@@ -1785,6 +1938,20 @@ class TacticalSignals:
     # win-rate evidence already supports the setup.
     backtest_favorability: str | None = None  # "supported" / "contradicted" / "mixed" / None
     favorable_excursion_median_r: float | None = None  # only ever non-None when backtest_favorability == "supported"
+    # --- added 2026-09-16: real incident this closes (NVDA, held long for
+    # most of a trading day while H1+H4 explicitly, repeatedly read
+    # downtrend — clerk_execution_log.txt:22101-23099, 2026-09-10/11).
+    # A PERSISTED counter (unlike every other field above, which is pure/
+    # stateless per-poll) of how many CONSECUTIVE polls this position's
+    # own aligned_h1_h4_trend_direction has contradicted its side —
+    # incremented here from prior_tactical's own last-saved value, reset
+    # to 0 the instant the trend no longer contradicts (re-aligns, or
+    # reads ambiguous/flat). _run_clerk_tactical_check uses this to force
+    # de-risking (see config.CLERK_TREND_FLIP_PARTIAL_AFTER_POLLS/_EXIT_
+    # AFTER_POLLS) regardless of what the LLM tactical verdict says —
+    # the whole point being that a self-acknowledged, sustained
+    # contradiction shouldn't be allowed to just keep getting HELD.
+    trend_flip_against_count: int = 0
 
 
 def _compute_tactical_signals(
@@ -1794,6 +1961,7 @@ def _compute_tactical_signals(
     h4_stats: TechnicalStats | None = None,
     h1_structure: ChartStructureSnapshot | None = None,
     base: AssetAnalysis | None = None,
+    prior_tactical: dict | None = None,
 ) -> TacticalSignals:
     """Pure, no-I/O — every input is already-fetched data the caller
     holds (never entry.price: that's the mega-session's OWN suggestion
@@ -1831,7 +1999,13 @@ def _compute_tactical_signals(
     feeds backtest_favorability/favorable_excursion_median_r via
     analysis.backtest.classify_backtest_favorability — see that
     function's own docstring and TacticalSignals' own field comment for
-    the full rule and the real gap this closes."""
+    the full rule and the real gap this closes.
+
+    `prior_tactical` (added 2026-09-16, same optional/backward-compatible
+    default) feeds TacticalSignals.trend_flip_against_count — see that
+    field's own comment. The ONLY stateful field this function computes;
+    every other field above is pure/stateless given just this poll's own
+    data."""
     favorable_move_pct = -position.adverse_move_pct
 
     h1_rsi = h1_stats.rsi if h1_stats is not None else None
@@ -1910,6 +2084,17 @@ def _compute_tactical_signals(
             base.double_top_backtest,
         )
 
+    aligned_trend = aligned_h1_h4_trend_direction(
+        h4_stats.trend if h4_stats is not None else None,
+        h1_stats.trend if h1_stats is not None else None,
+    )
+    trend_contradicts_position = (
+        (position.side == "buy" and aligned_trend == "down")
+        or (position.side == "sell" and aligned_trend == "up")
+    )
+    prior_trend_flip_count = (prior_tactical or {}).get("trend_flip_against_count", 0)
+    trend_flip_against_count = prior_trend_flip_count + 1 if trend_contradicts_position else 0
+
     return TacticalSignals(
         favorable_move_pct=favorable_move_pct,
         h1_atr=h1_atr,
@@ -1930,6 +2115,7 @@ def _compute_tactical_signals(
         nearest_support=nearest_support,
         backtest_favorability=backtest_favorability,
         favorable_excursion_median_r=favorable_excursion_median_r,
+        trend_flip_against_count=trend_flip_against_count,
     )
 
 
@@ -2224,10 +2410,29 @@ def _run_clerk_tactical_check(
     signals.hard_exit_required, this returns a synthetic EXIT verdict
     WITHOUT calling the LLM at all, and the merge loop applies it even
     while tactical-defense is otherwise in shadow mode (see
-    TacticalVerdict.hard_exit's own docstring)."""
+    TacticalVerdict.hard_exit's own docstring).
+
+    A second, equally deterministic circuit-breaker (added 2026-09-16,
+    real NVDA incident — see TacticalSignals.trend_flip_against_count's
+    own comment) checks signals.trend_flip_against_count next, once
+    hard_exit_required has already been ruled out: at/past
+    config.CLERK_TREND_FLIP_EXIT_AFTER_POLLS, a synthetic EXIT fires
+    every poll from there on (same `>=`, keep-insisting-until-it-actually-
+    closes philosophy as hard_exit_required's own check) — checked
+    FIRST, so a position that's already past both thresholds always
+    exits rather than merely being re-reduced. Exactly AT config.
+    CLERK_TREND_FLIP_PARTIAL_AFTER_POLLS (an exact `==`, not `>=`, so
+    this fires ONCE per contradicting streak, not on every poll the
+    count happens to sit at or above it) — a synthetic DEFEND with
+    partial_close_fraction only (no forced stop change) cuts the
+    CURRENT volume by config.CLERK_TREND_FLIP_PARTIAL_REDUCE_PCT. Both
+    set hard_exit=True — same bypass-shadow-mode reasoning as the O'Neil
+    ceiling: a sustained, self-acknowledged trend contradiction is a
+    genuine circuit-breaker, not a discretionary judgment call waiting
+    on the tactical-defense rollout toggle."""
     if signals.hard_exit_required:
         raw = (
-            "[deterministic circuit-breaker — no model call made] "
+            _DETERMINISTIC_CIRCUIT_BREAKER_PREFIX +
             f"Adverse move {position.adverse_move_pct:.2f}% at/past the "
             f"{config.CLERK_TACTICAL_HARD_EXIT_PCT}% hard-stop ceiling."
         )
@@ -2237,6 +2442,46 @@ def _run_clerk_tactical_check(
             numbers_citation=(
                 f"Adverse move {position.adverse_move_pct:.2f}% at/past the "
                 f"{config.CLERK_TACTICAL_HARD_EXIT_PCT}% hard-stop ceiling — no exceptions."
+            ),
+            raw_text=raw,
+            hard_exit=True,
+        )
+        return symbol, verdict, raw
+
+    if signals.trend_flip_against_count >= config.CLERK_TREND_FLIP_EXIT_AFTER_POLLS:
+        raw = (
+            _DETERMINISTIC_CIRCUIT_BREAKER_PREFIX +
+            f"{signals.trend_flip_against_count} consecutive polls of a confirmed H1+H4 trend "
+            "flip against this position's own side."
+        )
+        verdict = TacticalVerdict(
+            tier="exit",
+            rule_citation="Sustained self-acknowledged trend flip (real NVDA incident, 2026-09-10/11)",
+            numbers_citation=(
+                f"H1+H4 trend has read opposite this position's side for "
+                f"{signals.trend_flip_against_count} consecutive polls, at/past the "
+                f"{config.CLERK_TREND_FLIP_EXIT_AFTER_POLLS}-poll exit ceiling."
+            ),
+            raw_text=raw,
+            hard_exit=True,
+        )
+        return symbol, verdict, raw
+
+    if signals.trend_flip_against_count == config.CLERK_TREND_FLIP_PARTIAL_AFTER_POLLS:
+        raw = (
+            _DETERMINISTIC_CIRCUIT_BREAKER_PREFIX +
+            f"{signals.trend_flip_against_count} consecutive polls of a confirmed H1+H4 trend "
+            "flip against this position's own side — reducing size."
+        )
+        verdict = TacticalVerdict(
+            tier="defend",
+            partial_close_fraction=config.CLERK_TREND_FLIP_PARTIAL_REDUCE_PCT / 100.0,
+            rule_citation="Sustained self-acknowledged trend flip (real NVDA incident, 2026-09-10/11)",
+            numbers_citation=(
+                f"H1+H4 trend has read opposite this position's side for "
+                f"{signals.trend_flip_against_count} consecutive polls, at the "
+                f"{config.CLERK_TREND_FLIP_PARTIAL_AFTER_POLLS}-poll partial-reduction threshold — "
+                f"cutting current volume by {config.CLERK_TREND_FLIP_PARTIAL_REDUCE_PCT:.0f}%."
             ),
             raw_text=raw,
             hard_exit=True,
@@ -2284,7 +2529,16 @@ def _validate_and_apply_tactical_verdict(
     wrong side of price, or a cooldown that never lets it re-fire) as if
     it were a healthy, pending action merely waiting on the toggle.
 
-    HOLD -> (None, None, ""), always.
+    HOLD -> (None, tactical_state_or_None, ""): the allocation is NEVER
+    touched on HOLD, but (added 2026-09-16) if `signals` carries a
+    trend_flip_against_count that's changed since prior_tactical's own
+    last-saved value, a tactical_state update persisting JUST that field
+    is still returned — otherwise the persisted counter would only ever
+    advance on a DEFEND/EXIT poll, never during the ordinary HOLD-heavy
+    streak this whole mechanism exists to catch (the real NVDA incident
+    was dozens of consecutive HOLD verdicts, not DEFEND ones). (None,
+    None, "") when the count hasn't changed (nothing new to persist) or
+    `signals` isn't given.
 
     EXIT -> forces pct to 0 (mirrors the existing invalidation-CONFIRMED
     pattern exactly — never calls close_position directly here;
@@ -2298,7 +2552,20 @@ def _validate_and_apply_tactical_verdict(
        the position has genuinely deteriorated further since the last
        tactical action (both required together to re-fire inside the
        cooldown window) — config.CLERK_TACTICAL_DEFEND_COOLDOWN_
-       MINUTES / _MIN_RETRIGGER_PCT.
+       MINUTES / _MIN_RETRIGGER_PCT. SKIPPED ENTIRELY when verdict.
+       hard_exit is True (added 2026-09-16, real bug found on self-audit
+       before this ever ran live) — this cooldown exists to stop a
+       DISCRETIONARY, LLM-driven DEFEND from thrashing, and was never
+       meant to gate a deterministic circuit-breaker (the trend-flip
+       partial-reduction verdict, same category as the O'Neil hard-exit
+       ceiling) that _run_clerk_tactical_check constructs directly:
+       without this, an unrelated real DEFEND minutes earlier could
+       silently suppress the reduction AND, since a suppressed DEFEND
+       persists nothing back to settlement, freeze TacticalSignals.
+       trend_flip_against_count's own persistence too — preventing the
+       counter from ever reaching the exit threshold for as long as the
+       position doesn't independently worsen enough to clear the
+       cooldown on its own.
     2. Never-widen-stop: a proposed new stop must be strictly MORE
        protective than the position's own current stop (higher for a
        buy, lower for a sell) — defense-in-depth alongside the prompt's
@@ -2342,6 +2609,14 @@ def _validate_and_apply_tactical_verdict(
        lots BEFORE solving for pct, so the same helper covers both a
        pure stop-tighten and a partial-close/stop-tighten combo."""
     if verdict.tier == "hold":
+        if signals is not None:
+            prior_count = (prior_tactical or {}).get("trend_flip_against_count", 0)
+            if signals.trend_flip_against_count != prior_count:
+                tactical_state = {
+                    **(prior_tactical or {}),
+                    "trend_flip_against_count": signals.trend_flip_against_count,
+                }
+                return None, tactical_state, ""
         return None, None, ""
 
     if verdict.tier == "exit":
@@ -2357,12 +2632,33 @@ def _validate_and_apply_tactical_verdict(
             **(prior_tactical or {}),
             "last_action_utc": datetime.now(timezone.utc).isoformat(),
             "tier_reached": "exit",
+            "trend_flip_against_count": (
+                signals.trend_flip_against_count if signals is not None
+                else (prior_tactical or {}).get("trend_flip_against_count", 0)
+            ),
         }
         return new_entry, tactical_state, ""
 
     # tier == "defend"
     now = datetime.now(timezone.utc)
-    if prior_tactical and prior_tactical.get("last_action_utc"):
+    # Real bug found on self-audit (2026-09-16), before the trend-flip
+    # partial-reduction verdict (see _run_clerk_tactical_check's own
+    # docstring) ever ran live: this cooldown exists to stop a
+    # DISCRETIONARY, LLM-driven DEFEND from thrashing/over-firing — it
+    # was never meant to gate a DETERMINISTIC circuit-breaker verdict
+    # this function itself constructs directly (verdict.hard_exit=True,
+    # same flag the O'Neil hard-exit ceiling already uses to bypass the
+    # shadow-mode toggle elsewhere). Without this guard, a real, unrelated
+    # DEFEND minutes earlier could silently suppress the partial
+    # reduction (return None, None, ...) — and since a suppressed DEFEND
+    # persists NOTHING back to settlement, trend_flip_against_count's own
+    # already-incremented value would never be saved either, freezing the
+    # counter and preventing it from ever reaching the exit threshold at
+    # all for as long as the position's adverse move doesn't independently
+    # worsen enough to clear the cooldown on its own — exactly the kind
+    # of slow, gradual bleed (real NVDA incident) this mechanism exists
+    # to catch.
+    if not verdict.hard_exit and prior_tactical and prior_tactical.get("last_action_utc"):
         try:
             last_action_dt = datetime.fromisoformat(prior_tactical["last_action_utc"])
         except ValueError:
@@ -2510,6 +2806,14 @@ def _validate_and_apply_tactical_verdict(
         "adverse_move_pct_at_last_action": position.adverse_move_pct,
         "defend_count": (prior_tactical or {}).get("defend_count", 0) + 1,
         "tier_reached": "defend",
+        # Added 2026-09-16 — this dict does NOT spread prior_tactical
+        # (unlike the EXIT branch above), so without this explicit line a
+        # real DEFEND would silently drop any already-accumulating
+        # trend-flip streak back to invisible (read as 0 next poll).
+        "trend_flip_against_count": (
+            signals.trend_flip_against_count if signals is not None
+            else (prior_tactical or {}).get("trend_flip_against_count", 0)
+        ),
         # Real bug found live 2026-09-03 (USDCHF): without persisting the
         # REDUCED size here, the very next poll's _build_carried_forward_
         # allocation rebuilds its baseline straight from the mega
@@ -2686,6 +2990,93 @@ def _apply_correlation_guard(
             )
         exposed_symbols.add(candidate)
 
+    return merged_allocation
+
+
+def _apply_atr_stop_floor_guard(
+    merged_allocation: dict[str, AllocationEntry],
+    positions: list[Position],
+    technical_context_cache: dict[str, tuple[FtmoAssetAnalysis, str]],
+) -> dict[str, AllocationEntry]:
+    """Real gap found on audit (2026-09-16): the Bulkowski 1.5x-H1-ATR
+    stop-floor check already exists as a NAMED audit-critique category
+    (ai.ftmo_suggest's own AUDIT_INSTRUCTION "Stops Systematically <
+    1.5x ATR" flaw) but has never been enforced in code — only ever
+    checked in prompt text, which an already-flagged draft can still get
+    through anyway. Real incident this closes: a real EURUSD entry
+    (2026-09-07) was independently audited at 0.57x H1 ATR against the
+    1.5x floor, explicitly predicted in that same audit to be a "high
+    probability of noise stop-out," executed anyway, and stopped out on
+    ordinary noise exactly as predicted
+    (records/ftmo/portfolio_suggestion_2026-09-07_122716.md:683-684).
+
+    Same architectural slot as _apply_correlation_guard immediately
+    above (a deterministic filter over merged_allocation before compute_
+    rebalance_plan runs, not inside that function — it must stay pure/
+    exchange-agnostic and has no per-symbol ATR data available to it).
+    Candidates are symbols about to become NEW exposure this poll
+    (pct > 0, not already an open position), same framing _apply_
+    correlation_guard itself already uses via `positions`.
+
+    For each candidate with both a real proposed price/stop_loss and a
+    real H1 ATR available (technical_context_cache, already guaranteed
+    to cover every pct>0 symbol by the fetch-loop that runs right before
+    this is called): if the proposed |price - stop_loss| is tighter than
+    config.ENTRY_ATR_STOP_FLOOR_MULTIPLE x H1 ATR, WIDENS the stop (on
+    the correct side for entry.side — further below price for a buy,
+    further above for a sell) to exactly meet the floor. Deliberately a
+    widen, not a reject — mirrors MIN_STOP_DISTANCE_PCT's own existing
+    precedent in risk/apply_suggestion.py: a trade whose direction/entry
+    is otherwise sound shouldn't be discarded over a fixable stop
+    distance. A symbol missing from the cache, with no H1 ATR yet, or
+    missing a proposed price/stop_loss is skipped, never guessed at.
+
+    Returns the same dict object, mutated in place, mirroring _apply_
+    correlation_guard's own return contract exactly."""
+    exposed_symbols = {p.symbol for p in positions}
+    candidates = sorted(
+        symbol for symbol, entry in merged_allocation.items()
+        if symbol != "CASH" and entry.pct > 0 and symbol not in exposed_symbols
+    )
+    for symbol in candidates:
+        entry = merged_allocation[symbol]
+        if entry.price is None or entry.stop_loss is None:
+            continue
+        fetched = technical_context_cache.get(symbol)
+        if fetched is None:
+            continue
+        analysis, _ = fetched
+        atr = analysis.h1_stats.atr
+        if atr is None or atr <= 0:
+            continue
+
+        floor_distance = config.ENTRY_ATR_STOP_FLOOR_MULTIPLE * atr
+        current_distance = abs(entry.price - entry.stop_loss)
+        if current_distance >= floor_distance:
+            continue
+
+        widened_stop = (
+            entry.price - floor_distance if entry.side == "buy" else entry.price + floor_distance
+        )
+        actual_multiple = current_distance / atr
+        logger.info(
+            "ATR stop-floor guard: %s stop %.5f (%.2fx H1 ATR) is tighter than the %.2gx floor "
+            "— widening to %.5f.",
+            symbol, entry.stop_loss, actual_multiple, config.ENTRY_ATR_STOP_FLOOR_MULTIPLE, widened_stop,
+        )
+        merged_allocation[symbol] = AllocationEntry(
+            pct=entry.pct,
+            price=entry.price,
+            stop_loss=widened_stop,
+            take_profit=entry.take_profit,
+            side=entry.side,
+            reason=(
+                f"{entry.reason} [ATR stop-floor guard: stop was {actual_multiple:.2f}x H1 ATR, "
+                f"below the {config.ENTRY_ATR_STOP_FLOOR_MULTIPLE:.2g}x floor — widened "
+                f"{entry.stop_loss:.5f} -> {widened_stop:.5f}.]"
+            ),
+            invalidation_condition=entry.invalidation_condition,
+        )
     return merged_allocation
 
 
@@ -2959,6 +3350,20 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
 
     last_verdicts: dict = {}
     last_tactical_verdicts: dict = {}
+    # Real gap found live 2026-09-16, direct user request: the AutoTrading-
+    # off gate already surfaces a clear, visible "Execution blocked this
+    # poll: ..." status the moment it fires — but a local Ollama server
+    # being unreachable (confirmed live the same day: every pending-
+    # setup/invalidation/tactical check that poll silently fell back to
+    # its own fail-safe NOT_CONFIRMED/HOLD verdict, with the real cause
+    # buried inside each individual verdict's own raw text rather than
+    # surfaced as a poll-level status) had no equivalent. Set below, once
+    # this poll's real LLM-bound results are in; carried through to both
+    # the live _notify feed and this poll's own persisted last_detail
+    # (see the final _write_execution_state call at the end of this
+    # function) so it's visible as an ongoing status, not just a log line
+    # that scrolls away.
+    ollama_health_note = ""
     merged_allocation = dict(carried_forward)
     # Declared here (not inside the `if` below) so it's always a real
     # dict — possibly empty — by the time the chart-overlay export near
@@ -3000,7 +3405,7 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
         # in more than one list (e.g. a watched position that's also a
         # tactical candidate) is only ever fetched once.
 
-        checkable: list[tuple[PendingSetup, str]] = []
+        checkable: list[tuple[PendingSetup, str, str]] = []
         for setup in not_yet_settled:
             # Real gap this closes, caught on a self-recheck: this is the
             # one Clerk decision point that places a genuinely NEW order
@@ -3026,7 +3431,7 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
                 logger.warning("%s is not currently visible in Market Watch — skipped.", setup.symbol)
                 continue
             _, technical_context = fetched
-            checkable.append((setup, technical_context))
+            checkable.append((setup, technical_context, market_prices[setup.symbol].description))
 
         checkable_watched: list[tuple[str, dict, str, str, str]] = []
         for symbol, raw, invalidation_condition, state in watched_positions:
@@ -3050,7 +3455,8 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
             prior_tactical = settlement["settled"].get(symbol, {}).get("tactical")
             position = positions_by_symbol[symbol]
             signals = _compute_tactical_signals(
-                position, entry, analysis.h1_stats, analysis.h4_stats, analysis.h1_structure, analysis.base
+                position, entry, analysis.h1_stats, analysis.h4_stats, analysis.h1_structure, analysis.base,
+                prior_tactical,
             )
             checkable_tactical.append((symbol, entry, position, technical_context, prior_tactical, signals))
 
@@ -3095,8 +3501,10 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
                 max_workers=len(checkable) + len(checkable_watched) + len(checkable_tactical)
             ) as pool:
                 futures = [
-                    pool.submit(_run_clerk_verdict, setup, technical_context, account.equity, elapsed_description)
-                    for setup, technical_context in checkable
+                    pool.submit(
+                        _run_clerk_verdict, setup, technical_context, account.equity, elapsed_description, description
+                    )
+                    for setup, technical_context, description in checkable
                 ] + [
                     pool.submit(
                         _run_clerk_invalidation_check, symbol, raw, cond, technical_context,
@@ -3111,6 +3519,11 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
                     for symbol, entry, position, technical_context, prior_tactical, signals in checkable_tactical
                 ]
                 results = [f.result() for f in futures]
+
+            ollama_health_note = _detect_ollama_outage(results)
+            if ollama_health_note:
+                logger.warning(ollama_health_note)
+                _notify(f"WARNING — {ollama_health_note}")
             # Merged on the main thread, in original list order, after
             # every future resolves — never inside a worker thread — so
             # completion order can never make this non-deterministic.
@@ -3266,6 +3679,11 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
         if _entry.pct > 0:
             _cached_technical_context(_symbol)
 
+    # Runs AFTER the fetch-loop above, never before: every pct>0 symbol's
+    # fresh H1 ATR is only guaranteed to be in technical_context_cache
+    # once that loop has run.
+    merged_allocation = _apply_atr_stop_floor_guard(merged_allocation, positions, technical_context_cache)
+
     _export_chart_overlay(technical_context_cache, merged_allocation, positions_by_symbol, pending_orders)
 
     planned_heat_pct = compute_aggregate_heat_pct(merged_allocation)
@@ -3308,8 +3726,17 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
     )
     if not fundamental_ok:
         _notify(f"Execution blocked this poll: {fundamental_block_reason}")
+        # Folds in ollama_health_note too (see its own comment above) —
+        # a real, live-observed combination: AutoTrading being off in
+        # the terminal and Ollama being unreachable are two entirely
+        # independent problems, and this account hit both at once. Only
+        # ever surfacing the execution-gate message in that case would
+        # have hidden the second, equally real issue.
+        blocked_detail = fundamental_block_reason
+        if ollama_health_note:
+            blocked_detail += f" | WARNING: {ollama_health_note}"
         _write_execution_state(
-            "blocked", fundamental_block_reason, last_verdicts=last_verdicts, last_tactical_verdicts=last_tactical_verdicts,
+            "blocked", blocked_detail, last_verdicts=last_verdicts, last_tactical_verdicts=last_tactical_verdicts,
         )
         _mark_interval_ran(datetime.now(timezone.utc))
         return
@@ -3573,8 +4000,17 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
 
     _save_settlement(settlement)
     _notify(f"Execution-check complete — {executed_count} order(s) sent this poll.")
+    # ollama_health_note (set earlier this poll, see its own comment) is
+    # folded into the PERSISTED status here, not just the transient
+    # notify feed above — otherwise it would be invisible the moment this
+    # poll's own "success" detail below overwrote it, exactly the gap
+    # that made an unreachable Ollama server look like ordinary
+    # NOT_CONFIRMED/HOLD activity instead of a real, ongoing outage.
+    success_detail = f"{executed_count} order(s) sent"
+    if ollama_health_note:
+        success_detail += f" — WARNING: {ollama_health_note}"
     _write_execution_state(
-        "success", f"{executed_count} order(s) sent",
+        "success", success_detail,
         last_verdicts=last_verdicts, last_execution_results=results_this_poll,
         last_tactical_verdicts=last_tactical_verdicts,
     )

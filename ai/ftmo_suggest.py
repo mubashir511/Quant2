@@ -2676,6 +2676,28 @@ def classify_long_term_alignment(
     return "mixed", short, agreeing, opposing
 
 
+def aligned_h1_h4_trend_direction(h4_trend: str | None, h1_trend: str | None) -> str | None:
+    """Real, un-hedged short-term directional read: 'up'/'down' when H1
+    and H4's own TREND fields (TechnicalStats.trend — a simple, current
+    price-vs-20-bar-SMA snapshot, NOT market_regime's medium-term drift
+    classification) agree with EACH OTHER. None when they disagree, are
+    unavailable, or read flat — there's nothing genuinely un-hedged to
+    report in any of those cases.
+
+    Takes bare trend strings rather than a whole FtmoAssetAnalysis (its
+    original shape when first extracted 2026-09-16) so BOTH real callers
+    can reuse it without reshaping their own already-unpacked data:
+    _tactical_trend_vs_regime_conflict below (analysis.h4_stats.trend/
+    analysis.h1_stats.trend) and ai.clerk_execution._compute_tactical_
+    signals (bare h4_stats/h1_stats TechnicalStats objects, no
+    FtmoAssetAnalysis wrapper available there at all) — one shared
+    definition of "aligned," never two copies that could silently
+    diverge on what counts as a real tactical trend read."""
+    if h4_trend is None or h1_trend is None or h4_trend != h1_trend or h4_trend == "flat":
+        return None
+    return "up" if h4_trend == "uptrend" else "down"
+
+
 def _tactical_trend_vs_regime_conflict(analysis: FtmoAssetAnalysis, regime_direction: str | None) -> str | None:
     """Real incident, 2026-09-10: a BTCUSD buy cited STRUCTURALLY BACKED
     (this function's own regime-based direction agreed with D1/Monthly),
@@ -2698,10 +2720,9 @@ def _tactical_trend_vs_regime_conflict(analysis: FtmoAssetAnalysis, regime_direc
     structural regime read can quietly overrule if nobody points out
     they've diverged. None when there's nothing to flag (no real
     tactical read, or the two genuinely agree)."""
-    h4_trend, h1_trend = analysis.h4_stats.trend, analysis.h1_stats.trend
-    if h4_trend is None or h1_trend is None or h4_trend != h1_trend or h4_trend == "flat":
+    tactical_direction = aligned_h1_h4_trend_direction(analysis.h4_stats.trend, analysis.h1_stats.trend)
+    if tactical_direction is None:
         return None
-    tactical_direction = "up" if h4_trend == "uptrend" else "down"
     if regime_direction in (None, "flat") or tactical_direction == regime_direction:
         # regime_direction is "flat"/None (H4's own regime shows no real
         # net direction, or there's not enough history) -- there's

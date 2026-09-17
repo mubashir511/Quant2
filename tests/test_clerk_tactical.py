@@ -257,6 +257,34 @@ def test_validate_hold_makes_no_change():
     assert rejected_reason == ""  # HOLD is never a "rejection" -- it's a legitimate verdict
 
 
+def test_validate_hold_still_persists_a_changed_trend_flip_count():
+    # Real gap this closes: the NVDA incident was dozens of consecutive
+    # HOLD verdicts -- without this, the counter would never advance
+    # across a HOLD-heavy streak.
+    verdict = TacticalVerdict(tier="hold")
+    position = _position(side="buy", volume=1.0, sl=1950.0)
+    signals = _signals(trend_flip_against_count=3)
+    new_entry, tactical_state, rejected_reason = _validate_and_apply_tactical_verdict(
+        "XAUUSD", verdict, position, None, {"trend_flip_against_count": 2}, 100_000.0, _get_spec_for({}),
+        signals=signals,
+    )
+    assert new_entry is None  # HOLD never touches the allocation
+    assert tactical_state == {"trend_flip_against_count": 3}
+    assert rejected_reason == ""
+
+
+def test_validate_hold_persists_nothing_when_the_count_is_unchanged():
+    verdict = TacticalVerdict(tier="hold")
+    position = _position(side="buy", volume=1.0, sl=1950.0)
+    signals = _signals(trend_flip_against_count=2)
+    new_entry, tactical_state, rejected_reason = _validate_and_apply_tactical_verdict(
+        "XAUUSD", verdict, position, None, {"trend_flip_against_count": 2}, 100_000.0, _get_spec_for({}),
+        signals=signals,
+    )
+    assert new_entry is None
+    assert tactical_state is None
+
+
 def test_validate_exit_forces_pct_zero_and_cites_the_verdict():
     verdict = TacticalVerdict(tier="exit", rule_citation="O'Neil", numbers_citation="stop hit at 1950")
     position = _position(side="buy", volume=1.0, sl=1950.0)
@@ -268,7 +296,20 @@ def test_validate_exit_forces_pct_zero_and_cites_the_verdict():
     assert "Tactical EXIT" in new_entry.reason
     assert "O'Neil" in new_entry.reason
     assert tactical_state["tier_reached"] == "exit"
+    assert tactical_state["trend_flip_against_count"] == 0  # no signals given -- degrades to prior (absent) value
     assert rejected_reason == ""  # a successful EXIT is not a rejection
+
+
+def test_validate_exit_persists_the_fresh_trend_flip_count_from_signals():
+    verdict = TacticalVerdict(tier="exit", rule_citation="O'Neil", numbers_citation="stop hit at 1950")
+    position = _position(side="buy", volume=1.0, sl=1950.0)
+    existing = AllocationEntry(pct=5.0, price=2000.0, stop_loss=1950.0, take_profit=2100.0, side="buy", reason="orig")
+    signals = _signals(trend_flip_against_count=6)
+    new_entry, tactical_state, rejected_reason = _validate_and_apply_tactical_verdict(
+        "XAUUSD", verdict, position, existing, {"trend_flip_against_count": 5}, 100_000.0, _get_spec_for({}),
+        signals=signals,
+    )
+    assert tactical_state["trend_flip_against_count"] == 6
 
 
 def test_validate_defend_tightens_stop_and_resizes_pct_to_preserve_lots():
@@ -308,6 +349,23 @@ def test_validate_defend_tightens_stop_and_resizes_pct_to_preserve_lots():
     assert tactical_state["persisted_pct"] == pytest.approx(4.0)
     assert tactical_state["persisted_stop_loss"] == 1960.0
     assert tactical_state["persisted_take_profit"] == 2100.0
+
+
+def test_validate_defend_preserves_the_trend_flip_count_from_signals():
+    # Real gap this closes: this dict does NOT spread prior_tactical the
+    # way the EXIT branch does -- without an explicit line for it, a
+    # real DEFEND would silently drop an already-accumulating trend-flip
+    # streak back to invisible (read as 0 next poll).
+    verdict = TacticalVerdict(tier="defend", new_stop_loss=1960.0, rule_citation="Schwager", numbers_citation="x")
+    position = _position(side="buy", volume=1.0, sl=1950.0, price_open=2000.0, price_current=1980.0)
+    existing = AllocationEntry(pct=10.0, price=2000.0, stop_loss=1950.0, take_profit=2100.0, side="buy")
+    spec = _spec(trade_contract_size=100.0)
+    signals = _signals(trend_flip_against_count=2)
+    new_entry, tactical_state, _reason = _validate_and_apply_tactical_verdict(
+        "XAUUSD", verdict, position, existing, {"trend_flip_against_count": 1}, 100_000.0,
+        _get_spec_for({"XAUUSD": spec}), signals=signals,
+    )
+    assert tactical_state["trend_flip_against_count"] == 2
 
 
 def test_validate_defend_uses_price_open_not_existing_entry_or_live_price_for_sizing():
@@ -533,6 +591,35 @@ def test_validate_defend_fires_within_cooldown_when_genuinely_worsened():
     assert new_entry is not None
     assert tactical_state["defend_count"] == 2
     assert rejected_reason == ""
+
+
+def test_validate_defend_hard_exit_bypasses_the_cooldown_gate_entirely():
+    # Real bug found on self-audit (2026-09-16), before the trend-flip
+    # partial-reduction verdict ever ran live: this is the EXACT scenario
+    # from test_validate_defend_suppressed_within_cooldown_without_
+    # further_deterioration above (a real, unrelated DEFEND fired
+    # moments ago, position hasn't worsened enough to normally re-fire)
+    # -- but with hard_exit=True (the trend-flip circuit-breaker's own
+    # flag), it must NOT be suppressed, and it must still persist
+    # tactical_state (a suppressed DEFEND persists nothing, which would
+    # otherwise freeze trend_flip_against_count's own counter forever).
+    now = datetime.now(timezone.utc)
+    prior_tactical = {
+        "last_action_utc": now.isoformat(), "adverse_move_pct_at_last_action": 1.0, "defend_count": 1,
+        "trend_flip_against_count": 3,
+    }
+    verdict = TacticalVerdict(
+        tier="defend", partial_close_fraction=0.5, rule_citation="x", numbers_citation="y", hard_exit=True,
+    )
+    position = _position(side="buy", volume=1.0, sl=1950.0, price_open=2000.0, price_current=1998.0)
+    signals = _signals(trend_flip_against_count=3)
+    new_entry, tactical_state, rejected_reason = _validate_and_apply_tactical_verdict(
+        "XAUUSD", verdict, position, None, prior_tactical, 100_000.0, _get_spec_for({"XAUUSD": _spec()}),
+        signals=signals,
+    )
+    assert new_entry is not None  # NOT suppressed by cooldown
+    assert rejected_reason == ""
+    assert tactical_state["trend_flip_against_count"] == 3  # persisted, not frozen
 
 
 def test_validate_defend_fires_after_cooldown_elapses_even_without_deterioration():
@@ -1424,6 +1511,65 @@ def test_compute_tactical_signals_wires_backtest_favorability_from_base():
     assert signals.favorable_excursion_median_r == pytest.approx(2.1)
 
 
+# --- TacticalSignals.trend_flip_against_count (2026-09-16, real NVDA incident) ---
+
+
+def test_trend_flip_count_starts_at_one_on_the_first_contradicting_poll():
+    position = _position(side="buy")  # long
+    h1_stats = _fake_technical_stats(trend="downtrend")
+    h4_stats = _fake_technical_stats(trend="downtrend")  # aligned downtrend vs a BUY -- contradicts
+    signals = _compute_tactical_signals(position, _NO_OP_ENTRY, h1_stats, h4_stats, prior_tactical=None)
+    assert signals.trend_flip_against_count == 1
+
+
+def test_trend_flip_count_increments_across_consecutive_contradicting_polls():
+    position = _position(side="buy")
+    h1_stats = _fake_technical_stats(trend="downtrend")
+    h4_stats = _fake_technical_stats(trend="downtrend")
+    signals = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, h1_stats, h4_stats, prior_tactical={"trend_flip_against_count": 4}
+    )
+    assert signals.trend_flip_against_count == 5
+
+
+def test_trend_flip_count_resets_to_zero_when_trend_realigns():
+    position = _position(side="buy")
+    h1_stats = _fake_technical_stats(trend="uptrend")
+    h4_stats = _fake_technical_stats(trend="uptrend")  # aligned uptrend vs a BUY -- no contradiction
+    signals = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, h1_stats, h4_stats, prior_tactical={"trend_flip_against_count": 5}
+    )
+    assert signals.trend_flip_against_count == 0
+
+
+def test_trend_flip_count_resets_to_zero_when_h1_h4_disagree_with_each_other():
+    # No real, un-hedged aligned read at all -- nothing to contradict with.
+    position = _position(side="buy")
+    h1_stats = _fake_technical_stats(trend="downtrend")
+    h4_stats = _fake_technical_stats(trend="uptrend")
+    signals = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, h1_stats, h4_stats, prior_tactical={"trend_flip_against_count": 5}
+    )
+    assert signals.trend_flip_against_count == 0
+
+
+def test_trend_flip_count_zero_for_a_sell_position_when_aligned_trend_is_down():
+    # A SELL is not contradicted by a downtrend -- it agrees with it.
+    position = _position(side="sell")
+    h1_stats = _fake_technical_stats(trend="downtrend")
+    h4_stats = _fake_technical_stats(trend="downtrend")
+    signals = _compute_tactical_signals(position, _NO_OP_ENTRY, h1_stats, h4_stats, prior_tactical=None)
+    assert signals.trend_flip_against_count == 0
+
+
+def test_trend_flip_count_zero_by_default_when_no_prior_tactical_given():
+    position = _position(side="buy")
+    h1_stats = _fake_technical_stats(trend="uptrend")
+    h4_stats = _fake_technical_stats(trend="uptrend")
+    signals = _compute_tactical_signals(position, _NO_OP_ENTRY, h1_stats, h4_stats)
+    assert signals.trend_flip_against_count == 0
+
+
 # --- _run_clerk_tactical_check: the hard-exit circuit breaker ---
 
 
@@ -1443,4 +1589,114 @@ def test_hard_exit_required_never_calls_the_model(mock_run_ollama):
     assert verdict.hard_exit is True
     assert verdict.rule_citation
     assert verdict.numbers_citation
+
+
+# --- _run_clerk_tactical_check: sustained trend-flip circuit breaker (2026-09-16, real NVDA incident) ---
+
+
+@patch("ai.clerk_execution.run_ollama")
+def test_trend_flip_partial_fires_exactly_at_the_configured_threshold(mock_run_ollama):
+    position = _position(side="buy", price_open=2000.0, price_current=1980.0)  # -1%, well under hard-exit
+    h1_stats = _fake_technical_stats(trend="downtrend")
+    h4_stats = _fake_technical_stats(trend="downtrend")
+    signals = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, h1_stats, h4_stats,
+        prior_tactical={"trend_flip_against_count": config.CLERK_TREND_FLIP_PARTIAL_AFTER_POLLS - 1},
+    )
+    assert signals.trend_flip_against_count == config.CLERK_TREND_FLIP_PARTIAL_AFTER_POLLS
+
+    symbol, verdict, raw = _run_clerk_tactical_check(
+        "XAUUSD", _NO_OP_ENTRY, position, "fake technical context", 100_000.0, None, signals,
+    )
+
+    mock_run_ollama.assert_not_called()
+    assert verdict.tier == "defend"
+    assert verdict.hard_exit is True
+    assert verdict.new_stop_loss is None
+    assert verdict.partial_close_fraction == pytest.approx(config.CLERK_TREND_FLIP_PARTIAL_REDUCE_PCT / 100.0)
+    assert verdict.rule_citation
+    assert verdict.numbers_citation
+
+
+@patch("ai.clerk_execution.run_ollama")
+def test_trend_flip_does_not_re_fire_partial_between_the_two_thresholds(mock_run_ollama):
+    # One poll past the partial threshold but still short of the exit
+    # threshold -- must fall through to the normal LLM call, not force
+    # another action (never compounds 50% -> 25% -> 12.5% ...).
+    mock_run_ollama.return_value = "FINAL_VERDICT: HOLD"
+    position = _position(side="buy", price_open=2000.0, price_current=1980.0)
+    h1_stats = _fake_technical_stats(trend="downtrend")
+    h4_stats = _fake_technical_stats(trend="downtrend")
+    signals = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, h1_stats, h4_stats,
+        prior_tactical={"trend_flip_against_count": config.CLERK_TREND_FLIP_PARTIAL_AFTER_POLLS},
+    )
+    assert signals.trend_flip_against_count == config.CLERK_TREND_FLIP_PARTIAL_AFTER_POLLS + 1
+
+    symbol, verdict, raw = _run_clerk_tactical_check(
+        "XAUUSD", _NO_OP_ENTRY, position, "fake technical context", 100_000.0, None, signals,
+    )
+
+    mock_run_ollama.assert_called_once()
+    assert verdict.tier == "hold"
+
+
+@patch("ai.clerk_execution.run_ollama")
+def test_trend_flip_exit_fires_at_the_configured_threshold(mock_run_ollama):
+    position = _position(side="buy", price_open=2000.0, price_current=1980.0)
+    h1_stats = _fake_technical_stats(trend="downtrend")
+    h4_stats = _fake_technical_stats(trend="downtrend")
+    signals = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, h1_stats, h4_stats,
+        prior_tactical={"trend_flip_against_count": config.CLERK_TREND_FLIP_EXIT_AFTER_POLLS - 1},
+    )
+    assert signals.trend_flip_against_count == config.CLERK_TREND_FLIP_EXIT_AFTER_POLLS
+
+    symbol, verdict, raw = _run_clerk_tactical_check(
+        "XAUUSD", _NO_OP_ENTRY, position, "fake technical context", 100_000.0, None, signals,
+    )
+
+    mock_run_ollama.assert_not_called()
+    assert verdict.tier == "exit"
+    assert verdict.hard_exit is True
+
+
+@patch("ai.clerk_execution.run_ollama")
+def test_trend_flip_exit_keeps_firing_past_the_threshold(mock_run_ollama):
+    # Same "keep insisting" philosophy as hard_exit_required's own >= check.
+    position = _position(side="buy", price_open=2000.0, price_current=1980.0)
+    h1_stats = _fake_technical_stats(trend="downtrend")
+    h4_stats = _fake_technical_stats(trend="downtrend")
+    signals = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, h1_stats, h4_stats,
+        prior_tactical={"trend_flip_against_count": config.CLERK_TREND_FLIP_EXIT_AFTER_POLLS + 5},
+    )
+    symbol, verdict, raw = _run_clerk_tactical_check(
+        "XAUUSD", _NO_OP_ENTRY, position, "fake technical context", 100_000.0, None, signals,
+    )
+    mock_run_ollama.assert_not_called()
+    assert verdict.tier == "exit"
+
+
+@patch("ai.clerk_execution.run_ollama")
+def test_hard_exit_required_takes_priority_over_trend_flip_escalation(mock_run_ollama):
+    # A real, large loss is a more urgent circuit-breaker than a sustained
+    # trend-flip streak -- both being true this poll must still resolve
+    # to the O'Neil hard-exit citation, not the trend-flip one.
+    position = _position(side="buy", price_open=2000.0, price_current=1850.0)  # -7.5%, past hard-exit
+    h1_stats = _fake_technical_stats(trend="downtrend")
+    h4_stats = _fake_technical_stats(trend="downtrend")
+    signals = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, h1_stats, h4_stats,
+        prior_tactical={"trend_flip_against_count": config.CLERK_TREND_FLIP_EXIT_AFTER_POLLS + 1},
+    )
+    assert signals.hard_exit_required is True
+
+    symbol, verdict, raw = _run_clerk_tactical_check(
+        "XAUUSD", _NO_OP_ENTRY, position, "fake technical context", 100_000.0, None, signals,
+    )
+
+    mock_run_ollama.assert_not_called()
+    assert verdict.tier == "exit"
+    assert "O'Neil" in verdict.rule_citation
     assert raw

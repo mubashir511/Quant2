@@ -34,6 +34,29 @@ MAX_SYMBOL_EXPOSURE_PCT = float(os.getenv("MAX_SYMBOL_EXPOSURE_PCT", "30"))
 MAX_ENRICHED_ASSETS = int(os.getenv("MAX_ENRICHED_ASSETS", "20"))
 NEWS_HEADLINES_PER_ASSET = int(os.getenv("NEWS_HEADLINES_PER_ASSET", "2"))
 
+# Real gap, 2026-09-17 (direct user request): the Clerk's pending-setup
+# verdict prompt has invited "use your own live web access ... e.g.
+# checking for any major news" since before the 2026-08-30 switch to
+# local Ollama models — neither qwen3:8b nor phi4-mini can browse the
+# web at all, so that instruction has been quietly unfulfillable for
+# weeks (see ai.clerk_execution._run_clerk_prompt's own docstring, which
+# already documented this as a known, accepted trade-off). Fixed by
+# reusing the same lightweight fetch_recent_headlines() path the mega
+# session itself already relies on (ai.portfolio_suggest), NOT the
+# Researcher's heavier multi-source fetch — the Clerk's own configurable
+# poll interval (read_clerk_execution_interval_minutes(), currently 5
+# minutes but user-adjustable at any time) means a per-poll Yahoo round
+# -trip per symbol would multiply real request volume (and the already-
+# documented yfinance hang risk, see data.news_source's own
+# _NEWS_TIMEOUT_SECONDS incident) far more than the once-daily
+# Researcher ever does. This cache is deliberately a plain wall-clock
+# TTL, not tied to poll count, specifically so real request volume stays
+# capped at this same rate no matter how short the poll interval is set
+# to — headlines don't meaningfully change minute to minute anyway, so
+# the same fetch is reused across many consecutive
+# polls instead of hitting Yahoo fresh every time.
+CLERK_NEWS_CACHE_MINUTES = int(os.getenv("CLERK_NEWS_CACHE_MINUTES", "20"))
+
 # Portfolio Suggestion now lets Claude do real multi-step web research
 # (WebSearch/WebFetch), so it needs much more time than a plain narration
 # call. Raised from 900s 2026-09-01: a real live run (the first full FTMO
@@ -148,6 +171,20 @@ PRICE_SANITY_BAND_PCT = float(os.getenv("PRICE_SANITY_BAND_PCT", "5"))
 # more days/instruments, same "ship a value, then recalibrate against
 # real data" process this file's other thresholds went through.
 MIN_STOP_DISTANCE_PCT = float(os.getenv("MIN_STOP_DISTANCE_PCT", "0.1"))
+
+# Real gap, 2026-09-16: Bulkowski's 1.5x-H1-ATR stop floor already exists
+# as a named audit critique (ai/ftmo_suggest.py's own AUDIT_INSTRUCTION
+# "Stops Systematically < 1.5x ATR" flaw) but was never enforced in code
+# before this — see ai.clerk_execution._apply_atr_stop_floor_guard. Real
+# incident this closes: a real EURUSD entry was independently audited at
+# 0.57x H1 ATR against the 1.5x floor, explicitly predicted in that same
+# audit to be a "high probability of noise stop-out," was executed
+# anyway, and was stopped out on ordinary noise exactly as predicted
+# (records/ftmo/portfolio_suggestion_2026-09-07_122716.md:683-684).
+# Deliberately a WIDEN, not a reject — mirrors MIN_STOP_DISTANCE_PCT's
+# own precedent immediately above: a trade whose direction/entry is
+# otherwise sound shouldn't be discarded over a fixable stop distance.
+ENTRY_ATR_STOP_FLOOR_MULTIPLE = float(os.getenv("ENTRY_ATR_STOP_FLOOR_MULTIPLE", "1.5"))
 
 # Real incident, 2026-09-11: the mega session revised an already-held
 # NVDA position's own stop (a genuine improvement, widening an unsafe
@@ -800,6 +837,22 @@ CLERK_TACTICAL_MAX_PARTIAL_CLOSE_FRACTION = float(
 # that bypasses the LLM call entirely as a genuine circuit-breaker, same
 # category as risk.apply_suggestion.check_execution_safety_gates.
 CLERK_TACTICAL_HARD_EXIT_PCT = float(os.getenv("CLERK_TACTICAL_HARD_EXIT_PCT", "7.0"))
+# A second deterministic circuit-breaker, same category as the hard-exit
+# ceiling above — added 2026-09-16 after a real incident: NVDA was held
+# long for most of a trading day while Clerk's own tactical checks
+# explicitly stated, across dozens of consecutive polls, that both H1
+# and H4 read downtrend (sometimes self-contradicting in the same
+# sentence) before finally exiting (clerk_execution_log.txt:22101-23099,
+# 2026-09-10/11). See ai.clerk_execution.TacticalSignals.trend_flip_
+# against_count's own comment for the persisted-counter mechanics.
+# 3 consecutive polls of a confirmed trend flip against a held position
+# forces a 50%-of-current-volume reduction; a further 3 consecutive
+# polls after that (6 total) forces a full exit — direct user decision:
+# not an instant full exit, and not stop-only, to give the trade room to
+# genuinely reverse back before the bot commits to closing it.
+CLERK_TREND_FLIP_PARTIAL_AFTER_POLLS = int(os.getenv("CLERK_TREND_FLIP_PARTIAL_AFTER_POLLS", "3"))
+CLERK_TREND_FLIP_EXIT_AFTER_POLLS = int(os.getenv("CLERK_TREND_FLIP_EXIT_AFTER_POLLS", "6"))
+CLERK_TREND_FLIP_PARTIAL_REDUCE_PCT = float(os.getenv("CLERK_TREND_FLIP_PARTIAL_REDUCE_PCT", "50.0"))
 # O'Neil's profit-lock trigger: tighten the stop once a position's
 # favorable move reaches this percentage.
 CLERK_TACTICAL_PROFIT_LOCK_PCT = float(os.getenv("CLERK_TACTICAL_PROFIT_LOCK_PCT", "15.0"))

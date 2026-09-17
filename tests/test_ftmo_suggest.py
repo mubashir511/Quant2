@@ -17,6 +17,7 @@ from ai.ftmo_suggest import (
     _ftmo_commission_pct_round_turn,
     _real_backtest_execution_kwargs,
     _tactical_trend_vs_regime_conflict,
+    aligned_h1_h4_trend_direction,
     analyze_ftmo_asset_live,
     analyze_ftmo_assets,
     build_ftmo_stage1_instruction,
@@ -964,6 +965,27 @@ def _analysis_with_trends(h4_trend, h1_trend, h4_regime, d1_regime, mn1_regime) 
         trade_cost=None,
         mn1_stats=_ts(market_regime=mn1_regime),
     )
+
+
+def test_aligned_h1_h4_trend_direction_up_when_both_agree_uptrend():
+    assert aligned_h1_h4_trend_direction("uptrend", "uptrend") == "up"
+
+
+def test_aligned_h1_h4_trend_direction_down_when_both_agree_downtrend():
+    assert aligned_h1_h4_trend_direction("downtrend", "downtrend") == "down"
+
+
+def test_aligned_h1_h4_trend_direction_none_when_h1_h4_disagree():
+    assert aligned_h1_h4_trend_direction("uptrend", "downtrend") is None
+
+
+def test_aligned_h1_h4_trend_direction_none_when_flat():
+    assert aligned_h1_h4_trend_direction("flat", "flat") is None
+
+
+def test_aligned_h1_h4_trend_direction_none_when_either_side_missing():
+    assert aligned_h1_h4_trend_direction(None, "uptrend") is None
+    assert aligned_h1_h4_trend_direction("uptrend", None) is None
 
 
 def test_tactical_regime_conflict_fires_on_the_real_btcusd_pattern():

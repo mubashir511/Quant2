@@ -50,6 +50,7 @@ from ai.researcher import (
     run_researcher_check,
 )
 from ai.mega_analysis import (
+    _write_state as _write_mega_analysis_state,
     is_due as mega_analysis_is_due,
     mega_session_is_live,
     next_run_utc,
@@ -737,8 +738,9 @@ def _render_clerk_execution_panel() -> None:
     # animation — see that CSS block's own key-generation comment).
     _clerk_content_gen = f"{suggestion.get('generated_utc', '')}_{exec_state.get('last_attempt_utc', '')}"
     exec_progress = read_execution_progress()
+    clerk_check_live = execution_check_is_live(exec_progress, exec_state)
     live_message = None
-    if execution_check_is_live(exec_progress, exec_state):
+    if clerk_check_live:
         live_message = exec_progress.get("message")
     # Direct user request 2026-08-31, after a real live incident: starting
     # a mega session while the Clerk's own periodic trigger could also
@@ -866,6 +868,28 @@ def _render_clerk_execution_panel() -> None:
             # that may have already elapsed while paused.
             timer_state["next_check_utc"] = None
             remaining_seconds = None
+        elif clerk_check_live:
+            # Real gap found live 2026-09-16, direct user report: unlike
+            # the mega-session pause immediately above, this countdown
+            # previously kept ticking (and re-firing _fire_scheduled_job_
+            # once every time it hit zero) even while a Clerk check was
+            # ALREADY genuinely running — that inner call is a harmless
+            # no-op while the prior check's own background thread is
+            # still alive, but `next_check_utc` still got unconditionally
+            # reset to "now + interval" regardless, so the visible
+            # countdown kept recycling on its own schedule with no
+            # relationship to whether a real check was actually in
+            # flight. With a short review interval (this account's own
+            # is currently 1 minute) a single check that legitimately
+            # takes longer than one interval to finish (multiple MT5/
+            # LLM calls, or a slow/retrying Ollama call) made the
+            # countdown visibly "reset and fire again" well before a
+            # user would expect, since it was never actually synced to
+            # real completion. Paused the same way mega_session_live is
+            # — reset to None, not just held, so a fresh full interval
+            # starts once this check genuinely finishes.
+            timer_state["next_check_utc"] = None
+            remaining_seconds = None
         else:
             if timer_state["next_check_utc"] is None:
                 timer_state["next_check_utc"] = now_utc + timedelta(minutes=interval_minutes)
@@ -876,6 +900,8 @@ def _render_clerk_execution_panel() -> None:
         with timer_col:
             if mega_session_live:
                 st.metric("Next review", "paused (mega session running)")
+            elif clerk_check_live:
+                st.metric("Next review", "running now")
             elif remaining_seconds is None:
                 st.metric("Next review", "paused")
             else:
@@ -1182,7 +1208,17 @@ def _render_clerk_execution_panel() -> None:
         if live_message:
             st.caption(f":blue[↻ Running now — {live_message}]")
         elif last_status == "success" and last_attempt:
-            st.caption(f":green[✓ Last check ({_format_last_run(last_attempt)}): {exec_state.get('last_detail', 'succeeded')}.]")
+            _exec_last_detail = exec_state.get("last_detail", "succeeded")
+            # Real gap found live 2026-09-16: an Ollama-outage warning
+            # (see ai.clerk_execution._detect_ollama_outage) gets folded
+            # into this SAME "success" detail string when real orders
+            # still went out fine this poll despite it — rendering it in
+            # green would bury a real, ongoing issue inside a status
+            # color that reads as "all clear."
+            if "WARNING" in _exec_last_detail:
+                st.caption(f":orange[⚠ Last check ({_format_last_run(last_attempt)}): {_exec_last_detail}.]")
+            else:
+                st.caption(f":green[✓ Last check ({_format_last_run(last_attempt)}): {_exec_last_detail}.]")
         elif last_status == "blocked" and last_attempt:
             st.caption(f":orange[⚠ Last check ({_format_last_run(last_attempt)}) executed nothing: {exec_state.get('last_detail', '')}]")
         elif last_status == "disabled" and last_attempt:
@@ -3782,6 +3818,15 @@ elif suggest_clicked and selected_exchange == "FTMO":
                 analyses = _captured_analyses[0] if _captured_analyses else None
             except MT5ConnectionError as e:
                 error_message = str(e)
+                # Real gap found live 2026-09-16: a manual click never
+                # wrote to MEGA_ANALYSIS_STATE_FILE at all (only
+                # run_scheduled_mega_analysis did), so the "Last run"
+                # status shown elsewhere on this page kept reporting a
+                # stale scheduled-run result — up to several days old —
+                # even immediately after a real, successful manual run.
+                # Mirrors run_scheduled_mega_analysis's own outcome
+                # classification exactly, just for this second call site.
+                _write_mega_analysis_state("error", error_message)
             except RuntimeError as e:
                 # e.g. "No instruments are visible in this FTMO account's
                 # MT5 Market Watch." — a data-availability issue, not a
@@ -3789,13 +3834,16 @@ elif suggest_clicked and selected_exchange == "FTMO":
                 # check made before delegating this check to
                 # run_mega_analysis() itself.
                 warning_message = str(e)
+                _write_mega_analysis_state("error", warning_message)
             finally:
                 release_lock(_MEGA_ANALYSIS_LOCK_PATH)
 
             if suggestion is not None:
                 if suggestion == CLI_MISSING_MESSAGE or suggestion.startswith(CLI_FAILED_PREFIX):
                     error_message = suggestion
+                    _write_mega_analysis_state("cli_failed", suggestion[:500])
                 else:
+                    _write_mega_analysis_state("success")
                     def _on_stage(msg: str) -> None:
                         st.write(msg)
 

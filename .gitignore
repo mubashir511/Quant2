@@ -23,6 +23,15 @@ clerk_execution_enabled.json
 clerk_execution_interval.json
 clerk_execution.lock
 clerk_tactical_defense_enabled.json
+copilot_execution.lock
+copilot_execution_bat_output.txt
+copilot_execution_enabled.json
+copilot_execution_interval.json
+copilot_execution_log.txt
+copilot_execution_progress.json
+copilot_execution_settlement.json
+copilot_execution_state.json
+copilot_tactical_defense_enabled.json
 records/
 *.lnk
 mql5/*.ex5
