@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
 SMA_WINDOW = 20
@@ -154,6 +155,26 @@ def classify_velocity_tier(h1_atr_pct: float | None) -> str | None:
         return None
     return "fast" if h1_atr_pct >= VELOCITY_FAST_THRESHOLD_PCT else "slow"
 
+
+# The M5 counterpart of VELOCITY_FAST_THRESHOLD_PCT (2026-09-24, M5 became the only decision
+# timeframe, so velocity is now read from the M5 ATR% the stop is sized in). It is applied to the
+# instrument's MEDIAN M5 ATR% (FtmoAssetAnalysis.m5_atr_pct_median, ~2 days of bars), NOT the
+# instantaneous value: audited on 20 real symbols x 6000 bars, the instantaneous M5 ATR% of gold,
+# copper and BTC drops below any usable cut in quiet hours (18-28% of bars would flip to "slow"
+# and back), while the rolling-median reading never leaves its tier. Medians: every "slow" symbol
+# (H1 ATR% < 0.25) 0.018-0.038, every "fast" one >= 0.100; 0.06 sits mid-gap and reproduces the H1
+# classification on 99.8% of bars (0.05 would misclassify USDJPY 15% of the time).
+VELOCITY_FAST_THRESHOLD_M5_PCT = 0.06
+
+
+def classify_m5_velocity_tier(m5_atr_pct: float | None) -> str | None:
+    """`classify_velocity_tier` for the instrument's MEDIAN M5 ATR% (see VELOCITY_FAST_THRESHOLD_M5_PCT
+    for why it must be the median, not the current bar-window value). None (never a guessed default)
+    when there is no reading."""
+    if m5_atr_pct is None:
+        return None
+    return "fast" if m5_atr_pct >= VELOCITY_FAST_THRESHOLD_M5_PCT else "slow"
+
 # RSI window — the standard 14-period convention, same simple-rolling-mean
 # treatment as ATR above (not Wilder's smoothing).
 RSI_WINDOW = 14
@@ -223,6 +244,11 @@ class TechnicalStats:
     rsi: float | None  # 0-100, momentum — conventionally overbought >70, oversold <30
     volume_trend_pct: float | None  # recent-vs-baseline average volume, %
     momentum_acceleration: str | None  # "accelerating_up" / "accelerating_down" / "stable" — a SHORT-window (MOMENTUM_WINDOW) sibling to market_regime, NOT a 4th market_regime value (see MOMENTUM_WINDOW's own comment); None only means insufficient history
+    # Trend STRENGTH (Wilder's ADX, Murphy/Pring: > 20 = trending, > 40 = extreme) and its 12-bar change (> 0 =
+    # strengthening). Added 2026-09-25 for the playbook selector: on 205,758 aligned M5 opportunities the breakout-stop
+    # entry's edge grew with ADX (>= 30: +0.070R gross; > 40: net +0.062R) and with a RISING ADX. None without High/Low.
+    adx: float | None = None
+    adx_change_12: float | None = None
 
 
 def _compute_rsi(prices: pd.Series) -> float | None:
@@ -244,6 +270,113 @@ def _compute_rsi(prices: pd.Series) -> float | None:
     return float(100 - (100 / (1 + rs)))
 
 
+def compute_rolling_rsi(prices: pd.Series) -> pd.Series:
+    """Classic RSI computed at EVERY point in the series (not just the
+    latest, unlike _compute_rsi above) — needed for anything that
+    compares RSI's own value at two different past bars (e.g. detect_
+    rsi_divergence below), not just today's single reading.
+
+    Public (promoted from analysis.backtest._rolling_rsi 2026-09-20,
+    direct user challenge) for the SAME reason compute_atr itself was
+    made public instead of staying a second, private per-module copy —
+    see compute_atr's own docstring: duplicating this logic in a second
+    module risked the two definitions of RSI quietly drifting apart.
+    analysis.backtest now imports this instead of keeping its own copy."""
+    delta = prices.diff()
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
+    avg_gain = gains.rolling(RSI_WINDOW).mean()
+    avg_loss = losses.rolling(RSI_WINDOW).mean()
+    # float("nan") rather than pd.NA — keeps the series plain float64
+    # instead of upcasting to a nullable/object dtype for the division.
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
+    rsi = 100 - (100 / (1 + rs))
+    # Where avg_loss is exactly 0, the formula above is NaN by
+    # construction (division guarded above) — fill with the correct
+    # boundary value: 100 if there were real gains in the window, 50 if
+    # the window was genuinely flat (both averages zero).
+    zero_loss = avg_loss == 0
+    return rsi.mask(zero_loss, (avg_gain > 0).astype(float) * 50.0 + 50.0)
+
+
+@dataclass
+class DivergenceSignal:
+    kind: str  # "bullish" (price LOWER low, RSI HIGHER low — momentum fading on the down move) / "bearish" (price HIGHER high, RSI LOWER high — momentum fading on the up move)
+    price_bars_ago: int  # how many bars ago the MORE RECENT of the two compared price extremes occurred
+    rsi_at_recent: float
+    rsi_at_prior: float
+    detail: str
+
+
+def detect_rsi_divergence(
+    prices: pd.Series,
+    swing_highs: list | None = None,
+    swing_lows: list | None = None,
+) -> DivergenceSignal | None:
+    """Real price/RSI divergence — added 2026-09-20, direct user
+    challenge ("differential between trend and reversal"): a classic,
+    well-documented early-reversal tell (Pring's own "Technical Analysis
+    Explained" covers this at length) that had NO detection anywhere in
+    this codebase before. Compares the two most recent CONFIRMED price
+    swing highs (bearish check) or swing lows (bullish check) against
+    compute_rolling_rsi's own value at those SAME bar indices — a fresh
+    price extreme that RSI itself fails to confirm is real, actionable
+    evidence momentum is fading before price itself turns.
+
+    `swing_highs`/`swing_lows` are duck-typed (any object with real
+    `.index`/`.price` attributes — deliberately NOT importing analysis.
+    chart_structure.SwingPoint here, which would create a circular
+    import: that module already imports FROM this one) — real callers
+    pass analysis.chart_structure.find_swing_points' own output. None
+    (never fabricated) without at least 2 confirmed points on the
+    relevant side, or without a real, computable RSI reading at both of
+    the compared bars."""
+    rolling_rsi = compute_rolling_rsi(prices)
+
+    def _check(points: list, is_bearish: bool) -> DivergenceSignal | None:
+        if not points or len(points) < 2:
+            return None
+        recent_two = sorted(points, key=lambda p: p.index)[-2:]
+        prior, recent = recent_two
+        if recent.index >= len(rolling_rsi) or prior.index >= len(rolling_rsi):
+            return None
+        rsi_recent = rolling_rsi.iloc[recent.index]
+        rsi_prior = rolling_rsi.iloc[prior.index]
+        if pd.isna(rsi_recent) or pd.isna(rsi_prior):
+            return None
+        last_index = len(rolling_rsi) - 1
+        if is_bearish:
+            price_diverges = recent.price > prior.price
+            rsi_diverges = rsi_recent < rsi_prior
+            kind = "bearish"
+            detail = (
+                f"Price made a higher high ({prior.price:.4f} -> {recent.price:.4f}) but RSI made a LOWER high "
+                f"({rsi_prior:.1f} -> {rsi_recent:.1f}) — momentum isn't confirming the new price high."
+            )
+        else:
+            price_diverges = recent.price < prior.price
+            rsi_diverges = rsi_recent > rsi_prior
+            kind = "bullish"
+            detail = (
+                f"Price made a lower low ({prior.price:.4f} -> {recent.price:.4f}) but RSI made a HIGHER low "
+                f"({rsi_prior:.1f} -> {rsi_recent:.1f}) — momentum isn't confirming the new price low."
+            )
+        if not (price_diverges and rsi_diverges):
+            return None
+        return DivergenceSignal(
+            kind=kind,
+            price_bars_ago=last_index - recent.index,
+            rsi_at_recent=float(rsi_recent),
+            rsi_at_prior=float(rsi_prior),
+            detail=detail,
+        )
+
+    bearish = _check(swing_highs or [], is_bearish=True)
+    if bearish is not None:
+        return bearish
+    return _check(swing_lows or [], is_bearish=False)
+
+
 def _compute_volume_trend_pct(volume: pd.Series) -> float | None:
     """% difference between the recent-window average volume and a longer
     baseline-window average — positive means participation has picked up
@@ -258,6 +391,45 @@ def _compute_volume_trend_pct(volume: pd.Series) -> float | None:
         return None
     recent = volume.tail(VOLUME_TREND_RECENT_WINDOW).mean()
     return float((recent - baseline) / baseline * 100)
+
+
+ADX_WINDOW = 14
+ADX_SLOPE_BARS = 12
+
+
+def compute_adx_series(high, low, close, window: int = ADX_WINDOW) -> np.ndarray:
+    """Wilder's Average Directional Index at EVERY bar (0-100): smoothed +DM/-DM over smoothed true range gives +DI/-DI,
+    DX = |+DI - -DI| / (+DI + -DI), ADX = the same smoothing of DX. Recursive (ewm alpha = 1/window), so the first
+    ~2*window values are still warming up. Public so the studies and the live stats share ONE definition."""
+    high, low, close = (np.asarray(x, dtype=float) for x in (high, low, close))
+    up = np.diff(high, prepend=high[0])
+    down = -np.diff(low, prepend=low[0])
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    prev_close = np.roll(close, 1)
+    prev_close[0] = close[0]
+    true_range = np.maximum(high - low, np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
+    alpha = 1.0 / window
+    atr = pd.Series(true_range).ewm(alpha=alpha, adjust=False).mean()
+    plus_di = 100 * pd.Series(plus_dm).ewm(alpha=alpha, adjust=False).mean() / atr
+    minus_di = 100 * pd.Series(minus_dm).ewm(alpha=alpha, adjust=False).mean() / atr
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    return dx.ewm(alpha=alpha, adjust=False).mean().to_numpy()
+
+
+def compute_adx(ohlc: pd.DataFrame) -> tuple[float | None, float | None]:
+    """(latest ADX, its change over the last ADX_SLOPE_BARS bars) or (None, None) without High/Low/Close or enough bars
+    for the smoothing to settle (3 x ADX_WINDOW + ADX_SLOPE_BARS)."""
+    if not {"High", "Low", "Close"}.issubset(ohlc.columns):
+        return None, None
+    frame = ohlc.dropna(subset=["High", "Low", "Close"])
+    if len(frame) < 3 * ADX_WINDOW + ADX_SLOPE_BARS:
+        return None, None
+    series = compute_adx_series(frame["High"], frame["Low"], frame["Close"])
+    now, before = series[-1], series[-1 - ADX_SLOPE_BARS]
+    if np.isnan(now) or np.isnan(before):
+        return None, None
+    return float(now), float(now - before)
 
 
 def compute_atr(ohlc: pd.DataFrame) -> float | None:
@@ -514,10 +686,12 @@ def compute_technical_stats(
             momentum_acceleration = "stable"
 
     atr = atr_pct = None
+    adx = adx_change_12 = None
     if history is not None and not history.empty:
         atr = compute_atr(history)
         if atr is not None and last_price:
             atr_pct = atr / last_price * 100
+        adx, adx_change_12 = compute_adx(history)
 
     rsi = _compute_rsi(prices)
 
@@ -543,4 +717,6 @@ def compute_technical_stats(
         rsi=rsi,
         volume_trend_pct=volume_trend_pct,
         momentum_acceleration=momentum_acceleration,
+        adx=adx,
+        adx_change_12=adx_change_12,
     )

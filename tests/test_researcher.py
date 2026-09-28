@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 import config
+import data.symbol_news as symbol_news
 from ai.openrouter_client import FAILED_MESSAGE as OPENROUTER_FAILED_MESSAGE, MISSING_KEY_MESSAGE as OPENROUTER_MISSING_KEY_MESSAGE
 from ai.portfolio_suggest import AUDIT_MODELS
 from ai.researcher import (
@@ -27,6 +28,7 @@ from ai.researcher import (
     _format_news_block,
     _google_news_query,
     _parse_published,
+    _prune_stale_research_notes,
     _read_calibration_ledger,
     _record_calibration_entry,
     _relative_age,
@@ -52,6 +54,55 @@ from analysis.technical import TechnicalStats
 from data.fundamentals_source import EquityFundamentals
 from data.macro_source import CountryFiscalIndicators
 from data.mt5_source import MarketAsset
+
+
+@pytest.fixture(autouse=True)
+def _clear_shared_symbol_news_cache(tmp_path):
+    # Real leak risk found live 2026-09-20 while consolidating news onto
+    # data.symbol_news's own shared, module-level, TTL-based cache
+    # (config.SYMBOL_NEWS_CACHE_MINUTES=20): since a full pytest run
+    # comfortably finishes well inside that window, a cache entry a test
+    # earlier in file order leaves behind for a given yahoo_ticker (e.g.
+    # "EURUSD=X") would still look "fresh" to a LATER test mocking a
+    # DIFFERENT expected result for that same ticker — silent, real,
+    # test-order-dependent contamination, not hypothetical.
+    #
+    # config.SYMBOL_NEWS_DIR is ALSO isolated here — same real leak this
+    # session already caught once for ai.trade_journal's own records dir:
+    # this module's own vault-persistence side effect
+    # (_record_symbol_news_to_vault) now fires for real whenever a test
+    # passes `symbol=` through _fetch_news_with_fallback (the main
+    # per-symbol research loop does, as of this same change), and this
+    # file's own existing OBSIDIAN_VAULT_PATH isolation alone doesn't
+    # cover the separate JSON store path.
+    #
+    # _category_news_cache/_macro_news_cache (added when the category-
+    # specialty/macro layers were ALSO moved onto this shared module,
+    # same day) are cleared here too — same class of leak, same fix.
+    #
+    # config.NEWS_FETCH_CACHE_FILE (added 2026-09-20 to dedupe real
+    # fetches ACROSS Clerk/Researcher/Mega's separate spawned processes)
+    # is isolated to tmp_path too — without this, a test run would read
+    # AND write the real production cache file, both leaking test
+    # fixture data into it and letting a stale real entry silently
+    # short-circuit a test's own mocked fetch.
+    #
+    # config.CATEGORY_NEWS_DIR (added 2026-09-20, same day category news
+    # gained its own vault persistence) is isolated for the exact same
+    # reason SYMBOL_NEWS_DIR already is above — get_category_news_items
+    # now also has a real, unmocked vault-write side effect.
+    symbol_news._symbol_news_cache.clear()
+    symbol_news._category_news_cache.clear()
+    symbol_news._macro_news_cache.clear()
+    with (
+        patch.object(config, "SYMBOL_NEWS_DIR", str(tmp_path / "ftmo_symbol_news")),
+        patch.object(config, "CATEGORY_NEWS_DIR", str(tmp_path / "ftmo_category_news")),
+        patch.object(config, "NEWS_FETCH_CACHE_FILE", str(tmp_path / "news_fetch_cache.json")),
+    ):
+        yield
+    symbol_news._symbol_news_cache.clear()
+    symbol_news._category_news_cache.clear()
+    symbol_news._macro_news_cache.clear()
 
 
 # --- _resolve_ftmo_yahoo_ticker: real Yahoo conventions per real category ---
@@ -306,8 +357,8 @@ def test_google_news_query_equities():
     assert _google_news_query("NVDA", "Equities I CFD") == "NVDA stock"
 
 
-@patch("ai.researcher.fetch_google_news")
-@patch("ai.researcher.fetch_recent_news")
+@patch("data.symbol_news.fetch_google_news")
+@patch("data.symbol_news.fetch_recent_news")
 def test_fetch_news_with_fallback_prefers_yahoo_when_available(mock_yahoo, mock_google):
     mock_yahoo.return_value = [{"title": "Real Yahoo item", "summary": "", "source": "", "published": ""}]
     result = _fetch_news_with_fallback("EURUSD=X", "EURUSD forex", limit=5)
@@ -315,8 +366,8 @@ def test_fetch_news_with_fallback_prefers_yahoo_when_available(mock_yahoo, mock_
     mock_google.assert_not_called()
 
 
-@patch("ai.researcher.fetch_google_news")
-@patch("ai.researcher.fetch_recent_news", return_value=[])
+@patch("data.symbol_news.fetch_google_news")
+@patch("data.symbol_news.fetch_recent_news", return_value=[])
 def test_fetch_news_with_fallback_uses_google_when_yahoo_empty(mock_yahoo, mock_google):
     mock_google.return_value = [{"title": "Real Google item", "summary": "", "source": "", "published": ""}]
     result = _fetch_news_with_fallback("USDCHF=X", "USDCHF forex", limit=5)
@@ -348,7 +399,7 @@ def test_category_rss_feed_url_equities_has_no_specialty_feed():
     assert _category_rss_feed_url("Equities I CFD") is None
 
 
-@patch("ai.researcher.fetch_rss_feed")
+@patch("data.symbol_news.fetch_rss_feed")
 def test_fetch_category_news_block_uses_the_real_feed_for_the_category(mock_rss):
     mock_rss.return_value = [{"title": "Real FXStreet item", "summary": "", "source": "FXStreet", "published": ""}]
     block = _fetch_category_news_block("Forex", limit=5)
@@ -430,7 +481,8 @@ def _analysis_with_stats(h1_trend="uptrend") -> object:
         base: _FakeBase
         h4_stats: TechnicalStats
         h1_stats: TechnicalStats
-        h1_structure: ChartStructureSnapshot
+        m5_stats: TechnicalStats
+        m5_structure: ChartStructureSnapshot
 
     flat = TechnicalStats(*([None] * 17))
     d1_stats = replace(flat, trend="uptrend", market_regime="trending_up", rsi=60.0, atr_pct=1.2, change_1m_pct=3.0)
@@ -444,14 +496,14 @@ def _analysis_with_stats(h1_trend="uptrend") -> object:
         trendlines=None,
         patterns=[],
     )
-    return _FakeAnalysis(base=_FakeBase(stats=d1_stats), h4_stats=d1_stats, h1_stats=h1_stats, h1_structure=structure)
+    return _FakeAnalysis(base=_FakeBase(stats=d1_stats), h4_stats=d1_stats, h1_stats=h1_stats, m5_stats=h1_stats, m5_structure=structure)
 
 
 def test_build_technical_snapshot_includes_real_trend_and_sr_levels():
     snapshot = _build_technical_snapshot(_analysis_with_stats())
     assert "uptrend" in snapshot
-    assert "Nearest H1 support" in snapshot
-    assert "Nearest H1 resistance" in snapshot
+    assert "Nearest M5 support" in snapshot
+    assert "Nearest M5 resistance" in snapshot
 
 
 def test_build_technical_snapshot_includes_backtest_when_present():
@@ -480,9 +532,10 @@ def test_build_technical_snapshot_degrades_honestly_when_no_history():
         base: _FakeBase
         h4_stats: TechnicalStats
         h1_stats: TechnicalStats
-        h1_structure: ChartStructureSnapshot
+        m5_stats: TechnicalStats
+        m5_structure: ChartStructureSnapshot
 
-    analysis = _FakeAnalysis(base=_FakeBase(stats=flat), h4_stats=flat, h1_stats=flat, h1_structure=empty_structure)
+    analysis = _FakeAnalysis(base=_FakeBase(stats=flat), h4_stats=flat, h1_stats=flat, m5_stats=flat, m5_structure=empty_structure)
     assert "not enough real MT5 history" in _build_technical_snapshot(analysis)
 
 
@@ -556,9 +609,9 @@ def test_extract_price_anchors_includes_current_price_support_and_resistance():
 
     @dataclass
     class _FakeAnalysis:
-        h1_structure: ChartStructureSnapshot
+        m5_structure: ChartStructureSnapshot
 
-    anchors = _extract_price_anchors(_FakeAnalysis(h1_structure=structure), current_price=1.3450)
+    anchors = _extract_price_anchors(_FakeAnalysis(m5_structure=structure), current_price=1.3450)
     assert anchors == [1.3450, 1.3400, 1.3524]
 
 
@@ -567,9 +620,9 @@ def test_extract_price_anchors_handles_missing_sr_levels():
 
     @dataclass
     class _FakeAnalysis:
-        h1_structure: ChartStructureSnapshot
+        m5_structure: ChartStructureSnapshot
 
-    anchors = _extract_price_anchors(_FakeAnalysis(h1_structure=empty_structure), current_price=1.3450)
+    anchors = _extract_price_anchors(_FakeAnalysis(m5_structure=empty_structure), current_price=1.3450)
     assert anchors == [1.3450]
 
 
@@ -868,6 +921,89 @@ def test_export_research_note_never_raises_on_oserror(tmp_path):
     _export_research_note("EURUSD", "text\nSENTIMENT: NEUTRAL", vault_path=blocker)  # must not raise
 
 
+def test_export_research_note_includes_the_same_real_inputs_the_webapp_panel_shows(tmp_path):
+    # Real gap found 2026-09-20, direct user report comparing the two:
+    # this note used to contain ONLY the model's own prose synthesis,
+    # while the webapp's Researcher panel (latest_research_report) reads
+    # records/researcher/'s full report, which also includes every real
+    # input via save_research_report's "Real inputs used" section -- so
+    # the vault note was silently thinner than what the webpage showed.
+    _export_research_note(
+        "EURUSD",
+        "Real synthesis.\nSENTIMENT: BULLISH",
+        news_block="- Real EURUSD headline",
+        category_news_block="- Real FXStreet item",
+        macro_headlines_block="- Real macro headline",
+        macro_snapshot_block="Real macro snapshot text",
+        technical_block="Real technical read",
+        equity_fundamentals_block="(not applicable — not an equity)",
+        track_record_block="Real track record text",
+        vault_path=tmp_path,
+    )
+    text = (tmp_path / "Research" / "EURUSD.md").read_text(encoding="utf-8")
+    assert "Real inputs used" in text
+    assert "Real EURUSD headline" in text
+    assert "Real FXStreet item" in text
+    assert "Real macro headline" in text
+    assert "Real macro snapshot text" in text
+    assert "Real technical read" in text
+    assert "Real track record text" in text
+
+
+def test_export_research_note_defaults_blocks_to_empty_when_not_given():
+    # The pre-existing 2-arg call shape (symbol, report_text) must keep
+    # working unchanged for any caller that hasn't been updated.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _export_research_note("EURUSD", "text\nSENTIMENT: NEUTRAL", vault_path=Path(tmp))
+        text = (Path(tmp) / "Research" / "EURUSD.md").read_text(encoding="utf-8")
+    assert "Real inputs used" in text
+
+
+# --- _prune_stale_research_notes: real gap found 2026-09-20, direct user ---
+# report that a symbol removed from the mix keeps its old research note ----
+# in the vault forever, with no natural mechanism to ever remove it --------
+
+
+def test_prune_stale_research_notes_deletes_notes_outside_the_current_mix(tmp_path):
+    research_dir = tmp_path / "Research"
+    research_dir.mkdir(parents=True)
+    (research_dir / "EURUSD.md").write_text("current", encoding="utf-8")
+    (research_dir / "AUDUSD.md").write_text("stale, no longer in the mix", encoding="utf-8")
+    with patch("ai.researcher.read_ftmo_symbol_mix", return_value=["EURUSD", "GBPUSD"]):
+        _prune_stale_research_notes(vault_path=tmp_path)
+    assert (research_dir / "EURUSD.md").exists()
+    assert not (research_dir / "AUDUSD.md").exists()
+
+
+def test_prune_stale_research_notes_does_nothing_when_no_allowlist_configured(tmp_path):
+    research_dir = tmp_path / "Research"
+    research_dir.mkdir(parents=True)
+    (research_dir / "AUDUSD.md").write_text("no allowlist -- nothing to prune against", encoding="utf-8")
+    with patch("ai.researcher.read_ftmo_symbol_mix", return_value=None):
+        _prune_stale_research_notes(vault_path=tmp_path)
+    assert (research_dir / "AUDUSD.md").exists()
+
+
+def test_prune_stale_research_notes_does_nothing_when_the_research_folder_does_not_exist(tmp_path):
+    with patch("ai.researcher.read_ftmo_symbol_mix", return_value=["EURUSD"]):
+        _prune_stale_research_notes(vault_path=tmp_path)  # must not raise
+
+
+def test_prune_stale_research_notes_never_raises_on_oserror(tmp_path, monkeypatch):
+    research_dir = tmp_path / "Research"
+    research_dir.mkdir(parents=True)
+    (research_dir / "AUDUSD.md").write_text("stale", encoding="utf-8")
+
+    def _boom(self):
+        raise OSError("locked")
+
+    with patch("ai.researcher.read_ftmo_symbol_mix", return_value=["EURUSD"]):
+        monkeypatch.setattr(Path, "unlink", _boom)
+        _prune_stale_research_notes(vault_path=tmp_path)  # must not raise
+
+
 # --- save_research_report / latest_research_report round trip ---
 
 
@@ -932,14 +1068,14 @@ def test_latest_research_report_never_mixes_up_symbols(tmp_path):
 
 
 @patch("ai.researcher.fetch_country_fiscal_indicators", return_value=[])
-@patch("ai.researcher.fetch_rss_feed", return_value=[])
-@patch("ai.researcher.fetch_google_news", return_value=[])
+@patch("data.symbol_news.fetch_rss_feed", return_value=[])
+@patch("data.symbol_news.fetch_google_news", return_value=[])
 @patch("ai.researcher.save_research_report")
 @patch("ai.researcher._run_researcher_model", return_value="Synthesis.\nSENTIMENT: BULLISH")
 @patch("ai.researcher._build_technical_snapshot", return_value=_TECHNICAL_BLOCK)
 @patch("ai.researcher.analyze_ftmo_asset_live")
 @patch("ai.researcher.build_macro_snapshot", return_value=_MACRO_SNAPSHOT_BLOCK)
-@patch("ai.researcher.fetch_recent_news")
+@patch("data.symbol_news.fetch_recent_news")
 @patch("ai.researcher.get_symbol_category")
 @patch("ai.researcher.get_market_watch")
 @patch("ai.researcher.connect")
@@ -976,15 +1112,15 @@ def test_run_researcher_check_saves_a_report_for_a_resolvable_symbol_with_news(
 
 
 @patch("ai.researcher.fetch_country_fiscal_indicators", return_value=[])
-@patch("ai.researcher.fetch_rss_feed", return_value=[])
-@patch("ai.researcher.fetch_google_news", return_value=[])
+@patch("data.symbol_news.fetch_rss_feed", return_value=[])
+@patch("data.symbol_news.fetch_google_news", return_value=[])
 @patch("ai.researcher.save_research_report")
 @patch("ai.researcher._run_researcher_model", return_value="ok\nSENTIMENT: BULLISH")
 @patch("ai.researcher._build_technical_snapshot", return_value=_TECHNICAL_BLOCK)
 @patch("ai.researcher.analyze_ftmo_asset_live")
 @patch("ai.researcher.fetch_equity_fundamentals")
 @patch("ai.researcher.build_macro_snapshot", return_value=_MACRO_SNAPSHOT_BLOCK)
-@patch("ai.researcher.fetch_recent_news")
+@patch("data.symbol_news.fetch_recent_news")
 @patch("ai.researcher.get_symbol_category", return_value="Equities I CFD")
 @patch("ai.researcher.get_market_watch")
 @patch("ai.researcher.connect")
@@ -1010,13 +1146,13 @@ def test_run_researcher_check_fetches_real_equity_fundamentals_for_equities(
 
 
 @patch("ai.researcher.fetch_country_fiscal_indicators", return_value=[])
-@patch("ai.researcher.fetch_rss_feed", return_value=[])
-@patch("ai.researcher.fetch_google_news", return_value=[])
+@patch("data.symbol_news.fetch_rss_feed", return_value=[])
+@patch("data.symbol_news.fetch_google_news", return_value=[])
 @patch("ai.researcher.save_research_report")
 @patch("ai.researcher._build_technical_snapshot", return_value=_TECHNICAL_BLOCK)
 @patch("ai.researcher.analyze_ftmo_asset_live")
 @patch("ai.researcher.build_macro_snapshot", return_value=_MACRO_SNAPSHOT_BLOCK)
-@patch("ai.researcher.fetch_recent_news")
+@patch("data.symbol_news.fetch_recent_news")
 @patch("ai.researcher.get_symbol_category", return_value="Forex")
 @patch("ai.researcher.get_market_watch")
 @patch("ai.researcher.connect")
@@ -1042,13 +1178,13 @@ def test_run_researcher_check_records_a_real_calibration_entry_on_success(
 
 
 @patch("ai.researcher.fetch_country_fiscal_indicators", return_value=[])
-@patch("ai.researcher.fetch_rss_feed", return_value=[])
-@patch("ai.researcher.fetch_google_news", return_value=[])
+@patch("data.symbol_news.fetch_rss_feed", return_value=[])
+@patch("data.symbol_news.fetch_google_news", return_value=[])
 @patch("ai.researcher.save_research_report")
 @patch("ai.researcher._run_researcher_model")
 @patch("ai.researcher.analyze_ftmo_asset_live")
 @patch("ai.researcher.build_macro_snapshot", return_value=_MACRO_SNAPSHOT_BLOCK)
-@patch("ai.researcher.fetch_recent_news", return_value=[])
+@patch("data.symbol_news.fetch_recent_news", return_value=[])
 @patch("ai.researcher.get_symbol_category")
 @patch("ai.researcher.get_market_watch")
 @patch("ai.researcher.connect")
@@ -1072,13 +1208,53 @@ def test_run_researcher_check_skips_a_symbol_with_no_known_yahoo_mapping(
 
 
 @patch("ai.researcher.fetch_country_fiscal_indicators", return_value=[])
-@patch("ai.researcher.fetch_rss_feed", return_value=[])
-@patch("ai.researcher.fetch_google_news", return_value=[])
+@patch("data.symbol_news.fetch_rss_feed", return_value=[])
+@patch("data.symbol_news.fetch_google_news")
+@patch("ai.researcher.save_research_report")
+@patch("ai.researcher._run_researcher_model", return_value="ok\nSENTIMENT: NEUTRAL")
+@patch("ai.researcher.analyze_ftmo_asset_live")
+@patch("ai.researcher.build_macro_snapshot", return_value=_MACRO_SNAPSHOT_BLOCK)
+@patch("data.symbol_news.fetch_recent_news", return_value=[])
+@patch("ai.researcher.get_symbol_category")
+@patch("ai.researcher.get_market_watch")
+@patch("ai.researcher.connect")
+def test_run_researcher_check_researches_an_unmapped_symbol_via_the_generic_description_fallback(
+    mock_connect, mock_watch, mock_category, mock_news, mock_macro, mock_analyze, mock_model, mock_save,
+    mock_google, mock_rss, mock_fiscal, tmp_path,
+):
+    # Real gap found 2026-09-20, direct user challenge ("how is it
+    # possible the 3 food items and oil does not have news feed, you
+    # have to do intelligent news searching"): a category with no known
+    # ticker convention used to mean this symbol was skipped forever.
+    # "SUGAR.c" is deliberately not one of the hardcoded commodity
+    # futures, so this exercises the GENERIC description-based fallback.
+    mock_watch.return_value = [
+        MarketAsset(symbol="SUGAR.c", description="Sugar vs US Dollar, Spot CFD", bid=0.22, ask=0.2201)
+    ]
+    mock_category.return_value = "Agriculture"
+    mock_google.return_value = [{"title": "Sugar prices rally", "summary": "", "source": "Reuters", "published": ""}]
+
+    with (
+        patch.object(config, "RESEARCHER_STATE_FILE", str(tmp_path / "researcher_state.json")),
+        patch.object(config, "OBSIDIAN_VAULT_PATH", str(tmp_path / "obsidian_vault")),
+        patch.object(config, "RESEARCHER_CALIBRATION_FILE", str(tmp_path / "researcher_calibration.json")),
+    ):
+        run_researcher_check()
+
+    mock_google.assert_any_call("Sugar", limit=config.RESEARCHER_HEADLINES_PER_SYMBOL)
+    mock_save.assert_called_once()
+    assert mock_save.call_args.args[0] == "SUGAR.c"
+    assert "Sugar prices rally" in mock_save.call_args.args[2]
+
+
+@patch("ai.researcher.fetch_country_fiscal_indicators", return_value=[])
+@patch("data.symbol_news.fetch_rss_feed", return_value=[])
+@patch("data.symbol_news.fetch_google_news", return_value=[])
 @patch("ai.researcher.save_research_report")
 @patch("ai.researcher._run_researcher_model")
 @patch("ai.researcher.analyze_ftmo_asset_live")
 @patch("ai.researcher.build_macro_snapshot", return_value=_MACRO_SNAPSHOT_BLOCK)
-@patch("ai.researcher.fetch_recent_news", return_value=[])
+@patch("data.symbol_news.fetch_recent_news", return_value=[])
 @patch("ai.researcher.get_symbol_category", return_value="Forex")
 @patch("ai.researcher.get_market_watch")
 @patch("ai.researcher.connect")
@@ -1106,14 +1282,14 @@ def test_run_researcher_check_skips_a_symbol_with_no_real_news(
 
 
 @patch("ai.researcher.fetch_country_fiscal_indicators", return_value=[])
-@patch("ai.researcher.fetch_rss_feed", return_value=[])
-@patch("ai.researcher.fetch_google_news")
+@patch("data.symbol_news.fetch_rss_feed", return_value=[])
+@patch("data.symbol_news.fetch_google_news")
 @patch("ai.researcher.save_research_report")
 @patch("ai.researcher._run_researcher_model", return_value="ok\nSENTIMENT: NEUTRAL")
 @patch("ai.researcher._build_technical_snapshot", return_value=_TECHNICAL_BLOCK)
 @patch("ai.researcher.analyze_ftmo_asset_live")
 @patch("ai.researcher.build_macro_snapshot", return_value=_MACRO_SNAPSHOT_BLOCK)
-@patch("ai.researcher.fetch_recent_news")
+@patch("data.symbol_news.fetch_recent_news")
 @patch("ai.researcher.get_symbol_category")
 @patch("ai.researcher.get_market_watch")
 @patch("ai.researcher.connect")
@@ -1140,14 +1316,14 @@ def test_run_researcher_check_falls_back_to_google_news_when_yahoo_has_nothing(
 
 
 @patch("ai.researcher.fetch_country_fiscal_indicators", return_value=[])
-@patch("ai.researcher.fetch_rss_feed", return_value=[])
-@patch("ai.researcher.fetch_google_news", return_value=[])
+@patch("data.symbol_news.fetch_rss_feed", return_value=[])
+@patch("data.symbol_news.fetch_google_news", return_value=[])
 @patch("ai.researcher.save_research_report")
 @patch("ai.researcher._run_researcher_model", return_value="ok\nSENTIMENT: NEUTRAL")
 @patch("ai.researcher._build_technical_snapshot", return_value=_TECHNICAL_BLOCK)
 @patch("ai.researcher.analyze_ftmo_asset_live")
 @patch("ai.researcher.build_macro_snapshot", return_value=_MACRO_SNAPSHOT_BLOCK)
-@patch("ai.researcher.fetch_recent_news")
+@patch("data.symbol_news.fetch_recent_news")
 @patch("ai.researcher.get_symbol_category")
 @patch("ai.researcher.get_market_watch")
 @patch("ai.researcher.connect")
@@ -1183,13 +1359,13 @@ def test_run_researcher_check_one_symbols_failure_does_not_abort_the_run(
 
 
 @patch("ai.researcher.fetch_country_fiscal_indicators", return_value=[])
-@patch("ai.researcher.fetch_rss_feed", return_value=[])
-@patch("ai.researcher.fetch_google_news", return_value=[])
+@patch("data.symbol_news.fetch_rss_feed", return_value=[])
+@patch("data.symbol_news.fetch_google_news", return_value=[])
 @patch("ai.researcher.save_research_report")
 @patch("ai.researcher._run_researcher_model", return_value="ok\nSENTIMENT: NEUTRAL")
 @patch("ai.researcher.analyze_ftmo_asset_live", side_effect=RuntimeError("MT5 fetch failed"))
 @patch("ai.researcher.build_macro_snapshot", return_value=_MACRO_SNAPSHOT_BLOCK)
-@patch("ai.researcher.fetch_recent_news")
+@patch("data.symbol_news.fetch_recent_news")
 @patch("ai.researcher.get_symbol_category", return_value="Forex")
 @patch("ai.researcher.get_market_watch")
 @patch("ai.researcher.connect")
@@ -1365,3 +1541,17 @@ def test_write_researcher_state_keeps_prior_last_run_date_on_a_later_failure(tmp
         today = read_researcher_state()["last_run_date_utc"]
         _write_researcher_state("no_assets")
         assert read_researcher_state()["last_run_date_utc"] == today
+
+
+def test_snapshot_shows_a_real_month_only_for_d1_and_prints_intraday_atr_with_enough_decimals():
+    analysis = _analysis_with_stats()
+    analysis.base.stats = replace(analysis.base.stats, atr_pct=1.2, change_1m_pct=3.0)
+    analysis.h4_stats = replace(analysis.h4_stats, atr_pct=0.7, change_1m_pct=2.0)
+    analysis.m5_stats = replace(analysis.m5_stats, atr_pct=0.0306, change_1m_pct=0.2)
+    lines = _build_technical_snapshot(analysis).split("\n")
+    by_label = {line.split(":")[0]: line for line in lines if line.startswith("- ") and "trend=" in line}
+    assert "1-month change=3.0%" in by_label["- D1 (context)"]
+    # 21 bars is a month only on D1 — the intraday reads must not claim one.
+    for label in ("- H4 (context)", "- H1 (context)", "- M5 (decision)"):
+        assert "1-month" not in by_label[label]
+    assert "ATR%=0.031 per bar" in by_label["- M5 (decision)"]

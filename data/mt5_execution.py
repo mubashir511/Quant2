@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 
 # _serialize_mt5_access wraps every function below in the SAME lock
@@ -28,44 +29,148 @@ def open_position(
     price: float,
     stop_loss: float | None = None,
     take_profit: float | None = None,
+    kind: str = "limit",
+    max_deviation_price: float | None = None,
+    expiration_hours: float | None = None,
 ) -> OrderResult:
-    """Places a pending LIMIT order to open/increase exposure — never a
-    market order for entries, so an unclamped or stale price never fills
-    at an unexpectedly worse level (the price sanity-clamping itself
-    happens in risk/apply_suggestion.py, before this is ever called).
-    Order-level outcomes (rejected/requoted/etc.) come back as a non-
-    raising OrderResult, matching this file's sibling: a rejected order
-    isn't a connection failure. MT5ConnectionError is still raised if
+    """Places an entry order: by default a pending LIMIT order (the price sanity-clamping happens in
+    risk/apply_suggestion.py, before this is ever called), and — since 2026-09-25, see
+    analysis/entry_mode.py for the full reasoning and the caller-side verification — optionally:
+
+    - kind="stop": a pending BUY STOP / SELL STOP at `price` (a breakout trigger beyond the market).
+    - kind="market": an immediate deal at the live ask (buy) / bid (sell). `price` is then only the
+      REFERENCE the caller verified, and `max_deviation_price` (price units, REQUIRED) is the most the
+      live price may have moved against the buyer/seller since — measured here, on a fresh tick, right
+      before sending, and also passed to MT5 as the deal's own `deviation` in points. A missing cap, no
+      quote, or a larger move sends NOTHING and returns a failed OrderResult.
+
+    `expiration_hours` (pending kinds only): the broker cancels the resting order itself after that many hours
+    (MT5 ORDER_TIME_SPECIFIED, measured on the SERVER clock via the symbol's own tick time) - used so an order
+    for a session-limited instrument cannot sit overnight when nobody can manage it (the NVDA case). Skipped when the
+    symbol does not support specified expiration, and if the broker rejects the expiration (retcode 10022) the order is
+    re-sent once as plain GTC - a missing expiry never blocks an entry.
+
+    Every kind carries its stop-loss/take-profit in the SAME request (no unprotected window). Order-level
+    outcomes (rejected/requoted/etc.) come back as a non-raising OrderResult, matching this file's
+    sibling: a rejected order isn't a connection failure. MT5ConnectionError is still raised if
     order_send itself returns nothing (the terminal isn't reachable)."""
     import MetaTrader5 as mt5
 
-    order_type = mt5.ORDER_TYPE_BUY_LIMIT if side == "buy" else mt5.ORDER_TYPE_SELL_LIMIT
-    request = {
-        "action": mt5.TRADE_ACTION_PENDING,
-        "symbol": symbol,
-        "volume": volume,
-        "type": order_type,
-        "price": price,
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_RETURN,
-    }
+    if kind not in ("limit", "stop", "market"):
+        return OrderResult(False, None, f"unknown entry order kind {kind!r} - nothing sent", None)
+
+    if kind == "market":
+        if max_deviation_price is None or max_deviation_price < 0:
+            return OrderResult(False, None, "market entry needs a max_deviation_price cap - nothing sent", None)
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            raise MT5ConnectionError(f"No live quote available to open {symbol} at the market.")
+        live = tick.ask if side == "buy" else tick.bid
+        if not live:
+            return OrderResult(False, None, f"no live {'ask' if side == 'buy' else 'bid'} for {symbol} - nothing sent", None)
+        adverse = (live - price) if side == "buy" else (price - live)
+        if adverse > max_deviation_price:
+            return OrderResult(
+                False, None,
+                f"market entry skipped: price moved {adverse:.6g} against the verified {price:.6g} "
+                f"(cap {max_deviation_price:.6g}) - nothing sent",
+                None,
+            )
+        info = mt5.symbol_info(symbol)
+        point = getattr(info, "point", 0) or 0
+        deviation = int(math.ceil(max_deviation_price / point)) if point > 0 else 0
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": volume,
+            "type": mt5.ORDER_TYPE_BUY if side == "buy" else mt5.ORDER_TYPE_SELL,
+            "price": live,
+            "deviation": deviation,
+            "type_filling": _market_filling_mode(mt5, info),
+        }
+    else:
+        if kind == "stop":
+            order_type = mt5.ORDER_TYPE_BUY_STOP if side == "buy" else mt5.ORDER_TYPE_SELL_STOP
+        else:
+            order_type = mt5.ORDER_TYPE_BUY_LIMIT if side == "buy" else mt5.ORDER_TYPE_SELL_LIMIT
+        request = {
+            "action": mt5.TRADE_ACTION_PENDING,
+            "symbol": symbol,
+            "volume": volume,
+            "type": order_type,
+            "price": price,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_RETURN,
+        }
     if stop_loss is not None:
         request["sl"] = stop_loss
     if take_profit is not None:
         request["tp"] = take_profit
+    gtc_request = None
+    if kind != "market" and expiration_hours and expiration_hours > 0:
+        expiry = _server_expiry(mt5, symbol, expiration_hours)
+        if expiry is not None:
+            gtc_request = dict(request)
+            request["type_time"] = mt5.ORDER_TIME_SPECIFIED
+            request["expiration"] = expiry
 
     result = mt5.order_send(request)
     if result is None:
         error = mt5.last_error()
         raise MT5ConnectionError(f"order_send returned nothing for {symbol} ({error}).")
+    if gtc_request is not None and result.retcode == _INVALID_EXPIRATION_RETCODE:
+        result = mt5.order_send(gtc_request)  # the broker refused the expiry: place it plain GTC rather than not at all
+        if result is None:
+            error = mt5.last_error()
+            raise MT5ConnectionError(f"order_send returned nothing for {symbol} ({error}).")
 
-    success = result.retcode == mt5.TRADE_RETCODE_DONE
+    # A market deal can come back PARTIALLY filled (IOC/FOK-less venues, thin stock CFDs): the position exists,
+    # so it is a success — treating it as a failure would make the Clerk retry and double the exposure.
+    success_codes = {mt5.TRADE_RETCODE_DONE}
+    if kind == "market":
+        success_codes.add(mt5.TRADE_RETCODE_DONE_PARTIAL)
+    success = result.retcode in success_codes
     return OrderResult(
         success=success,
         retcode=result.retcode,
         comment=result.comment,
         ticket=result.order if success else None,
     )
+
+
+_INVALID_EXPIRATION_RETCODE = 10022  # TRADE_RETCODE_INVALID_EXPIRATION
+# The Python package exposes no SYMBOL_EXPIRATION_* constants; these are the MQL5 values of SYMBOL_EXPIRATION_MODE bits.
+_SYMBOL_EXPIRATION_GTC, _SYMBOL_EXPIRATION_SPECIFIED = 1, 4
+
+
+def _server_expiry(mt5, symbol: str, hours: float) -> int | None:
+    """Expiration timestamp (server-clock epoch seconds) `hours` from now, or None when the symbol does not allow a
+    specified expiration or no live tick exists. The server clock comes from the symbol's own last tick so the broker's
+    UTC offset never enters the arithmetic."""
+    info = mt5.symbol_info(symbol)
+    mode = getattr(info, "expiration_mode", None)
+    if isinstance(mode, int) and not (mode & _SYMBOL_EXPIRATION_SPECIFIED):
+        return None
+    tick = mt5.symbol_info_tick(symbol)
+    server_now = getattr(tick, "time", 0) if tick is not None else 0
+    if not server_now:
+        return None
+    return int(server_now + hours * 3600)
+
+
+def _market_filling_mode(mt5, info) -> int:
+    """The deal filling mode this symbol actually supports (SYMBOL_FILLING_FOK = 1, IOC = 2 bits of
+    symbol_info.filling_mode). Prefers IOC (what close_position uses), then FOK; RETURN only when the symbol
+    advertises neither. An unsupported mode is rejected by the broker (retcode 10030) — safe, but the market
+    entry would then never work on that instrument."""
+    mask = getattr(info, "filling_mode", None)
+    if isinstance(mask, int):
+        if mask & 2:
+            return mt5.ORDER_FILLING_IOC
+        if mask & 1:
+            return mt5.ORDER_FILLING_FOK
+        return mt5.ORDER_FILLING_RETURN
+    return mt5.ORDER_FILLING_IOC
 
 
 @_serialize_mt5_access

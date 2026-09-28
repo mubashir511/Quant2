@@ -8,3 +8,5 @@ plotly
 beautifulsoup4
 lxml
 pytest
+tzdata
+pyarrow

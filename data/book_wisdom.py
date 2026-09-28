@@ -707,7 +707,176 @@ BOOK_PRINCIPLES: list[BookPrinciple] = [
             "elsewhere — it cuts both ways."
         ),
     ),
+    # --- Position-hunting additions (2026-09-25): each paraphrases a rule from the owned books (re-read in
+    # full for the entry/stop/target/risk chapters) and states what this account's own data showed about it.
+    BookPrinciple(
+        principle=(
+            "Trade WITH the intermediate trend and work from the long-term chart to the short-term one: the "
+            "larger timeframes give the direction, the shorter ones only fine-tune the entry."
+        ),
+        author="John Murphy / Martin Pring",
+        source="Technical Analysis of the Financial Markets (multiple-timeframe and trend chapters); Technical Analysis Explained",
+        rationale=(
+            "Measured on this account's own broker data (2007-2026, 667,701 H1 bars, 20 symbols, higher-timeframe "
+            "flags taken only from CLOSED bars): entries aligned with both the H4 and D1 trend earned +0.021R gross "
+            "per trade against -0.009R for counter-trend entries (14 of 20 symbols) - positive every year since "
+            "2019 but REVERSED in 2008-2015 (Lo: rules decay and regimes change). So rank aligned candidates first "
+            "and give counter-trend ones a higher bar and a smaller size, but treat it as a monitored ranking factor, "
+            "never a hard filter, and never exclude on a noisy short backtest."
+        ),
+    ),
+    BookPrinciple(
+        principle=(
+            "The breakout dilemma: anticipate the break, take it when it happens, or wait for the pullback — "
+            "and a dynamic market often does not give the second chance (Murphy calls the wait-for-the-pullback "
+            "compromise sensible but one that may never come)."
+        ),
+        author="John Murphy",
+        source="Technical Analysis of the Financial Markets (trading tactics / breakouts)",
+        rationale=(
+            "Measured here on 34,407 with-the-trend breakout moments (deep M5, 20 symbols): a resting limit at the "
+            "nearest reaction level was the worst entry (-0.03..-0.05R gross per fill; a limit 4 M5 ATRs away fills "
+            "only ~34% within 3 hours and the target is reached WITHOUT a fill 63-70% of the time), a market order "
+            "+0.02..+0.03R, a breakout STOP at the range extreme +0.04..+0.07R. So take the break with a stop "
+            "order (or a capped market entry when it is already through and not extended); use a limit only within "
+            "~1.6 ATR of the price at a real reaction point."
+        ),
+    ),
+    BookPrinciple(
+        principle=(
+            "Mid-trend entries: (1) a retracement of roughly 35-65% of the last leg, (2) the resumption after a "
+            "minor reaction against the trend, (3) a breakout of a consolidation — and the stop goes where the "
+            "technical picture changes (beyond the range, trendline or relative low/high), with a money stop if "
+            "that is too far."
+        ),
+        author="Jack Schwager",
+        source="Getting Started in Technical Analysis (entry and stop chapters)",
+        rationale=(
+            "Schwager's own caveat is that the retracement may not occur before the trend runs away. On this "
+            "account's DEEP M5 data (up to 200k bars per symbol, paired at the same moments) the STOP was the part that "
+            "mattered: a structure stop (opposite side of the 24-bar range, clipped 1.5-4 ATR) beat a fixed 2 ATR stop by "
+            "+0.07..+0.11R per opportunity for any entry type, and the breakout order added another +0.03..+0.05R. "
+            "Let the stop be the invalidation level, not an ATR habit."
+        ),
+    ),
+    BookPrinciple(
+        principle=(
+            "Buy the pivot/breakout, not the cheapest price, and do not chase: more than a few percent past the "
+            "pivot is a late entry. Never buy near the low of a weak market."
+        ),
+        author="William O'Neil",
+        source="How to Make Money in Stocks (buy points)",
+        rationale=(
+            "Encoded as the 'extension cap': a breakout entry is accepted only while price is within ~0.6 M5 ATR "
+            "beyond the trigger; further than that the setup is rejected rather than chased."
+        ),
+    ),
+    BookPrinciple(
+        principle=(
+            "Pullbacks/throwbacks after a breakout occur only about 43-56% of the time and hurt performance when "
+            "they do; measure rule: the target is the pattern height projected from the breakout (half the "
+            "height is the conservative case), and the stop sits just beyond the minor low/high."
+        ),
+        author="Thomas Bulkowski",
+        source="Encyclopedia of Chart Patterns (throwbacks/pullbacks, measure rule)",
+        rationale=(
+            "'Too low to form a reliable strategy' is Bulkowski's own verdict on waiting for the pullback. The "
+            "trade-zone read prints the half-leg and full-leg measured moves and the swing-extreme structure stop "
+            "next to the S/R and session-extreme targets."
+        ),
+        tier="trend",
+    ),
+    BookPrinciple(
+        principle=(
+            "Let profits run with a trailing stop, never let a winner turn into a loser, and add only to a "
+            "position that is already in profit (pyramid into strength, never average down)."
+        ),
+        author="Jack Schwager / John Murphy",
+        source="Getting Started in Technical Analysis; Technical Analysis of the Financial Markets (stops, trailing, money management)",
+        rationale=(
+            "Measured on 38,960 paired random M5 trades: trailing the stop 1.5 M5 ATR behind the price once the "
+            "trade is +1R lifted net expectancy from -0.174R to -0.148R (better on 17 of 20 symbols) and beat "
+            "breakeven-at-1R (-0.163R) and partial-plus-breakeven (-0.155R). The Clerk now applies that trail "
+            "automatically, so a distant target is acceptable as the RUNNER of a plan that has a nearer partial."
+        ),
+        tier="trend",
+    ),
+    BookPrinciple(
+        principle=(
+            "A trading plan states, besides the entry, its re-entry rule — what happens after a stop or a target "
+            "— and treats reward:risk as a filter using a worst-case estimate; controlling losses comes first."
+        ),
+        author="James Rockefeller",
+        source="Technical Analysis For Dummies (the trading plan)",
+        rationale=(
+            "An entry that died unfilled is now remembered (the re-hunt ledger) and offered to the next session "
+            "for ONE re-issue with fresh levels, instead of vanishing."
+        ),
+    ),
+    BookPrinciple(
+        principle=(
+            "Markets adapt: trading rules decay as participants learn, backtests are non-stationary, and a rule "
+            "needs confirmation before it earns capital."
+        ),
+        author="Andrew Lo / Martin Pring",
+        source="The Adaptive Markets Hypothesis; Technical Analysis Explained",
+        rationale=(
+            "This is why a pooled backtest is judged against a random-entry baseline and called NO-INFORMATION "
+            "when it cannot beat it — absence of proof is not proof against a structural thesis — and why the "
+            "studies behind these rules are re-runnable (tools/studies) rather than frozen."
+        ),
+    ),
 ]
+
+
+# Added 2026-09-25 from the Book Rule Ledger (Books/rule_ledger.md): only rules whose wording was FOUND in the extracted book
+# text (tools/nlm/verify_quotes) AND tested on real deep broker data. Rules that failed the data test are listed there as
+# rejected and deliberately absent here (close filters and soft/time stops on M5, "strongest level" rankings, TP1 partials).
+BOOK_PRINCIPLES.extend([
+    BookPrinciple(
+        principle=(
+            "Use market orders rather than limit orders in most cases: the fills a limit order gets are better, but "
+            "the trades it misses cost more than the improvement earns."
+        ),
+        author="Jack Schwager",
+        source="Getting Started in Technical Analysis (Rules of Thumb, rule 11)",
+        rationale=(
+            "Confirmed on this account's M5 data (ledger #1, #31): limit at the nearest reaction level -0.03..-0.05R "
+            "gross per fill vs market +0.02..+0.03R vs breakout stop +0.04..+0.07R. The same rule set says not to let a "
+            "missed first move stop you trading with the trend if a reasonable stop exists (rule 8) - wait for a new "
+            "consolidation rather than chase."
+        ),
+    ),
+    BookPrinciple(
+        principle=(
+            "Stop orders cluster just beyond the edge of a trading range, so a small poke through a level can trigger "
+            "them and then the break fails: put a protective stop BEYOND the level by a buffer, not on it."
+        ),
+        author="Jack Schwager",
+        source="Getting Started in Technical Analysis (chapter 4, stops and false breaks)",
+        rationale=(
+            "Measured (ledger #5): support/resistance levels that later held were still pierced by a median 0.5, P75 1.3 "
+            "and P90 2.7 M5 ATRs. A stop placed at the level itself is inside that poke distance about half the time."
+        ),
+    ),
+    BookPrinciple(
+        principle=(
+            "The books rank support/resistance (thick multi-touch bases, volume nodes, polarity flips, 38-62% "
+            "retracements, round numbers) and say the strongest level is the best place for a reversal order. Treat that "
+            "ranking as unproven on intraday data: list every real candidate and let distance and what the price has "
+            "actually done (an unbroken reaction low/high) decide."
+        ),
+        author="John Murphy / Martin Pring / Steve Nison / Thomas Bulkowski",
+        source="Technical Analysis of the Financial Markets (ch. 4); Technical Analysis Explained (ch. 5); Japanese Candlestick Charting Techniques; Encyclopedia of Chart Patterns",
+        rationale=(
+            "Tested on 20 symbols x up to 200k M5 bars (ledger #29): no kind or feature of level (touch count, liquidity "
+            "pool, round number, H1 confluence, recency, volume, Fibonacci, range extreme) filled-and-held better than a "
+            "RANDOM price at the same distance (-0.008..-0.040 vs random). Fill odds are set by distance (93% within 1 "
+            "ATR, ~62% at 3-5 ATR). A Nison-style reversal candle is a context flag, not a trigger, until it passes the "
+            "same test."
+        ),
+    ),
+])
 
 
 def format_book_wisdom() -> str:
@@ -824,7 +993,9 @@ TREND_PRINCIPLES: list[BookPrinciple] = [
 ]
 
 
-def format_trend_wisdom() -> str:
+def format_trend_wisdom(brief: bool = False) -> str:
+    """`brief=True` (the Execution Clerk's tactical prompt): the principle and its author only, without the "Why:" rationale lines -
+    the model must cite a rule and numbers, not re-read the evidence behind it, and every prompt token costs it ~8 ms."""
     trend = [p for p in BOOK_PRINCIPLES if p.tier == "trend"] + TREND_PRINCIPLES
     lines = [
         "Short-term/tactical investing-literature principles (advisory "
@@ -833,5 +1004,6 @@ def format_trend_wisdom() -> str:
     ]
     for p in trend:
         lines.append(f"- {p.principle} — {p.author} ({p.source}).")
-        lines.append(f"  Why: {p.rationale}")
+        if not brief:
+            lines.append(f"  Why: {p.rationale}")
     return "\n".join(lines)

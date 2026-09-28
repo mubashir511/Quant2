@@ -79,9 +79,11 @@ manual-button inline pass) share automatically, so a disabled clerk is
 disabled everywhere at once, not just on the scheduled poll. The review
 frequency itself (previously a fixed config.CLERK_EXECUTION_CHECK_
 INTERVAL_MINUTES) is now similarly overridable via read_clerk_
-execution_interval_minutes(), read by _interval_start (and therefore by
-both is_execution_due and the new next_execution_check_utc, used for
-the panel's own "next review" countdown).
+execution_interval_minutes(), read by both is_execution_due and
+next_execution_check_utc (used for the panel's own "next review"
+countdown) — see is_execution_due's own docstring for the 2026-09-21
+switch from fixed clock-aligned windows to a genuine rolling cooldown
+timed from the last run's own completion.
 
 2026-08-23/24 update — Claude and the Clerk can now re-assess an
 ALREADY-suggested position, not just propose fresh ones (direct user
@@ -173,10 +175,12 @@ restore is never new exposure)."""
 
 import json
 import logging
+import math
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
+import dataclasses
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -184,15 +188,21 @@ from typing import Callable
 import pandas as pd
 
 import config
+from ai import continuation_hunter, trade_journal
 from ai.ollama_client import FAILED_MESSAGE as OLLAMA_FAILED_MESSAGE
 from ai.ollama_client import run_ollama
 from ai.ftmo_suggest import (
     FtmoAssetAnalysis,
+    IntradayBacktests,
+    intraday_edge_verdicts,
+    effective_stop_floor,
     _HIGH_CORRELATION_THRESHOLD,
     _MIN_CORRELATION_OBSERVATIONS,
     aligned_h1_h4_trend_direction,
+    aligned_m5_trend_direction,
     analyze_ftmo_asset_live,
     fetch_ftmo_status,
+    format_clerk_context,
     format_ftmo_asset_context,
     read_latest_suggestion,
 )
@@ -201,16 +211,37 @@ from ai.mega_analysis import read_progress as read_mega_progress
 from ai.mega_analysis import read_state as read_mega_state
 from ai.portfolio_suggest import AllocationEntry, AssetAnalysis, PendingSetup
 from analysis.backtest import classify_backtest_favorability
-from analysis.chart_structure import ChartStructureSnapshot, SRLevel
+from analysis.edge_stats import SUPPORTED as EDGE_SUPPORTED
+from analysis.entry_mode import normalise_entry_mode, resolve_entry_mode
+from analysis.triggers import evaluate_trigger, normalise_trigger
+from ai import clerk_thinking
+from ai.sentinel import apply_sentinel_ratchet, ingest_sentinel_stops, read_sentinel_state
+from analysis.trail import original_risk as trail_original_risk, trail_decision
+from ai import rehunt
+from analysis.chart_structure import (
+    ChartStructureSnapshot,
+    LiquiditySweepEvent,
+    SRLevel,
+    StructureBreak,
+    compute_chart_structure,
+    find_swing_points,
+)
+from analysis.setup_classifier import classify_setups
 from analysis.technical import (
+    TRADING_DAYS_PER_YEAR,
     TechnicalStats,
+    classify_m5_velocity_tier,
     classify_rsi_tier,
     classify_velocity_tier,
+    compute_atr,
     compute_regime_segments,
+    compute_technical_stats,
+    detect_rsi_divergence,
 )
+from analysis.timeframe_profiles import M5_PROFILE
+from analysis.trade_zone import construct_trade_zone
 from data.book_wisdom import format_trend_wisdom
-from data.news_source import fetch_recent_headlines
-from data.underlying import resolve_yahoo_ticker
+from data import economic_calendar, symbol_news
 from data.mt5_execution import (
     MT5ConnectionError,
     OrderResult,
@@ -224,21 +255,26 @@ from data.mt5_source import (
     ClosedTrade,
     PendingOrder,
     Position,
+    TradeCost,
     connect,
     fetch_mt5_price_history,
+    fetch_mt5_price_history_range,
     get_account_summary,
     get_contract_spec,
     get_history_deals,
     get_market_watch,
     get_open_positions,
     get_pending_orders,
+    get_server_time_offset,
     get_symbol_category,
     get_terminal_commondata_path,
+    get_trade_economics,
     group_closed_trades,
     is_symbol_tradable_now,
     is_trading_permitted,
 )
 from risk.apply_suggestion import (
+    PlannedOrder,
     check_execution_safety_gates,
     compute_aggregate_heat_pct,
     compute_rebalance_plan,
@@ -309,11 +345,14 @@ def _write_execution_state(
     last_verdicts: dict | None = None,
     last_execution_results: dict | None = None,
     last_tactical_verdicts: dict | None = None,
+    preserve_headline: bool = False,
 ) -> None:
-    """Records this poll's outcome. Preserves `last_run_interval_utc`
+    """Records this poll's outcome. `preserve_headline` (the fast lane): keep the prior last_attempt_utc / status / detail and
+    only merge the per-symbol maps. Preserves `last_run_completed_utc`
     from whatever was there before (this function never touches it —
     only _mark_interval_ran does) so a call here can never accidentally
-    erase the due-check's own dedup marker regardless of call order.
+    erase the due-check's own rolling-cooldown marker regardless of call
+    order.
     `last_verdicts` and `last_execution_results` are both MERGED onto
     the prior record (a fresh entry for a symbol overwrites its own old
     one; other symbols' entries from an earlier poll survive) rather
@@ -348,14 +387,17 @@ def _write_execution_state(
     merged_tactical_verdicts = {
         **prior.get("last_tactical_verdicts", {}), **(last_tactical_verdicts or {})
     }
+    if preserve_headline:
+        status = prior.get("last_status", status)
+        detail = prior.get("last_detail", detail)
     payload = {
-        "last_attempt_utc": now.isoformat(),
+        "last_attempt_utc": prior.get("last_attempt_utc", now.isoformat()) if preserve_headline else now.isoformat(),
         "last_status": status,
         "last_detail": detail,
         "last_verdicts": merged_verdicts,
         "last_execution_results": merged_results,
         "last_tactical_verdicts": merged_tactical_verdicts,
-        "last_run_interval_utc": prior.get("last_run_interval_utc"),
+        "last_run_completed_utc": prior.get("last_run_completed_utc"),
     }
     try:
         Path(config.CLERK_EXECUTION_STATE_FILE).write_text(json.dumps(payload, indent=2))
@@ -504,56 +546,72 @@ def set_clerk_execution_interval_minutes(minutes: int) -> None:
         logger.warning("Could not write interval file %s: %s", config.CLERK_EXECUTION_INTERVAL_FILE, e)
 
 
-# --- interval due-check (mirrors ai.mega_analysis.is_due, keyed on a fixed-size window) ---
-
-
-def _interval_start(now_utc: datetime) -> datetime:
-    """The start instant of the review-frequency window `now_utc` falls
-    inside — e.g. with a 15-minute interval, 13:00-13:14 all resolve to
-    13:00, 13:15-13:29 all resolve to 13:15. A pure function of the clock
-    plus the current interval-minutes setting, not of any stored state,
-    so it can never disagree with itself between is_execution_due and
-    _mark_interval_ran."""
-    interval = read_clerk_execution_interval_minutes()
-    bucket_minute = (now_utc.minute // interval) * interval
-    return now_utc.replace(minute=bucket_minute, second=0, microsecond=0)
+# --- interval due-check: a genuine rolling cooldown from the last run's
+# own completion, not a fixed clock-aligned window ---------------------
+#
+# Replaced 2026-09-21, direct user report ("clerk seems to fire much
+# faster than the interval, maybe continuously" — then, once that was
+# traced to a grace-window bug and fixed, the direct follow-up "why not
+# have the counter restart only after the clerk session finishes").
+# That follow-up is a genuinely better design for THIS job, not just a
+# preference: the OLD fixed-clock-window scheme (mirroring ai.mega_
+# analysis.is_due's own once-daily version — a reasonable shape to COPY
+# at the time, but that job genuinely needs calendar-day alignment,
+# which this one never did) marked a window "ran" using the run's own
+# COMPLETION time, not its start time. A run that starts in window
+# [15:00-15:04] but takes 6 minutes (slow local-LLM calls are common in
+# this account's own logs) completes at 15:06 — inside the NEXT window,
+# [15:05-15:09] — so THAT fresh window gets silently marked "already
+# ran" by a check that was really answering the PREVIOUS window's
+# question, and the window it actually started in never gets marked at
+# all. A rolling cooldown sidesteps this whole class of bug entirely:
+# "due" simply means "at least `interval` minutes have passed since the
+# last run finished," which is exactly what a repeating check wants and
+# needs no fixed clock alignment, no grace-window sizing, and no
+# separate bucket-key bookkeeping to keep in sync with it.
 
 
 def is_execution_due(now_utc: datetime, state: dict | None = None) -> bool:
-    """True only within the first CLERK_EXECUTION_GRACE_MINUTES minutes
-    of a review-frequency-sized window this job hasn't already run in —
-    the same trigger/grace-window/dedup shape as ai.mega_analysis.is_due's
-    daily version, just keyed on a fixed-size recurring window instead of
-    one clock time per day, since this job's own OS-level poll interval
-    is set at the Task Scheduler level, not here. Direct user request
-    2026-08-23: originally hourly, tightened to check more often since
-    the work itself is cheap; the frequency itself became user-editable
-    (read_clerk_execution_interval_minutes) the same day."""
+    """True once at least the configured review-frequency (read_clerk_
+    execution_interval_minutes) has elapsed since the last run's own
+    real completion (state["last_run_completed_utc"]) — or immediately,
+    if this job has never completed a run before. A pure rolling
+    cooldown: however long a given run actually takes, the NEXT one is
+    always due exactly `interval` minutes after THAT run finished, never
+    sooner and never meaningfully later (bounded only by however often
+    clerk_execution_job.py's own OS-level/tray-timer poll actually
+    lands) — see this section's own module-level comment for the real
+    incident (a slow run silently consuming the wrong window's dedup
+    slot) this replaced a fixed-clock-window scheme to fix."""
     state = state if state is not None else read_execution_state()
+    last_completed = state.get("last_run_completed_utc")
+    if not last_completed:
+        return True
+    try:
+        last_completed_dt = datetime.fromisoformat(last_completed)
+    except ValueError:
+        return True
     interval = read_clerk_execution_interval_minutes()
-    current_interval_key = _interval_start(now_utc).isoformat()
-    if state.get("last_run_interval_utc") == current_interval_key:
-        return False
-    return now_utc.minute % interval <= config.CLERK_EXECUTION_GRACE_MINUTES
+    return now_utc >= last_completed_dt + timedelta(minutes=interval)
 
 
 def next_execution_check_utc(now_utc: datetime, state: dict | None = None) -> datetime:
     """Best-effort next execution-check instant, purely for display (the
     real trigger is clerk_execution_job.py's own OS-level poll, not a
-    precise clock instant): `now_utc` itself if the current window hasn't
-    run yet (i.e. due now, or as soon as the next OS-level poll lands),
-    otherwise the start of the next review-frequency window."""
+    precise clock instant): `now_utc` itself if a check is already due
+    (i.e. due now, or as soon as the next OS-level poll lands), otherwise
+    `interval` minutes after the last run's own real completion."""
     state = state if state is not None else read_execution_state()
-    interval = read_clerk_execution_interval_minutes()
-    current_start = _interval_start(now_utc)
-    if state.get("last_run_interval_utc") != current_start.isoformat():
+    if is_execution_due(now_utc, state=state):
         return now_utc
-    return current_start + timedelta(minutes=interval)
+    last_completed_dt = datetime.fromisoformat(state["last_run_completed_utc"])
+    interval = read_clerk_execution_interval_minutes()
+    return last_completed_dt + timedelta(minutes=interval)
 
 
 def _mark_interval_ran(now_utc: datetime) -> None:
     prior = read_execution_state()
-    prior["last_run_interval_utc"] = _interval_start(now_utc).isoformat()
+    prior["last_run_completed_utc"] = now_utc.isoformat()
     try:
         Path(config.CLERK_EXECUTION_STATE_FILE).write_text(json.dumps(prior, indent=2))
     except OSError as e:
@@ -677,6 +735,23 @@ def _detect_newly_closed_symbols(old_settled: dict, new_settled: dict) -> list[s
     return newly_closed
 
 
+def _detect_newly_filled_symbols(old_settled: dict, new_settled: dict) -> list[tuple[str, dict]]:
+    """Trade Journal support (direct user request 2026-09-19): the same
+    "transition detection" pattern as _detect_newly_closed_symbols
+    above, one state earlier — "order_placed" to "filled". Returns the
+    new record alongside the symbol (not just the symbol) since the
+    caller needs order_ticket/entry.price from it, and this function is
+    the one place that already knows exactly which records qualify."""
+    newly_filled = []
+    for symbol, new_rec in new_settled.items():
+        if new_rec.get("state") != "filled":
+            continue
+        old_rec = old_settled.get(symbol)
+        if old_rec is not None and old_rec.get("state") == "order_placed":
+            newly_filled.append((symbol, new_rec))
+    return newly_filled
+
+
 def _compute_realized_r(entry: dict, open_price: float, close_price: float) -> float | None:
     """Realized R-multiple from the position's own ORIGINAL recorded stop
     distance (entry["stop_loss"]) against its real close price — None
@@ -752,7 +827,10 @@ def _export_closed_trade_notes(newly_closed_symbols: list[str], old_settled: dic
         now_utc = datetime.now(timezone.utc)
         closed_trades_by_symbol: dict[str, ClosedTrade] = {}
         try:
-            deals = get_history_deals(now_utc - timedelta(days=7), now_utc)
+            # No explicit date_to: get_history_deals' own default deliberately reaches a day into
+            # the future to absorb the broker's server-clock skew — passing `now_utc` here excluded a
+            # just-closed deal, so every closure came back P&L-less (real bug, 2026-09-22).
+            deals = get_history_deals(now_utc - timedelta(days=7))
             for t in group_closed_trades(deals):
                 closed_trades_by_symbol.setdefault(t.symbol, t)  # already newest-first
         except Exception:
@@ -779,6 +857,144 @@ def _export_closed_trade_notes(newly_closed_symbols: list[str], old_settled: dic
                 )
     except Exception:
         logger.warning("Vault trade-journal export failed this poll (cosmetic only, continuing).", exc_info=True)
+
+
+def _determine_close_cause(entry: dict, closed_trade: ClosedTrade | None, story) -> str:
+    """Best-effort classification of why a trade closed. The Trade
+    Journal's own last recorded tactical action (a Clerk EXIT genuinely
+    applied shortly before this poll noticed the close) takes priority
+    over inferring from price — it's a direct causal record, not a
+    guess. Falls back to comparing the real close price against the
+    ORIGINALLY recorded stop/target (a real, if imperfect, proxy — a
+    stop/target amended mid-life by a tactical action would need
+    comparing against its latest value instead, which is out of scope
+    here) before giving up and calling it manual/unknown rather than
+    fabricating a specific cause it can't actually support."""
+    if story is not None:
+        for event in reversed(story.events):
+            if event.type == "tactical_action" and event.data.get("tier") == "exit" and event.data.get("applied"):
+                return "clerk_tactical_exit"
+    if closed_trade is not None:
+        stop_loss = entry.get("stop_loss")
+        take_profit = entry.get("take_profit")
+        close_price = closed_trade.close_price
+        tolerance = close_price * 0.001  # 0.1% of price -- real fills rarely land exactly on the level
+        if stop_loss and abs(close_price - stop_loss) <= tolerance:
+            return "stop_loss_hit"
+        if take_profit and abs(close_price - take_profit) <= tolerance:
+            return "take_profit_hit"
+    return "manual_or_unknown"
+
+
+def _maybe_register_continuation_watch(symbol: str, story_id: str, closed_trade: ClosedTrade) -> None:
+    """Continuation Watch (2026-09-28 plan, point 1): only ever called right above for a WINNING close.
+    Best-effort, same posture as the rest of this function's own callers — a failure here must never break
+    real close-journaling, so it gets its own try/except and never propagates."""
+    try:
+        if not config.CONTINUATION_WATCH_ENABLED:
+            return
+        atr_window = fetch_mt5_price_history_range(
+            symbol, "M5", closed_trade.closed_at - timedelta(hours=2), closed_trade.closed_at,
+        )
+        atr_at_close = compute_atr(atr_window) if not atr_window.empty else None
+        continuation_hunter.register_watch(
+            symbol, story_id, closed_trade.side, closed_trade.close_price, closed_trade.closed_at, atr_at_close,
+        )
+    except Exception:
+        logger.warning("Continuation watch: could not register a watch for %s (cosmetic only).", symbol, exc_info=True)
+
+
+def _record_trade_journal_closures(newly_closed_symbols: list[str], old_settled: dict) -> None:
+    """Trade Journal support (direct user request 2026-09-19): a
+    separate, parallel best-effort side effect alongside
+    _export_closed_trade_notes above — deliberately NOT a modification
+    of that function, so its own existing behavior/tests stay completely
+    untouched. Does its own independent MT5 deal-history fetch (same
+    pattern; the real duplicate cost is negligible since this only runs
+    on an actual close, not every poll) rather than sharing state with
+    that function, keeping the two fully decoupled."""
+    if not newly_closed_symbols:
+        return
+    try:
+        now_utc = datetime.now(timezone.utc)
+        closed_trades_by_symbol: dict[str, ClosedTrade] = {}
+        try:
+            # No explicit date_to: get_history_deals' own default deliberately reaches a day into
+            # the future to absorb the broker's server-clock skew — passing `now_utc` here excluded a
+            # just-closed deal, so every closure came back P&L-less (real bug, 2026-09-22).
+            deals = get_history_deals(now_utc - timedelta(days=7))
+            for t in group_closed_trades(deals):
+                closed_trades_by_symbol.setdefault(t.symbol, t)
+        except Exception:
+            logger.warning(
+                "Trade journal: could not fetch MT5 deal history this poll — "
+                "closed events below will degrade to a bare P&L-less record.", exc_info=True,
+            )
+        for symbol in newly_closed_symbols:
+            try:
+                entry = old_settled.get(symbol, {}).get("entry", {})
+                closed_trade = closed_trades_by_symbol.get(symbol)
+                story = trade_journal.find_open_story(symbol)
+                cause = _determine_close_cause(entry, closed_trade, story)
+                net_pnl = closed_trade.profit if closed_trade is not None else None
+                trade_journal.record_closed(symbol, net_pnl, cause)
+                if net_pnl is not None and net_pnl > 0 and story is not None and closed_trade is not None:
+                    _maybe_register_continuation_watch(symbol, story.story_id, closed_trade)
+            except Exception:
+                logger.warning("Trade journal: record_closed failed for %s (cosmetic only).", symbol, exc_info=True)
+    except Exception:
+        logger.warning("Trade journal: closure recording failed this poll (cosmetic only).", exc_info=True)
+
+
+def _reconcile_journal_unknown_closures(settled: dict) -> None:
+    """Retries P&L matching for journal stories that closed with no
+    matching MT5 deal at the time (status "closed_unknown"). Cheap when
+    there's nothing to fix: no MT5 call unless such a story exists."""
+    try:
+        if not trade_journal.has_unknown_closures():
+            return
+        now_utc = datetime.now(timezone.utc)
+        closed_trades = group_closed_trades(get_history_deals(now_utc - timedelta(days=7)))
+
+        def _cause(closed_trade: ClosedTrade, story) -> str:
+            record = settled.get(story.symbol) or {}
+            entry = dict(record.get("entry") or {})
+            live_stop = (record.get("tactical") or {}).get("last_stop_loss")
+            if live_stop:
+                entry["stop_loss"] = live_stop
+            return _determine_close_cause(entry, closed_trade, story)
+
+        reconciled = trade_journal.reconcile_unknown_closures(closed_trades, _cause)
+        if config.CLERK_VAULT_JOURNAL_ENABLED:
+            for story, closed_trade in reconciled:
+                _repair_closed_trade_note(story, closed_trade, (settled.get(story.symbol) or {}).get("entry"))
+    except Exception:
+        logger.warning("Trade journal: unknown-closure reconciliation failed this poll (cosmetic only).", exc_info=True)
+
+
+def _repair_closed_trade_note(story, closed_trade: ClosedTrade, settled_entry: dict | None) -> None:
+    """Rewrites the vault's Trades/ note that was written P&L-less when
+    this story's close was first noticed (its filename carries the close
+    poll's own timestamp, same as the journal's `closed` event) now that
+    the real deal is matched. No note found -> nothing to repair."""
+    try:
+        closed_event = next((e for e in reversed(story.events) if e.type == "closed"), None)
+        if closed_event is None:
+            return
+        stamp = datetime.fromisoformat(closed_event.timestamp_utc).astimezone(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+        vault_dir = Path(config.OBSIDIAN_VAULT_PATH) / "Trades"
+        for path in vault_dir.glob(f"{story.symbol} {stamp} *.md"):
+            summary = trade_journal.summarize_story(story)
+            entry = dict(settled_entry) if settled_entry else {
+                "side": summary["side"], "price": summary["planned_price"], "stop_loss": summary["planned_stop"],
+                "take_profit": summary["planned_target"], "reason": summary["thesis"],
+                "invalidation_condition": summary["invalidation_condition"],
+            }
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            tmp_path.write_text(_format_closed_trade_note(story.symbol, entry, closed_trade), encoding="utf-8")
+            os.replace(tmp_path, path)
+    except Exception:
+        logger.warning("Vault trade note repair failed for %s (cosmetic only).", story.symbol, exc_info=True)
 
 
 def _backfill_settlement_for_held_positions(
@@ -927,7 +1143,9 @@ def _iter_stop_drift(
         if rec is None:
             continue
         tactical = rec.get("tactical") or {}
-        recorded_sl = tactical.get("persisted_stop_loss")
+        recorded_sl = tactical.get("sentinel_stop")
+        if recorded_sl is None:
+            recorded_sl = tactical.get("persisted_stop_loss")
         if recorded_sl is None:
             recorded_sl = (rec.get("entry") or {}).get("stop_loss")
         if recorded_sl is None:
@@ -1175,6 +1393,24 @@ def _allocation_entry_from_dict(d: dict) -> AllocationEntry:
         side=d.get("side", "buy"),
         reason=d.get("reason", ""),
         invalidation_condition=d.get("invalidation_condition"),
+        entry_mode=normalise_entry_mode(d.get("entry_mode")),
+    )
+
+
+def _apply_persisted_tactical(entry: AllocationEntry, tactical: dict | None) -> AllocationEntry:
+    """The persisted tactical state (a DEFEND's reduced risk %, tightened stop and target) laid over a settlement-record entry.
+    The immediate-allocation branch of _build_carried_forward_allocation always did this; the pending-setup-origin branches read
+    rec["entry"] as-is, so on the poll AFTER a DEFEND the baseline snapped back to the ORIGINAL stop and size and the plan
+    amended a trailed stop back out (or re-bought a partial close). Only ever tightens: applies when the persisted risk is
+    below the entry's own."""
+    tactical = tactical or {}
+    persisted_pct = tactical.get("persisted_pct")
+    if persisted_pct is None or persisted_pct >= entry.pct:
+        return entry
+    return _with_changes(
+        entry, pct=persisted_pct,
+        stop_loss=tactical.get("persisted_stop_loss", entry.stop_loss),
+        take_profit=tactical.get("persisted_take_profit", entry.take_profit),
     )
 
 
@@ -1292,7 +1528,9 @@ def _build_carried_forward_allocation(
         if rec is not None and rec.get("origin") == "pending_setup" and (
             rec.get("state") == "filled" or symbol in held_symbols
         ):
-            carried[symbol] = _allocation_entry_from_dict(rec["entry"])
+            carried[symbol] = apply_sentinel_ratchet(
+                _apply_persisted_tactical(_allocation_entry_from_dict(rec["entry"]), rec.get("tactical")), rec.get("tactical")
+            )
             continue
         entry = _allocation_entry_from_dict(raw)
         tactical = (rec or {}).get("tactical") or {}
@@ -1306,15 +1544,18 @@ def _build_carried_forward_allocation(
                 side=entry.side,
                 reason=f"{entry.reason} (tactically reduced to {persisted_pct:.2f}% risk this session)",
                 invalidation_condition=entry.invalidation_condition,
+                entry_mode=entry.entry_mode,
             )
-        carried[symbol] = entry
+        carried[symbol] = apply_sentinel_ratchet(entry, tactical)
 
     for symbol, rec in settled.items():
         if symbol in carried or symbol in immediate_allocation_raw:
             continue
         if rec.get("state") != "filled" and symbol not in held_symbols:
             continue
-        carried[symbol] = _allocation_entry_from_dict(rec["entry"])
+        carried[symbol] = apply_sentinel_ratchet(
+            _apply_persisted_tactical(_allocation_entry_from_dict(rec["entry"]), rec.get("tactical")), rec.get("tactical")
+        )
 
     return carried
 
@@ -1351,43 +1592,60 @@ def parse_clerk_verdict(response_text: str) -> bool:
     return matches[-1].upper() == "CONFIRMED"
 
 
-# Per-symbol news cache for the Clerk's pending-setup verdict prompt —
-# see config.CLERK_NEWS_CACHE_MINUTES's own comment for why this is
-# cached rather than fetched fresh every poll. Module-level and
-# unbounded: the real key set is just Market Watch's own symbol count
-# (already capped, single digits to low dozens), never unbounded growth.
-_clerk_news_cache: dict[str, tuple[datetime, str]] = {}
-
-
 def _fetch_clerk_news_block(symbol: str, description: str) -> str:
     """Real, live headlines for `symbol` — closes the real gap where the
     Clerk's verdict prompt invited "checking for major news" but neither
     local model (qwen3:8b/phi4-mini) can actually browse the web (see
-    _run_clerk_prompt's own docstring). Mirrors ai.portfolio_suggest's
-    own mega-session fetch (fetch_recent_headlines via a resolved Yahoo
-    ticker) rather than ai.researcher's heavier multi-source one — see
-    config.CLERK_NEWS_CACHE_MINUTES's own comment for why.
+    _run_clerk_prompt's own docstring).
 
-    Cached per symbol for config.CLERK_NEWS_CACHE_MINUTES; safe to call
-    from inside the tactical/verdict thread pool (plain HTTP via
-    yfinance, no MT5 involvement, same thread-safety class as the LLM
-    calls already made from there). Returns "" (never fabricated) when
-    no Yahoo ticker resolves for this symbol or the real fetch comes
-    back empty — the caller renders an honest "no recent headlines
-    found" placeholder for that case, same convention as
-    ai.researcher's "(no category-specialty feed for ...)"."""
-    now = datetime.now(timezone.utc)
-    cached = _clerk_news_cache.get(symbol)
-    if cached is not None and (now - cached[0]) < timedelta(minutes=config.CLERK_NEWS_CACHE_MINUTES):
-        return cached[1]
-    block = ""
-    resolved = resolve_yahoo_ticker(symbol, description)
-    if resolved is not None:
-        _, yahoo_ticker = resolved
-        headlines = fetch_recent_headlines(yahoo_ticker, limit=config.NEWS_HEADLINES_PER_ASSET)
-        block = "\n".join(f"- {title}" for title in headlines)
-    _clerk_news_cache[symbol] = (now, block)
-    return block
+    Real bug fixed 2026-09-20: this used to resolve `symbol` via data.
+    underlying.resolve_yahoo_ticker (a PMEX-symbol keyword map matched
+    against `description`) — confirmed live against this account's real
+    symbol mix that 17 of 22 symbols (77%) silently resolved to NO
+    ticker at all under it (every equity/forex/crypto symbol; only a
+    couple of metals/commodities worked, by coincidence, since their MT5
+    description happens to literally contain a matching keyword like
+    "Gold"). Now delegates entirely to data.symbol_news.get_symbol_
+    news_block, the same shared fetch/cache/vault-history Researcher and
+    Mega Session use — this is also where "avoid double-calling the same
+    symbol's news" is actually solved: Clerk, Researcher, and Mega
+    Session now share ONE cache (config.SYMBOL_NEWS_CACHE_MINUTES),
+    keyed by the real Yahoo ticker, regardless of which of the three
+    resolves/asks for it first. `description` is now ALSO passed straight
+    through to get_symbol_news_block's own "intelligent search" fallback
+    (added 2026-09-20) — a symbol whose category matches no known ticker
+    convention still gets real news via a Google search built from this
+    same real MT5 description, instead of nothing.
+
+    Returns "" (never fabricated) when no news resolves for this symbol
+    (precisely or via the generic fallback) or the real fetch comes back
+    empty on every source — the caller renders an honest "no recent
+    headlines found" placeholder for that case, same convention as ai.
+    researcher's own "(no category-specialty feed for ...)"."""
+    category = get_symbol_category(symbol)
+    items = symbol_news.get_symbol_news_block(
+        symbol, category, limit=config.NEWS_HEADLINES_PER_ASSET, description=description
+    )
+    return "\n".join(f"- {item['title']}" for item in items)
+
+
+# Shared by all three local-LLM prompts (verdict / invalidation / tactical) —
+# intraday decision-tier upgrade, 2026-09-24: the technical context they are
+# handed is now split into a DECISION TIER (M5 only — H1 joined the context
+# tier the same day) and a CONTEXT TIER (D1/H4/H1), and the trigger/invalidation
+# conditions Claude writes are now in M5 terms.
+_TIMEFRAME_ROLES_NOTE = (
+    "TIMEFRAME ROLES: the technical picture below is split into two tiers. The DECISION TIER "
+    "(M5 only) is what you judge triggers, invalidation conditions, stops, targets and "
+    "defense against — the senior analyst wrote them in M5 terms (levels, trigger and timing all "
+    "come from the M5 read). The CONTEXT TIER (D1/H4/H1) is regime context only: use it to say "
+    "whether the setup is WITH or AGAINST the larger trend, never to decide that an M5 condition "
+    "has or has not happened. EXCEPTION for older setups: a trigger or invalidation condition that "
+    "the senior analyst explicitly wrote on H1, H4 or D1 (setups carried over from before this "
+    "timeframe split) is judged against that named timeframe's read in the context tier — do not call "
+    "it unevaluable just because it is not an M5 condition. If an 'Upcoming High-impact events' line "
+    "appears for this instrument, say so plainly in your reasoning."
+)
 
 
 def _build_verdict_prompt(
@@ -1435,11 +1693,12 @@ def _build_verdict_prompt(
         "no longer a valid trade — this line is what a human will see "
         "in the UI and the log, so make it clear and specific, not "
         "generic.\n\n"
-        f"{technical_context}\n\n"
+        f"{_TIMEFRAME_ROLES_NOTE}\n\n{technical_context}\n\n"
         f"Recent headlines for {setup.symbol}:\n"
         f"{news_block if news_block else '(no recent headlines found)'}\n\n"
         f"Account equity for context: {account_equity:.2f}. This does "
         "not change your verdict on the trigger itself.\n\n"
+        "Keep your reasoning short (at most four sentences). "
         "End your response with exactly one line, and nothing after "
         'it: either "FINAL_VERDICT: CONFIRMED" or "FINAL_VERDICT: '
         'NOT_CONFIRMED". Do not use this exact token anywhere else in '
@@ -1448,7 +1707,7 @@ def _build_verdict_prompt(
 
 
 def _fetch_technical_context(
-    symbol: str, market_prices: dict, account_equity: float
+    symbol: str, market_prices: dict, account_equity: float, lean: bool = False
 ) -> tuple[FtmoAssetAnalysis, str] | None:
     """The MT5-bound half of checking one symbol — fetches its live
     4-timeframe technicals (analyze_ftmo_asset_live) and formats them
@@ -1499,9 +1758,20 @@ def _fetch_technical_context(
     asset = market_prices.get(symbol)
     if asset is None:
         return None
-    analysis = analyze_ftmo_asset_live(symbol, asset.bid, asset.ask, asset.description)
+    analysis = (
+        analyze_ftmo_asset_live(symbol, asset.bid, asset.ask, asset.description, lean=True)
+        if lean else analyze_ftmo_asset_live(symbol, asset.bid, asset.ask, asset.description)
+    )
+    now = datetime.now(timezone.utc)
+    try:
+        calendar_events = economic_calendar.fetch_calendar_events(now)
+    except Exception:
+        calendar_events = []
+    if config.CLERK_COMPACT_CONTEXT:
+        return analysis, format_clerk_context(analysis, calendar_events=calendar_events, now_utc=now)
     return analysis, format_ftmo_asset_context(
-        [analysis], account_equity=account_equity, include_favorable_excursion=False, include_market_status=False
+        [analysis], account_equity=account_equity, include_favorable_excursion=False, include_market_status=False,
+        calendar_events=calendar_events, now_utc=now,
     )
 
 
@@ -1534,6 +1804,69 @@ def _fetch_technical_context(
 # is worse than no backup: gemma4:12b was the most reliable model tested
 # but too slow to be USABLE as a fallback in this job's own timeframe,
 # so it was removed from this machine's Ollama install entirely.
+_HTF_CONDITION_RE = re.compile(r"\b(d1|h4|h1|1h|4h|daily|weekly)\b", re.IGNORECASE)
+
+
+def _condition_needs_htf(condition: str | None) -> bool:
+    """True when the analyst wrote a trigger / invalidation condition on H1, H4 or D1 (older setups): judging it needs the higher-
+    timeframe reads the compact Clerk context leaves out."""
+    return bool(condition and _HTF_CONDITION_RE.search(condition))
+
+
+def _context_for_condition(analysis, compact_context: str, condition: str | None, account_equity: float) -> str:
+    """The compact context, or the FULL one when `condition` is written on a higher timeframe. Falls back to the compact text if
+    the full formatting cannot be built."""
+    if not (config.CLERK_COMPACT_CONTEXT and _condition_needs_htf(condition)):
+        return compact_context
+    try:
+        now = datetime.now(timezone.utc)
+        try:
+            events = economic_calendar.fetch_calendar_events(now)
+        except Exception:
+            events = []
+        return format_ftmo_asset_context(
+            [analysis], account_equity=account_equity, include_favorable_excursion=False, include_market_status=False,
+            calendar_events=events, now_utc=now,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("Could not build the full context for a higher-timeframe condition - using the compact one.", exc_info=True)
+        return compact_context
+
+
+_STRICT_M5_INVALIDATION_RE = re.compile(
+    r"^\s*(?:the\s+)?m5\s+(?:candle\s+)?close[sd]?\s+(?:back\s+)?(above|below)\s+\$?(\d[\d,]*(?:\.\d+)?)\s*\.?\s*$", re.IGNORECASE
+)
+
+
+def deterministic_invalidation(entry_raw: dict, condition: str | None, analysis) -> tuple[bool, str] | None:
+    """(confirmed, reasoning text) for an invalidation condition that is PURELY mechanical - "M5 closes above 64.49" for a sell,
+    "M5 closes below 745.54" for a buy - decided from the last COMPLETED M5 close, with no model call; None for anything else
+    (extra clauses, another timeframe, a level on the favourable side), which the model still judges. The model used to be
+    asked "did the M5 close beyond X?" - a comparison Python does exactly, and a call that cost 15-250 seconds."""
+    if not config.CLERK_DETERMINISTIC_INVALIDATION or not condition:
+        return None
+    match = _STRICT_M5_INVALIDATION_RE.match(condition)
+    if match is None:
+        return None
+    direction, level = match.group(1).lower(), float(match.group(2).replace(",", ""))
+    side = (entry_raw or {}).get("side")
+    if not ((side == "sell" and direction == "above") or (side == "buy" and direction == "below")):
+        return None
+    bars = getattr(analysis, "m5_recent", None)
+    if bars is None or len(bars) == 0 or "Close" not in bars.columns:
+        return None
+    last_close = float(bars["Close"].iloc[-1])
+    confirmed = last_close > level if direction == "above" else last_close < level
+    verdict = "CONFIRMED" if confirmed else "NOT_CONFIRMED"
+    text = (
+        _DETERMINISTIC_CIRCUIT_BREAKER_PREFIX
+        + f"Invalidation \"{condition.strip()}\": the last completed M5 close is {last_close:.5g} against the level {level:.5g} - "
+        + ("it HAS closed beyond it." if confirmed else "it has not closed beyond it.")
+        + f"\n\nFINAL_VERDICT: {verdict}"
+    )
+    return confirmed, text
+
+
 def _run_clerk_prompt(prompt: str, timeout: int) -> str:
     """Runs `prompt` through the Clerk's primary local model
     (config.CLERK_PRIMARY_MODEL, thinking disabled) and, only if that's
@@ -1563,7 +1896,10 @@ def _run_clerk_prompt(prompt: str, timeout: int) -> str:
     most informative single failure to surface), and the existing
     fail-safe verdict parsing still applies — a total outage still
     resolves to NOT_CONFIRMED/HOLD, never a silent guess."""
-    raw = run_ollama(prompt, model=config.CLERK_PRIMARY_MODEL, timeout=timeout)
+    raw = run_ollama(
+        prompt, model=config.CLERK_PRIMARY_MODEL, timeout=timeout, keep_alive=config.CLERK_LLM_KEEP_ALIVE,
+        max_tokens=config.CLERK_LLM_MAX_TOKENS,
+    )
     if raw != OLLAMA_FAILED_MESSAGE:
         return raw
     backup_raw = run_ollama(prompt, model=config.CLERK_BACKUP_MODEL, timeout=timeout)
@@ -1709,9 +2045,11 @@ def _build_invalidation_prompt(
         "inconclusive or only partially matches the stated condition, "
         "that means NOT_CONFIRMED — the condition must have genuinely, "
         "unambiguously occurred, not merely be trending toward occurring.\n\n"
-        f"{technical_context}\n\n"
+        f"{_TIMEFRAME_ROLES_NOTE}\n\n{technical_context}\n\n"
         f"Account equity for context: {account_equity:.2f}. This does not "
         "change your verdict on the condition itself.\n\n"
+        "Keep your reasoning SHORT - at most two sentences, naming the level and the latest M5 price or close you compared - "
+        "then the final line. "
         "End your response with exactly one line, and nothing after it: "
         'either "FINAL_VERDICT: CONFIRMED" (the invalidation condition has '
         'genuinely occurred — this position should be exited/cancelled '
@@ -1952,6 +2290,66 @@ class TacticalSignals:
     # the whole point being that a self-acknowledged, sustained
     # contradiction shouldn't be allowed to just keep getting HELD.
     trend_flip_against_count: int = 0
+    # --- added 2026-09-18: direct user request for occasional small,
+    # real, realized-profit events (a new, aspirant trader's own stated
+    # need), separate from and much earlier than partial_profit_due's own
+    # 50%-of-target milestone above, which is only ever advisory and has
+    # never reliably converted into a real banked gain. A PERSISTED,
+    # ONE-TIME sticky flag (unlike trend_flip_against_count, which
+    # decays) — once True, stays True for the life of this settled
+    # position; see _run_clerk_tactical_check's own deterministic
+    # circuit breaker for it and config.CLERK_QUICK_PROFIT_LOCK_COST_
+    # MULTIPLE's own comment for why 3x real round-trip cost, not a
+    # guessed flat percentage.
+    quick_profit_lock_due: bool = False
+    # --- added 2026-09-21, Phase 5c of the charting-expert technical-
+    # analysis upgrade: the most recent real BOS/CHOCH structure break
+    # and liquidity sweep on H1 (analysis.chart_structure.detect_
+    # structure_breaks/detect_liquidity_sweeps, Phase 2/3 of that same
+    # upgrade) — pulled out of technical_context's own buried prose the
+    # same way nearest_resistance/nearest_support already were above, so
+    # a genuine "structure just changed against you" fact can't get lost
+    # among the ~15 other lines per timeframe. Distinct from, not a
+    # replacement for, trend_flip_against_count: a CHOCH is a one-shot
+    # structural EVENT (it either happened recently or it didn't), while
+    # trend_flip_against_count tracks SUSTAINED contradiction building up
+    # poll over poll — genuinely complementary signals, not redundant
+    # ones (see _build_tactical_prompt's own comment for how both are
+    # surfaced together).
+    nearest_structure_break: StructureBreak | None = None
+    nearest_liquidity_sweep: LiquiditySweepEvent | None = None
+    # --- added 2026-09-24, intraday decision-tier upgrade; re-based on M5 ONLY the same day (H1/H4/D1 are
+    # context). The ATR stop candidate is sized off the M5 ATR (atr_timeframe says which ATR was
+    # actually used — "H1" only when no M5 read exists), velocity is classified from the M5 ATR%,
+    # nearest_resistance/nearest_support and the structure break/sweep come from the M5 structure
+    # (structure_timeframe says which; "H1" only when no M5 read exists), the trend-flip circuit
+    # breaker reads the M5 trend+regime (trend_flip_basis says which; "H1+H4" only when no M5 read
+    # exists), and defense gets the M5 RSI and a structure-trail stop candidate (just beyond the
+    # nearest M5 support/resistance). H1/H4 RSI stay in the prompt as context lines.
+    m5_atr: float | None = None
+    atr_timeframe: str = "H1"
+    structure_timeframe: str = "H1"
+    trend_flip_basis: str = "H1+H4"
+    velocity_timeframe: str = "H1"  # "M5" when velocity came from the median M5 ATR%, else the H1 fallback
+    m5_rsi: float | None = None
+    m5_rsi_tier: str | None = None
+    nearest_m5_resistance: SRLevel | None = None
+    nearest_m5_support: SRLevel | None = None
+    structure_trail_candidate: float | None = None
+    structure_trail_is_tighter: bool | None = None
+    event_note: str | None = None
+    # --- added 2026-09-25 (position-hunting review): deterministic profit trail. MEASURED on 20 real symbols x
+    # 6000 M5 bars (38,960 paired random trades, stop 2 ATR / target 2R / hold 96 bars, spread charged): a stop
+    # trailed 1.5 M5 ATR behind the price once the trade is +1R improved net expectancy from -0.174R to -0.148R
+    # (17/20 symbols), better than breakeven-at-1R (-0.163R, 16/20), partial-50%+breakeven (-0.155R, 16/20) and
+    # breakeven-at-1.5R (-0.172R, 13/20), while lifting the win share from 34% to 48%. `profit_trail_r0` is the
+    # trade's ORIGINAL risk distance (persisted in the tactical state, since a later tightened stop would shrink
+    # it), `profit_trail_r` the current progress in those R, `profit_trail_stop` the stop to ratchet to (None
+    # unless the trade is past config.CLERK_PROFIT_TRAIL_START_R AND the new stop is tighter than the current one
+    # by at least config.CLERK_PROFIT_TRAIL_MIN_STEP_ATR M5 ATR).
+    profit_trail_r0: float | None = None
+    profit_trail_r: float | None = None
+    profit_trail_stop: float | None = None
 
 
 def _compute_tactical_signals(
@@ -1962,6 +2360,12 @@ def _compute_tactical_signals(
     h1_structure: ChartStructureSnapshot | None = None,
     base: AssetAnalysis | None = None,
     prior_tactical: dict | None = None,
+    trade_cost: TradeCost | None = None,
+    m5_stats: TechnicalStats | None = None,
+    m5_structure: ChartStructureSnapshot | None = None,
+    event_note: str | None = None,
+    intraday_backtests: IntradayBacktests | None = None,
+    m5_atr_pct_median: float | None = None,
 ) -> TacticalSignals:
     """Pure, no-I/O — every input is already-fetched data the caller
     holds (never entry.price: that's the mega-session's OWN suggestion
@@ -2015,16 +2419,35 @@ def _compute_tactical_signals(
 
     h1_atr = h1_stats.atr if h1_stats is not None else None
     h1_atr_pct = h1_stats.atr_pct if h1_stats is not None else None
-    velocity_tier = classify_velocity_tier(h1_atr_pct)
-    atr_stop_multiple_used = (
-        config.CLERK_TACTICAL_ATR_STOP_MULTIPLE_FAST
-        if velocity_tier == "fast"
-        else config.CLERK_TACTICAL_ATR_STOP_MULTIPLE
-    )
+    # Decision-tier basis: the M5 ATR with the M5 multiples (2.0x, 3.0x fast — the same stop distance the
+    # earlier 1.5x/2.5x M15 ATR gave); the H1-era 1.5x/2.5x multiples apply only when no M5 read exists.
+    m5_atr = m5_stats.atr if m5_stats is not None else None
+    use_m5_atr = m5_atr is not None and m5_atr > 0
+    # Velocity is a property of the instrument, so it is read from its MEDIAN M5 ATR% (a stable ~2-day
+    # baseline), never the instantaneous value that dips in quiet hours (audited: gold/copper/BTC would
+    # flip fast<->slow on 18-28% of bars); H1 ATR% only when no M5 baseline exists.
+    if m5_atr_pct_median is not None:
+        velocity_tier, velocity_timeframe = classify_m5_velocity_tier(m5_atr_pct_median), "M5"
+    else:
+        velocity_tier, velocity_timeframe = classify_velocity_tier(h1_atr_pct), "H1"
+    if use_m5_atr:
+        atr_stop_multiple_used = (
+            config.CLERK_TACTICAL_M5_ATR_STOP_MULTIPLE_FAST
+            if velocity_tier == "fast"
+            else config.CLERK_TACTICAL_M5_ATR_STOP_MULTIPLE
+        )
+    else:
+        atr_stop_multiple_used = (
+            config.CLERK_TACTICAL_ATR_STOP_MULTIPLE_FAST
+            if velocity_tier == "fast"
+            else config.CLERK_TACTICAL_ATR_STOP_MULTIPLE
+        )
     atr_stop_candidate: float | None = None
     atr_stop_is_tighter_than_current: bool | None = None
-    if h1_atr is not None:
-        distance = atr_stop_multiple_used * h1_atr
+    stop_atr = m5_atr if use_m5_atr else h1_atr
+    atr_timeframe = "M5" if use_m5_atr else "H1"
+    if stop_atr is not None:
+        distance = atr_stop_multiple_used * stop_atr
         if position.side == "buy":
             atr_stop_candidate = position.price_current - distance
             atr_stop_is_tighter_than_current = (
@@ -2057,6 +2480,20 @@ def _compute_tactical_signals(
         and days_held <= config.CLERK_TACTICAL_PARTIAL_PROFIT_MAX_DAYS
     )
 
+    # favorable_move_pct and trade_cost.spread_pct_of_price are both
+    # already expressed as a % of price_open (see Position.adverse_move_
+    # pct's own docstring and TradeCost's own field comment) — directly
+    # comparable with no unit conversion. A one-time, sticky flag (see
+    # TacticalSignals.quick_profit_lock_due's own comment) — once
+    # already_locked, never re-fires for this same settled position.
+    already_locked = (prior_tactical or {}).get("quick_profit_lock_done", False)
+    quick_profit_lock_due = (
+        not already_locked
+        and trade_cost is not None
+        and trade_cost.spread_pct_of_price > 0
+        and favorable_move_pct >= config.CLERK_QUICK_PROFIT_LOCK_COST_MULTIPLE * trade_cost.spread_pct_of_price
+    )
+
     # Nearest level on each side — resistance_levels are all ABOVE price
     # (distance_pct > 0, smallest = nearest), support_levels all BELOW
     # (distance_pct < 0, largest/least-negative = nearest) — see
@@ -2064,30 +2501,109 @@ def _compute_tactical_signals(
     # convention; this is a SEPARATE "nearest" read for tactical
     # relevance, not a re-ranking of that function's own "strongest
     # first" ordering.
+    # The structure read is the M5 one (decision timeframe); H1 only when the caller has no M5 read.
+    structure_source = m5_structure if m5_structure is not None else h1_structure
+    structure_timeframe = "M5" if m5_structure is not None else "H1"
     nearest_resistance: SRLevel | None = None
     nearest_support: SRLevel | None = None
-    if h1_structure is not None and h1_structure.sr_levels is not None:
-        if h1_structure.sr_levels.resistance_levels:
-            nearest_resistance = min(h1_structure.sr_levels.resistance_levels, key=lambda lvl: lvl.distance_pct)
-        if h1_structure.sr_levels.support_levels:
-            nearest_support = max(h1_structure.sr_levels.support_levels, key=lambda lvl: lvl.distance_pct)
+    if structure_source is not None and structure_source.sr_levels is not None:
+        if structure_source.sr_levels.resistance_levels:
+            nearest_resistance = min(structure_source.sr_levels.resistance_levels, key=lambda lvl: lvl.distance_pct)
+        if structure_source.sr_levels.support_levels:
+            nearest_support = max(structure_source.sr_levels.support_levels, key=lambda lvl: lvl.distance_pct)
+
+    # Most recent (smallest bars_ago) real structure break/liquidity
+    # sweep on the same structure read — see TacticalSignals.nearest_structure_break's own
+    # field comment for why this is pulled out of prose the same way
+    # nearest_resistance/nearest_support already were.
+    nearest_structure_break: StructureBreak | None = None
+    nearest_liquidity_sweep: LiquiditySweepEvent | None = None
+    if structure_source is not None:
+        if structure_source.structure_breaks:
+            nearest_structure_break = min(structure_source.structure_breaks, key=lambda b: b.bars_ago)
+        if structure_source.liquidity_sweeps:
+            nearest_liquidity_sweep = min(structure_source.liquidity_sweeps, key=lambda s: s.bars_ago)
+
+    nearest_m5_resistance: SRLevel | None = None
+    nearest_m5_support: SRLevel | None = None
+    structure_trail_candidate: float | None = None
+    structure_trail_is_tighter: bool | None = None
+    if m5_structure is not None and m5_structure.sr_levels is not None:
+        if m5_structure.sr_levels.resistance_levels:
+            nearest_m5_resistance = min(m5_structure.sr_levels.resistance_levels, key=lambda lvl: lvl.distance_pct)
+        if m5_structure.sr_levels.support_levels:
+            nearest_m5_support = max(m5_structure.sr_levels.support_levels, key=lambda lvl: lvl.distance_pct)
+    if use_m5_atr:
+        buffer = 0.4 * m5_atr  # ~0.25 of the old M15 ATR (median M15/M5 ATR ratio 1.42 -> 0.35; 0.4 rounds up)
+        if position.side == "buy" and nearest_m5_support is not None:
+            level = nearest_m5_support.low if nearest_m5_support.low is not None else nearest_m5_support.price
+            candidate = level - buffer
+            if candidate < position.price_current:
+                structure_trail_candidate = candidate
+                structure_trail_is_tighter = position.sl is None or candidate > position.sl
+        elif position.side == "sell" and nearest_m5_resistance is not None:
+            level = nearest_m5_resistance.high if nearest_m5_resistance.high is not None else nearest_m5_resistance.price
+            candidate = level + buffer
+            if candidate > position.price_current:
+                structure_trail_candidate = candidate
+                structure_trail_is_tighter = position.sl is None or candidate < position.sl
+    m5_rsi = m5_stats.rsi if m5_stats is not None else None
+
+    profit_trail_r0: float | None = None
+    profit_trail_r: float | None = None
+    profit_trail_stop: float | None = None
+    if config.CLERK_PROFIT_TRAIL_ENABLED and use_m5_atr:
+        r0 = trail_original_risk(
+            position.price_open, entry.stop_loss if entry is not None else None, position.sl,
+            (prior_tactical or {}).get("profit_trail_r0"),
+        )
+        decision = trail_decision(
+            position.side, position.price_open, position.price_current, position.sl, r0, m5_atr,
+            trade_cost.min_stop_distance_pct if trade_cost is not None else 0.0,
+        )
+        profit_trail_r0, profit_trail_r, profit_trail_stop = decision.r0, decision.progress_r, decision.new_stop
 
     backtest_favorability: str | None = None
     favorable_excursion_median_r: float | None = None
     if base is not None:
-        backtest_favorability, favorable_excursion_median_r = classify_backtest_favorability(
-            position.side,
-            base.rsi_overbought_backtest,
-            base.rsi_oversold_backtest,
-            base.support_resistance_backtest,
-            base.double_bottom_backtest,
-            base.double_top_backtest,
-        )
+        # M5 is the decision tier, so the M5 setups are judged against their random-entry baseline
+        # (a raw avg-R sign near the null result is not evidence). The D1 sign read stays only as the
+        # fallback for a symbol with no M5 backtest at all.
+        intraday = intraday_backtests if intraday_backtests is not None else IntradayBacktests()
+        m5_verdicts = {
+            key: verdict.verdict for key, verdict in intraday_edge_verdicts(intraday, position.side).items()
+        }
+        if m5_verdicts:
+            backtest_favorability, favorable_excursion_median_r = classify_backtest_favorability(
+                position.side,
+                intraday.rsi_overbought_backtest,
+                intraday.rsi_oversold_backtest,
+                intraday.support_resistance_backtest,
+                None,
+                None,
+                edge_verdicts=m5_verdicts,
+            )
+        else:
+            backtest_favorability, favorable_excursion_median_r = classify_backtest_favorability(
+                position.side,
+                base.rsi_overbought_backtest,
+                base.rsi_oversold_backtest,
+                base.support_resistance_backtest,
+                base.double_bottom_backtest,
+                base.double_top_backtest,
+            )
 
-    aligned_trend = aligned_h1_h4_trend_direction(
-        h4_stats.trend if h4_stats is not None else None,
-        h1_stats.trend if h1_stats is not None else None,
-    )
+    # Risk management reads the M5 trend+regime (aligned_m5_trend_direction); the H1+H4 alignment is
+    # only the fallback for a caller with no M5 read.
+    if m5_stats is not None and m5_stats.trend is not None:
+        aligned_trend = aligned_m5_trend_direction(m5_stats)
+        trend_flip_basis = "M5"
+    else:
+        aligned_trend = aligned_h1_h4_trend_direction(
+            h4_stats.trend if h4_stats is not None else None,
+            h1_stats.trend if h1_stats is not None else None,
+        )
+        trend_flip_basis = "H1+H4"
     trend_contradicts_position = (
         (position.side == "buy" and aligned_trend == "down")
         or (position.side == "sell" and aligned_trend == "up")
@@ -2116,6 +2632,24 @@ def _compute_tactical_signals(
         backtest_favorability=backtest_favorability,
         favorable_excursion_median_r=favorable_excursion_median_r,
         trend_flip_against_count=trend_flip_against_count,
+        quick_profit_lock_due=quick_profit_lock_due,
+        nearest_structure_break=nearest_structure_break,
+        nearest_liquidity_sweep=nearest_liquidity_sweep,
+        m5_atr=m5_atr,
+        atr_timeframe=atr_timeframe,
+        structure_timeframe=structure_timeframe,
+        trend_flip_basis=trend_flip_basis,
+        velocity_timeframe=velocity_timeframe,
+        m5_rsi=m5_rsi,
+        m5_rsi_tier=classify_rsi_tier(m5_rsi),
+        nearest_m5_resistance=nearest_m5_resistance,
+        nearest_m5_support=nearest_m5_support,
+        structure_trail_candidate=structure_trail_candidate,
+        structure_trail_is_tighter=structure_trail_is_tighter,
+        event_note=event_note,
+        profit_trail_r0=profit_trail_r0,
+        profit_trail_r=profit_trail_r,
+        profit_trail_stop=profit_trail_stop,
     )
 
 
@@ -2137,7 +2671,7 @@ def _build_tactical_prompt(
     or was already tried this cycle and the position kept deteriorating
     — the user's own exact framing, confirmed directly. Every DEFEND/
     EXIT must cite a specific book rule and specific real numbers."""
-    if prior_tactical:
+    if prior_tactical and (prior_tactical.get("defend_count") or prior_tactical.get("last_action_utc")):  # a Sentinel-only record is not a prior DEFEND
         history = (
             "This position has ALREADY had a tactical action taken on it this "
             f"mega-session cycle: {prior_tactical.get('defend_count', 0)} prior DEFEND "
@@ -2157,7 +2691,7 @@ def _build_tactical_prompt(
         f"({'tighter' if signals.atr_stop_is_tighter_than_current else 'NOT tighter'} "
         "than the current stop above)"
         if signals.atr_stop_candidate is not None
-        else "not available (insufficient H1 data for a live ATR reading)"
+        else "not available (insufficient data for a live ATR reading)"
     )
     # Added 2026-09-10 — real, repeated incident: the local tactical model
     # proposed a SELL's NEW_STOP_LOSS below the live market price six
@@ -2199,22 +2733,28 @@ def _build_tactical_prompt(
         else "not available (no take-profit set, or it equals the entry price)"
     )
     days_held_line = f"{signals.days_held:.2f}" if signals.days_held is not None else "unknown"
+    velocity_tf = signals.velocity_timeframe
+    standard_multiple = (
+        config.CLERK_TACTICAL_M5_ATR_STOP_MULTIPLE
+        if signals.atr_timeframe == "M5"
+        else config.CLERK_TACTICAL_ATR_STOP_MULTIPLE
+    )
     if signals.velocity_tier is None:
         velocity_line = (
-            "no live H1 ATR% reading is available to classify this instrument's velocity "
+            "no live ATR% baseline is available to classify this instrument's velocity "
             "— the standard ATR multiple applies"
         )
     elif signals.velocity_tier == "fast":
         velocity_line = (
-            f"this instrument's own current H1 ATR classifies it as a FAST-tier mover right now "
+            f"this instrument's own typical {velocity_tf} ATR classifies it as a FAST-tier mover "
             "— a normal pullback here covers ground faster than a slow FX cross's own noise would, "
             f"which is why the ATR multiple below is wider than the usual "
-            f"{config.CLERK_TACTICAL_ATR_STOP_MULTIPLE}x default"
+            f"{standard_multiple}x default"
         )
     else:
         velocity_line = (
-            f"this instrument's own current H1 ATR classifies it as a "
-            f"{signals.velocity_tier.upper()}-tier mover right now — the standard ATR multiple applies"
+            f"this instrument's own typical {velocity_tf} ATR classifies it as a "
+            f"{signals.velocity_tier.upper()}-tier mover — the standard ATR multiple applies"
         )
     def _rsi_line(label: str, rsi: float | None, tier: str | None) -> str:
         if rsi is None or tier is None:
@@ -2231,7 +2771,41 @@ def _build_tactical_prompt(
         if level is None:
             return "not available (no confirmed swing structure yet)"
         pool = " — LIQUIDITY POOL (tight cluster of real equal highs/lows, not just a single touch)" if level.is_liquidity_pool else ""
-        return f"{level.price:.5f} ({level.touches}x real confirmed touches, {level.distance_pct:+.2f}% away){pool}"
+        # Real band, not a single point — added 2026-09-20, direct user
+        # challenge. None low/high (a pre-upgrade SRLevel) falls back to
+        # the old single-point rendering.
+        if level.low is not None and level.high is not None:
+            band = f"{level.low:.5f}-{level.high:.5f} (mid {level.price:.5f})"
+        else:
+            band = f"{level.price:.5f}"
+        return f"{band} ({level.touches}x real confirmed touches, {level.distance_pct:+.2f}% away){pool}"
+
+    def _structure_break_line(
+        break_: StructureBreak | None, sweep: LiquiditySweepEvent | None
+    ) -> str:
+        # Added 2026-09-21, Phase 5c of the charting-expert technical-
+        # analysis upgrade — see TacticalSignals.nearest_structure_
+        # break's own field comment for why this is a genuinely
+        # DIFFERENT signal from trend_flip_against_count (surfaced
+        # separately, as a deterministic circuit breaker, in _run_clerk_
+        # tactical_check below) rather than a duplicate of it: a CHOCH is
+        # a one-shot structural EVENT, trend_flip_against_count tracks
+        # SUSTAINED contradiction building up poll over poll — both real,
+        # neither redundant with the other.
+        bits = []
+        if break_ is not None:
+            bits.append(
+                f"{break_.kind} {break_.bars_ago} bars ago ({break_.direction}, broke "
+                f"{break_.broken_level:.5f})"
+            )
+        if sweep is not None:
+            bits.append(
+                f"liquidity sweep {sweep.bars_ago} bars ago ({sweep.direction}, "
+                f"{sweep.wick_penetration_pct:.2f}% wick penetration)"
+            )
+        if not bits:
+            return "none confirmed recently"
+        return "; ".join(bits)
 
     def _backtest_favorability_line(favorability: str | None, excursion_median_r: float | None) -> str | None:
         # Added 2026-09-12 — real gap this closes: this position's own
@@ -2274,21 +2848,41 @@ def _build_tactical_prompt(
         signals.backtest_favorability, signals.favorable_excursion_median_r
     )
 
+    # Decision-tier lines (M5) — only when a real M5 read exists, so a caller with H1-only signals
+    # renders exactly as before. The nearest-level / structure-break lines below follow the same
+    # timeframe (signals.structure_timeframe), the H1/H4 RSI lines are context.
+    decision_lines: list[str] = []
+    if signals.m5_rsi is not None:
+        decision_lines.append(f"- {_rsi_line('M5', signals.m5_rsi, signals.m5_rsi_tier)}")
+    if signals.structure_trail_candidate is not None:
+        decision_lines.append(
+            "- M5 structure-trail stop candidate (just beyond the nearest M5 "
+            f"{'support' if position.side == 'buy' else 'resistance'}, 0.4 of an M5 ATR of room): "
+            f"{signals.structure_trail_candidate:.5f} "
+            f"({'tighter' if signals.structure_trail_is_tighter else 'NOT tighter'} than the current stop above)"
+        )
+    if signals.event_note:
+        decision_lines.append(f"- Event risk: {signals.event_note}")
+    decision_tier_lines = "".join(line + "\n" for line in decision_lines)
+
     pre_screen = (
         "Deterministic pre-screen (computed directly from live data — use "
         "these numbers rather than re-deriving your own arithmetic; you "
         "still decide which tier applies):\n"
         f"- Velocity: {velocity_line}.\n"
-        f"- {_rsi_line('H1', signals.h1_rsi, signals.h1_rsi_tier)}\n"
-        f"- {_rsi_line('H4', signals.h4_rsi, signals.h4_rsi_tier)}\n"
-        f"- Nearest H1 structural resistance (real swing-point clustering, not a guess): "
+        f"{decision_tier_lines}"
+        f"- {_rsi_line('H1', signals.h1_rsi, signals.h1_rsi_tier)} (context only)\n"
+        f"- {_rsi_line('H4', signals.h4_rsi, signals.h4_rsi_tier)} (context only)\n"
+        f"- Nearest {signals.structure_timeframe} structural resistance (real swing-point clustering, not a guess): "
         f"{_sr_line(signals.nearest_resistance)}\n"
-        f"- Nearest H1 structural support: {_sr_line(signals.nearest_support)}\n"
+        f"- Nearest {signals.structure_timeframe} structural support: {_sr_line(signals.nearest_support)}\n"
+        f"- Most recent {signals.structure_timeframe} structure break/liquidity sweep: "
+        f"{_structure_break_line(signals.nearest_structure_break, signals.nearest_liquidity_sweep)}\n"
         f"- Favorable move so far: {signals.favorable_move_pct:.2f}% "
         f"(profit-lock threshold: {config.CLERK_TACTICAL_PROFIT_LOCK_PCT}% "
         f"— {'REACHED' if signals.profit_lock_due else 'not reached'})\n"
-        f"- H1 ATR-based stop candidate "
-        f"({signals.atr_stop_multiple_used}x H1 ATR from the current "
+        f"- {signals.atr_timeframe} ATR-based stop candidate "
+        f"({signals.atr_stop_multiple_used}x {signals.atr_timeframe} ATR from the current "
         f"price): {atr_stop_line}\n"
         f"- Valid NEW_STOP_LOSS range for this {position.side.upper()} position: "
         f"{valid_stop_range_line}. A number outside this range is not a real "
@@ -2303,7 +2897,7 @@ def _build_tactical_prompt(
         f"- Days held: {days_held_line}\n"
         + (f"- {backtest_favorability_line}\n" if backtest_favorability_line is not None else "")
         + "\n"
-        "If you choose DEFEND under the ATR-stop rule, use the H1 ATR-based "
+        "If you choose DEFEND under the ATR-stop rule, use the ATR-based "
         "stop candidate above verbatim as NEW_STOP_LOSS rather than "
         "deriving your own number. The RSI tier labels above (OVERBOUGHT/"
         "OVERSOLD/NEUTRAL) are already correctly computed by Python — use "
@@ -2339,11 +2933,11 @@ def _build_tactical_prompt(
         f"{entry.invalidation_condition or '(none stated)'}\n\n"
         f"{history}\n\n"
         f"{pre_screen}\n"
-        f"{format_trend_wisdom()}\n\n"
+        f"{format_trend_wisdom(brief=config.CLERK_COMPACT_CONTEXT)}\n\n"
         "Below is this symbol's REAL, LIVE technical picture right now (the "
         "same data source that powers this account's own Asset Health "
         "analysis):\n\n"
-        f"{technical_context}\n\n"
+        f"{_TIMEFRAME_ROLES_NOTE}\n\n{technical_context}\n\n"
         f"Account equity for context: {account_equity:.2f}.\n\n"
         "This account trades intraday, closing out within a single trading "
         "day at most — judge this position against a day trader's own "
@@ -2367,8 +2961,8 @@ def _build_tactical_prompt(
         "above) and the position kept deteriorating regardless — the goal "
         "is capturing the best remaining outcome (maximum remaining "
         "profit, or minimum further loss), not giving up early.\n\n"
-        "Respond with your reasoning, then end with EXACTLY this block and "
-        "nothing after it (omit a line entirely if it doesn't apply):\n\n"
+        "Keep your reasoning short - at most three sentences (for HOLD, one sentence is enough) - then end with EXACTLY "
+        "this block and nothing after it (omit a line entirely if it doesn't apply):\n\n"
         "FINAL_VERDICT: HOLD\n\n"
         "-- or --\n\n"
         "FINAL_VERDICT: DEFEND\n"
@@ -2395,6 +2989,7 @@ def _run_clerk_tactical_check(
     account_equity: float,
     prior_tactical: dict | None,
     signals: TacticalSignals,
+    deterministic_only: bool = False,
 ) -> tuple[str, TacticalVerdict, str]:
     """The LLM-bound half of a tactical-defense check — pure local HTTP
     call (with a same-server backup model, see
@@ -2448,17 +3043,41 @@ def _run_clerk_tactical_check(
         )
         return symbol, verdict, raw
 
+    if signals.quick_profit_lock_due:
+        raw = (
+            _DETERMINISTIC_CIRCUIT_BREAKER_PREFIX +
+            f"Position has moved {signals.favorable_move_pct:.2f}% in its favor, "
+            f">= {config.CLERK_QUICK_PROFIT_LOCK_COST_MULTIPLE:g}x real round-trip "
+            "cost with margin — locking a small, real profit."
+        )
+        verdict = TacticalVerdict(
+            tier="defend",
+            partial_close_fraction=config.CLERK_QUICK_PROFIT_LOCK_REDUCE_PCT / 100.0,
+            rule_citation=(
+                "Schwager's partial-profit-taking discipline, applied early/small for real, "
+                "frequent realized gains rather than waiting for the full 50%-of-target milestone"
+            ),
+            numbers_citation=(
+                f"Favorable move {signals.favorable_move_pct:.2f}% covers "
+                f"{config.CLERK_QUICK_PROFIT_LOCK_COST_MULTIPLE:g}x real round-trip cost — "
+                "banking a small, genuinely real gain."
+            ),
+            raw_text=raw,
+            hard_exit=True,
+        )
+        return symbol, verdict, raw
+
     if signals.trend_flip_against_count >= config.CLERK_TREND_FLIP_EXIT_AFTER_POLLS:
         raw = (
             _DETERMINISTIC_CIRCUIT_BREAKER_PREFIX +
-            f"{signals.trend_flip_against_count} consecutive polls of a confirmed H1+H4 trend "
+            f"{signals.trend_flip_against_count} consecutive polls of a confirmed {signals.trend_flip_basis} trend "
             "flip against this position's own side."
         )
         verdict = TacticalVerdict(
             tier="exit",
             rule_citation="Sustained self-acknowledged trend flip (real NVDA incident, 2026-09-10/11)",
             numbers_citation=(
-                f"H1+H4 trend has read opposite this position's side for "
+                f"{signals.trend_flip_basis} trend has read opposite this position's side for "
                 f"{signals.trend_flip_against_count} consecutive polls, at/past the "
                 f"{config.CLERK_TREND_FLIP_EXIT_AFTER_POLLS}-poll exit ceiling."
             ),
@@ -2470,7 +3089,7 @@ def _run_clerk_tactical_check(
     if signals.trend_flip_against_count == config.CLERK_TREND_FLIP_PARTIAL_AFTER_POLLS:
         raw = (
             _DETERMINISTIC_CIRCUIT_BREAKER_PREFIX +
-            f"{signals.trend_flip_against_count} consecutive polls of a confirmed H1+H4 trend "
+            f"{signals.trend_flip_against_count} consecutive polls of a confirmed {signals.trend_flip_basis} trend "
             "flip against this position's own side — reducing size."
         )
         verdict = TacticalVerdict(
@@ -2478,7 +3097,7 @@ def _run_clerk_tactical_check(
             partial_close_fraction=config.CLERK_TREND_FLIP_PARTIAL_REDUCE_PCT / 100.0,
             rule_citation="Sustained self-acknowledged trend flip (real NVDA incident, 2026-09-10/11)",
             numbers_citation=(
-                f"H1+H4 trend has read opposite this position's side for "
+                f"{signals.trend_flip_basis} trend has read opposite this position's side for "
                 f"{signals.trend_flip_against_count} consecutive polls, at the "
                 f"{config.CLERK_TREND_FLIP_PARTIAL_AFTER_POLLS}-poll partial-reduction threshold — "
                 f"cutting current volume by {config.CLERK_TREND_FLIP_PARTIAL_REDUCE_PCT:.0f}%."
@@ -2488,11 +3107,184 @@ def _run_clerk_tactical_check(
         )
         return symbol, verdict, raw
 
+    if signals.profit_trail_stop is not None:
+        raw = (
+            _DETERMINISTIC_CIRCUIT_BREAKER_PREFIX +
+            f"Position is {signals.profit_trail_r:.2f}R in profit (>= {config.CLERK_PROFIT_TRAIL_START_R:g}R): "
+            f"ratcheting the stop to {signals.profit_trail_stop:.5g}, {config.CLERK_PROFIT_TRAIL_ATR:g} M5 ATR behind the price."
+        )
+        verdict = TacticalVerdict(
+            tier="defend",
+            new_stop_loss=signals.profit_trail_stop,
+            rule_citation=(
+                "Schwager/Murphy trailing stop — let profits run, never give a winner back; measured on this "
+                "account's own M5 data (trail 1.5 ATR after +1R beat breakeven and partial rules)"
+            ),
+            numbers_citation=(
+                f"{signals.profit_trail_r:.2f}R progress on an original risk of {signals.profit_trail_r0:.5g}; "
+                f"new stop {signals.profit_trail_stop:.5g} vs current {position.sl:.5g}."
+            ),
+            raw_text=raw,
+            hard_exit=True,
+        )
+        return symbol, verdict, raw
+
+    if deterministic_only:
+        # Fast lane: every deterministic circuit-breaker above has been ruled out; the discretionary model verdict is the full poll's.
+        return symbol, TacticalVerdict(tier="hold"), _FAST_LANE_RAW
+
     prompt = _build_tactical_prompt(
         symbol, entry, position, technical_context, account_equity, prior_tactical, signals,
     )
     raw = _run_clerk_prompt(prompt, timeout=config.CLERK_LLM_TIMEOUT_SECONDS)
     return symbol, parse_tactical_verdict(raw), raw
+
+
+_FAST_LANE_RAW = "[fast lane - no model call]"
+_REUSED_RAW = "[unchanged since the last thinking pass - no model call]"
+
+
+def _tactical_fingerprint(position: Position, signals: "TacticalSignals") -> str:
+    """What a tactical review actually depends on, coarsely: the position's own terms, price in half-ATR buckets, the RSI tier, the
+    trend-flip count, whether a profit lock or a sweep is in play. If none of it moved since the last HOLD, asking the model again
+    (30-90 s) can only repeat that HOLD."""
+    atr = signals.m5_atr or 0.0
+    bucket = round(position.price_current / (0.5 * atr)) if atr > 0 else round(position.price_current, 4)
+    return json.dumps([
+        position.side, round(position.volume, 4), position.sl, position.tp, bucket, signals.m5_rsi_tier,
+        signals.trend_flip_against_count, bool(signals.profit_lock_due), bool(signals.quick_profit_lock_due),
+        signals.nearest_liquidity_sweep is not None, getattr(signals.nearest_structure_break, "kind", None),
+    ])
+
+
+def _tactical_unchanged(cache: dict, symbol: str, fingerprint: str, now: datetime) -> bool:
+    """True when the last stored tactical verdict for `symbol` was a HOLD on this same fingerprint and is younger than
+    config.CLERK_THINK_REUSE_MAX_MINUTES (a hard ceiling so a long quiet spell is still re-read)."""
+    item = cache.get("items", {}).get(f"tactical:{symbol}")
+    if not item or item.get("fingerprint") != fingerprint or (item.get("verdict") or {}).get("tier") != "hold":
+        return False
+    try:
+        age = now - datetime.fromisoformat(item["checked_utc"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return age <= timedelta(minutes=config.CLERK_THINK_REUSE_MAX_MINUTES)
+_MAX_PARTIAL_ATTEMPTS = 3
+
+
+def _tactical_verdict_to_dict(v: "TacticalVerdict") -> dict:
+    return {
+        "tier": v.tier, "new_stop_loss": v.new_stop_loss, "partial_close_fraction": v.partial_close_fraction,
+        "rule_citation": v.rule_citation, "numbers_citation": v.numbers_citation, "raw_text": v.raw_text, "hard_exit": v.hard_exit,
+    }
+
+
+def _tactical_verdict_from_dict(d: dict) -> "TacticalVerdict":
+    return TacticalVerdict(
+        tier=d.get("tier", "hold"), new_stop_loss=d.get("new_stop_loss"), partial_close_fraction=d.get("partial_close_fraction"),
+        rule_citation=d.get("rule_citation", ""), numbers_citation=d.get("numbers_citation", ""), raw_text=d.get("raw_text", ""),
+        hard_exit=bool(d.get("hard_exit", False)),
+    )
+
+
+def _store_thinking_results(results: list, generated_utc: str | None, tactical_fingerprints: dict | None = None) -> None:
+    """The thinking pass's output: every model verdict of this pass, written for the acting passes (ai/clerk_thinking.py).
+    Deterministic results (structured triggers, circuit-breakers) are not stored - acting passes recompute those themselves."""
+    now = datetime.now(timezone.utc)
+    cache = clerk_thinking.for_suggestion(clerk_thinking.load_cache(), generated_utc)
+    for result in results:
+        if isinstance(result[0], PendingSetup):
+            setup, confirmed, raw = result
+            if str(raw).startswith("[structured trigger]"):
+                continue
+            clerk_thinking.store(cache, "pending", setup.symbol, {
+                "confirmed": bool(confirmed), "raw_text": raw, "side": setup.side, "trigger_condition": setup.trigger_condition,
+            }, now)
+        elif isinstance(result[1], TacticalVerdict):
+            symbol, verdict, raw = result
+            if raw.startswith(_DETERMINISTIC_CIRCUIT_BREAKER_PREFIX) or raw in (_FAST_LANE_RAW, _REUSED_RAW):
+                continue  # (a reused HOLD keeps its earlier stored item and fingerprint)
+            clerk_thinking.store(cache, "tactical", symbol, {
+                "verdict": _tactical_verdict_to_dict(verdict), "raw_text": raw,
+                "fingerprint": (tactical_fingerprints or {}).get(symbol),
+            }, now)
+        else:
+            symbol, confirmed, raw = result
+            if str(raw).startswith(_DETERMINISTIC_CIRCUIT_BREAKER_PREFIX):
+                continue  # a mechanical invalidation check: acting passes recompute it themselves every pass
+            clerk_thinking.store(cache, "invalidation", symbol, {"confirmed": bool(confirmed), "raw_text": raw}, now)
+    clerk_thinking.mark_think_completed(cache, now)
+    clerk_thinking.save_cache(cache)
+
+
+def _cached_thinking_results(checkable, checkable_watched, checkable_tactical, account_equity, generated_utc) -> tuple[list, int]:
+    """What an acting pass uses instead of calling the model: for each item the freshest UNUSED stored verdict (marked used), in the
+    exact result shapes the merge loop already consumes. A tactical item first runs its deterministic circuit-breakers (they always
+    win); only when none fires is the stored model verdict considered."""
+    now = datetime.now(timezone.utc)
+    cache = clerk_thinking.for_suggestion(clerk_thinking.load_cache(), generated_utc)
+    out: list = []
+    applied = 0
+    for setup, _context, _description in checkable:
+        hit = clerk_thinking.take_fresh(cache, "pending", setup.symbol, now)
+        if hit and hit.get("side") == setup.side and hit.get("trigger_condition") == setup.trigger_condition:
+            out.append((setup, bool(hit["confirmed"]), hit.get("raw_text", "")))
+            applied += 1
+    for symbol, _raw, _cond, _state, _context in checkable_watched:
+        hit = clerk_thinking.take_fresh(cache, "invalidation", symbol, now)
+        if hit:
+            out.append((symbol, bool(hit["confirmed"]), hit.get("raw_text", "")))
+            applied += 1
+    for symbol, entry, position, context, prior_tactical, signals in checkable_tactical:
+        checked = _run_clerk_tactical_check(
+            symbol, entry, position, context, account_equity, prior_tactical, signals, deterministic_only=True
+        )
+        if checked[2] != _FAST_LANE_RAW:
+            out.append(checked)  # a deterministic circuit-breaker fired
+            continue
+        hit = clerk_thinking.take_fresh(cache, "tactical", symbol, now)
+        if hit:
+            out.append((symbol, _tactical_verdict_from_dict(hit["verdict"]), hit.get("raw_text", "")))
+            applied += 1
+        else:
+            out.append(checked)  # nothing fired, nothing new thought: skipped by the merge loop
+    clerk_thinking.save_cache(cache)
+    return out, applied
+
+
+def _pending_partial_symbols(
+    settled: dict, positions_by_symbol: dict[str, Position], merged_allocation: dict[str, AllocationEntry]
+) -> set[str]:
+    """Symbols whose tactical partial close (DEFEND with a fraction - the 20% quick profit lock, a trend-flip partial or a
+    model-proposed one) still has to reach the broker. The reduce is planned with the held-size rounding tolerance switched OFF
+    for them, and re-attempted on later polls (up to _MAX_PARTIAL_ATTEMPTS) until the held volume actually drops below the
+    volume recorded when the partial was decided. A retry also re-pins the target to the persisted, already-reduced risk and
+    stop, so it cannot be undone by a carried-forward baseline that still holds the original size (pending-setup origin)."""
+    out: set[str] = set()
+    for symbol, rec in settled.items():
+        tactical = rec.get("tactical") or {}
+        from_volume = tactical.get("partial_pending_from_volume")
+        position = positions_by_symbol.get(symbol)
+        if not from_volume or position is None:
+            continue
+        if position.volume < float(from_volume) - 1e-9:
+            tactical["partial_pending_from_volume"] = None  # it went through
+            continue
+        attempts = int(tactical.get("partial_attempts", 0))
+        if attempts >= _MAX_PARTIAL_ATTEMPTS:
+            logger.warning("%s: the tactical partial close did not execute after %d attempts - giving up on it.", symbol, attempts)
+            tactical["partial_pending_from_volume"] = None
+            continue
+        tactical["partial_attempts"] = attempts + 1
+        entry = merged_allocation.get(symbol)
+        persisted_pct = tactical.get("persisted_pct")
+        if entry is not None and persisted_pct is not None and persisted_pct < entry.pct:
+            merged_allocation[symbol] = _with_changes(
+                entry, pct=persisted_pct,
+                stop_loss=tactical.get("persisted_stop_loss", entry.stop_loss),
+                take_profit=tactical.get("persisted_take_profit", entry.take_profit),
+            )
+        out.add(symbol)
+    return out
 
 
 def _validate_and_apply_tactical_verdict(
@@ -2783,6 +3575,50 @@ def _validate_and_apply_tactical_verdict(
         return None, None, reason
 
     fraction = verdict.partial_close_fraction
+    if fraction is not None and not verdict.hard_exit and position.adverse_move_pct >= 0 and config.CLERK_PARTIAL_CLOSE_REQUIRES_PROFIT:
+        # Found on the audit of the real MSFT trade (2026-09-22): the backup model (phi4-mini, qwen3 was down)
+        # applied a DEFEND with a 25% partial close justified by "a 15% gain was already achieved" while the
+        # position was ~1.4% UNDERWATER — the partial close banked a loss on a premise that did not exist. A
+        # DEFEND's partial close is defined as taking PROFIT; a position that is not in profit gets its stop
+        # tightened (if the model proposed one) but never a discretionary partial close. The deterministic
+        # circuit-breakers (hard_exit: trend-flip cut, hard-stop ceiling) are exempt — reducing a losing
+        # position is exactly their job.
+        if new_stop is None:
+            reason = (
+                f"rejected: proposed a partial close on a position that is not in profit (adverse move "
+                f"{position.adverse_move_pct:.2f}%) — a DEFEND partial close takes profit"
+            )
+            logger.warning("%s: tactical DEFEND %s.", symbol, reason)
+            return None, None, reason
+        logger.warning(
+            "%s: tactical DEFEND proposed a partial close on a position that is not in profit (adverse move "
+            "%.2f%%) — dropping the partial close, keeping the stop change.",
+            symbol, position.adverse_move_pct,
+        )
+        fraction = None
+    if fraction is not None:
+        # A position at (or near) the minimum lot cannot be partially closed: 0.01 lot x (1 - 50%) is below the broker's minimum
+        # volume, so the plan came back "infeasible" on every poll and - because the DEFEND is persisted as a whole - the stop
+        # tightening that came with it was never sent either (XAGUSD, 2026-09-26). Drop the impossible partial, keep the stop.
+        _spec = get_spec(symbol)
+        if _spec is not None and _spec.volume_step > 0:
+            remaining = math.floor(position.volume * (1.0 - fraction) / _spec.volume_step + 1e-9) * _spec.volume_step
+            if remaining < _spec.volume_min - 1e-12:
+                if new_stop is None and resolved_stop == current_stop:
+                    logger.info(
+                        "%s: tactical DEFEND wanted a %.0f%% partial close but %.4g lot cannot be reduced below the %.4g minimum - "
+                        "nothing to apply.", symbol, fraction * 100, position.volume, _spec.volume_min,
+                    )
+                    lock_state = (
+                        {**(prior_tactical or {}), "quick_profit_lock_done": True}
+                        if signals is not None and signals.quick_profit_lock_due else None
+                    )  # a lock that can never be banked must not re-fire every poll
+                    return None, lock_state, ""
+                logger.info(
+                    "%s: tactical DEFEND partial close (%.0f%%) is below the minimum lot (%.4g of %.4g) - dropping it, keeping the stop change.",
+                    symbol, fraction * 100, _spec.volume_min, position.volume,
+                )
+                fraction = None
     target_lots = position.volume * (1.0 - fraction) if fraction is not None else position.volume
 
     new_pct = pct_for_target_lots(symbol, target_lots, sizing_entry_price, resolved_stop, account_equity, get_spec)
@@ -2814,6 +3650,17 @@ def _validate_and_apply_tactical_verdict(
             signals.trend_flip_against_count if signals is not None
             else (prior_tactical or {}).get("trend_flip_against_count", 0)
         ),
+        # Added 2026-09-18 — same reasoning as trend_flip_against_count
+        # immediately above: this dict does NOT spread prior_tactical, so
+        # ANY DEFEND (whatever triggered it — quick-profit-lock, a
+        # trend-flip partial, or a normal LLM-driven DEFEND) must
+        # explicitly re-list this too, or a DEFEND for a completely
+        # different reason would silently erase an already-banked
+        # quick-lock flag, letting it incorrectly re-fire later.
+        "quick_profit_lock_done": (
+            signals.quick_profit_lock_due if signals is not None and signals.quick_profit_lock_due
+            else (prior_tactical or {}).get("quick_profit_lock_done", False)
+        ),
         # Real bug found live 2026-09-03 (USDCHF): without persisting the
         # REDUCED size here, the very next poll's _build_carried_forward_
         # allocation rebuilds its baseline straight from the mega
@@ -2828,6 +3675,16 @@ def _validate_and_apply_tactical_verdict(
         "persisted_pct": new_pct,
         "persisted_stop_loss": resolved_stop,
         "persisted_take_profit": new_entry.take_profit,
+        # A partial close was requested: remember the volume it must come DOWN from, so the plan can insist on the resize
+        # (bypassing the held-size rounding tolerance) and retry it if the order did not go through (see _pending_partial_symbols).
+        "partial_pending_from_volume": position.volume if fraction is not None else None,
+        "partial_attempts": 0,
+        # The trade's ORIGINAL risk distance (see TacticalSignals.profit_trail_r0): carried through every
+        # DEFEND so a tightened stop never shrinks the yardstick the profit trail measures progress in.
+        "profit_trail_r0": (
+            signals.profit_trail_r0 if signals is not None and signals.profit_trail_r0
+            else (prior_tactical or {}).get("profit_trail_r0")
+        ),
     }
     return new_entry, tactical_state, ""
 
@@ -2843,7 +3700,7 @@ def _validate_and_apply_tactical_verdict(
 # keep working unchanged.
 
 
-_CORRELATION_SIZE_REDUCTION_FACTOR = 0.5
+_CORRELATION_SIZE_REDUCTION_FACTOR = config.CLERK_CORRELATION_SIZE_FACTOR
 # Comfortably above _MIN_CORRELATION_OBSERVATIONS (30) once the last bar
 # is dropped by .pct_change() — a generous buffer, not the bare minimum.
 _CORRELATION_CHECK_D1_BARS = 90
@@ -2959,7 +3816,7 @@ def _apply_correlation_guard(
             if len(aligned) < _MIN_CORRELATION_OBSERVATIONS:
                 continue
             corr = aligned["a"].corr(aligned["b"])
-            if corr is None or pd.isna(corr) or abs(corr) < _HIGH_CORRELATION_THRESHOLD:
+            if corr is None or pd.isna(corr) or abs(corr) < config.CLERK_CORRELATION_GUARD_THRESHOLD:
                 continue
             same_side = side_by_symbol.get(candidate) == side_by_symbol.get(other)
             effective_pnl_correlation_is_positive = (same_side and corr > 0) or (not same_side and corr < 0)
@@ -2987,10 +3844,747 @@ def _apply_correlation_guard(
                     f"{other} — size reduced from {entry.pct:.2f}% to {reduced_pct:.2f}%.]"
                 ),
                 invalidation_condition=entry.invalidation_condition,
+                entry_mode=entry.entry_mode,
             )
         exposed_symbols.add(candidate)
 
     return merged_allocation
+
+
+# Deliberately permissive — the stale-entry re-anchor below uses construct_trade_zone
+# ONLY to find a real, validated M5 ENTRY ZONE (and to confirm at least one real
+# M5-structure level exists beyond it in the profitable direction, a basic sanity
+# check); it discards that function's own take_profits/reward_risk output entirely
+# and keeps the ORIGINAL take_profit (Claude's own real target). The real reward:risk
+# check against that kept target is _apply_reward_risk_floor_guard, which runs after.
+_M5_ENTRY_MIN_REWARD_RISK = 0.0
+
+
+def _broker_clock_offset(symbols) -> timedelta:
+    """How far ahead of true UTC the broker's server clock runs, rounded to the
+    nearest quarter hour (real FTMO offsets are whole/half hours). MT5 stamps
+    an order's `time_setup` on that server clock while this process's own "now"
+    is real UTC, so an order's age computed naively is off by the whole offset
+    (a +3h server made a brand-new order look 3 hours YOUNGER — invisible under
+    the old 24h age ceiling, material under the 3h intraday one). The offset is
+    read from a live tick; a symbol whose tick is stale (a closed market)
+    produces an offset that is not within seconds of a quarter hour and is
+    skipped. 0 when no symbol gives a trustworthy reading."""
+    for symbol in symbols:
+        try:
+            offset = get_server_time_offset(symbol)
+        except Exception:
+            continue
+        if offset is None:
+            continue
+        quarter = 900.0
+        rounded = round(offset.total_seconds() / quarter) * quarter
+        if abs(offset.total_seconds() - rounded) <= 10.0 and abs(rounded) <= 14 * 3600:
+            return timedelta(seconds=rounded)
+    return timedelta(0)
+
+
+_GUARD_NOTE_RE = re.compile(
+    r"\[(?:Stale-entry|ATR stop-floor guard|Intraday size scalar|Reward:risk|Correlation guard|Event blackout)[^\]]*\]",
+    re.IGNORECASE,  # the reward:risk guard writes its note lowercase
+)
+
+
+_ANY_GUARD_NOTE_RE = re.compile(r"\[([^\]]*(?:guard|Event blackout|Reward:risk|Stale-entry)[^\]]*)\]", re.IGNORECASE)
+
+
+def _last_guard_note(reason: str | None) -> str | None:
+    """The text of the LAST guard note ("[Entry-mode guard: ...]", "[Reward:risk ...]", ...) a guard appended to an
+    entry's reason, or None - what the Clerk desk shows as WHY a target was held back."""
+    matches = _ANY_GUARD_NOTE_RE.findall(reason or "")
+    return matches[-1].strip() if matches else None
+
+
+def _guard_blocks_this_poll(
+    pct_before: dict[str, float],
+    merged_allocation: dict[str, AllocationEntry],
+    positions: list[Position],
+    cooldowns: dict,
+) -> dict[str, str]:
+    """{symbol: why} for every UNFILLED candidate that had a live target going into the guard pipeline and came out at
+    0% - so the desk can say "held back by <guard>" instead of the meaningless "on target, no change needed"."""
+    held = {p.symbol for p in positions}
+    blocks: dict[str, str] = {}
+    for symbol, before in pct_before.items():
+        entry = merged_allocation.get(symbol)
+        if symbol == "CASH" or before <= 0 or entry is None or entry.pct > 0 or symbol in held:
+            continue
+        cooldown = cooldowns.get(symbol)
+        note = _last_guard_note(entry.reason)
+        if cooldown is not None and not note:
+            try:
+                until = datetime.fromisoformat(cooldown["until_utc"]).strftime("%H:%M")
+            except (KeyError, TypeError, ValueError):
+                until = "?"
+            note = f"cooldown until {until} UTC after: {cooldown.get('reason') or 'an earlier guard rejection'}"
+        blocks[symbol] = note or "a guard held the target at 0%"
+    return blocks
+
+
+def _candidate_symbols(merged_allocation: dict[str, AllocationEntry], positions: list[Position]) -> list[str]:
+    """New-exposure candidates: pct > 0, not CASH, not already an open position —
+    the same framing every guard in this pipeline uses."""
+    exposed_symbols = {p.symbol for p in positions}
+    return sorted(
+        symbol for symbol, entry in merged_allocation.items()
+        if symbol != "CASH" and entry.pct > 0 and symbol not in exposed_symbols
+    )
+
+
+def _with_changes(entry: AllocationEntry, **changes) -> AllocationEntry:
+    return dataclasses.replace(entry, **changes)
+
+
+_MARKET_CLOSED_RE = re.compile(r"market\s+closed", re.IGNORECASE)
+
+
+def _order_backoff_until(backoff: dict, symbol: str, now_utc: datetime) -> datetime | None:
+    """When a "Market closed" rejection put this symbol's order actions on hold until (None when not held).
+    Expired or corrupt records are dropped in place."""
+    record = backoff.get(symbol)
+    if not record:
+        return None
+    try:
+        until = datetime.fromisoformat(record["until_utc"])
+    except (KeyError, TypeError, ValueError):
+        backoff.pop(symbol, None)
+        return None
+    if until <= now_utc:
+        backoff.pop(symbol, None)
+        return None
+    return until
+
+
+def _learn_order_outcome(backoff: dict, symbol: str, result, now_utc: datetime) -> None:
+    """A success clears the symbol's backoff; a "Market closed" rejection starts one, so the next polls do not
+    hammer the broker with an order action that cannot work until the market reopens (56 failed cancels in one
+    night before this existed)."""
+    if result.success:
+        backoff.pop(symbol, None)
+        return
+    if _MARKET_CLOSED_RE.search(result.comment or ""):
+        until = now_utc + timedelta(minutes=config.MARKET_CLOSED_BACKOFF_MINUTES)
+        if symbol not in backoff:
+            logger.info(
+                "%s: the market is closed — order actions for it are deferred until %s UTC.",
+                symbol, until.strftime("%H:%M"),
+            )
+        backoff[symbol] = {"since_utc": now_utc.isoformat(), "until_utc": until.isoformat()}
+
+
+def _minutes_to_session_close(history, now_utc: datetime, broker_offset: timedelta) -> float | None:
+    """Minutes until the instrument's usual session end, learned from where its last sessions actually ended
+    (the bar before each overnight gap of 3-30 hours; a 1-hour maintenance break or a weekend does not count).
+    None when the instrument shows no daily close (24h markets), has too little history, or is not trading right
+    now (last bar older than 20 minutes) — a missing estimate never blocks anything."""
+    import pandas as pd
+
+    if history is None or len(history) < 60:
+        return None
+    times = pd.DatetimeIndex(history.index) - pd.Timedelta(broker_offset)
+    gaps = times[1:] - times[:-1]
+    ends = [times[i] for i, gap in enumerate(gaps) if pd.Timedelta(hours=3) <= gap <= pd.Timedelta(hours=30)]
+    if len(ends) < 2:
+        return None
+    close_tods = sorted(((t + pd.Timedelta(minutes=5)).hour * 60 + (t + pd.Timedelta(minutes=5)).minute) for t in ends[-3:])
+    close_tod = float(close_tods[len(close_tods) // 2])
+    now = pd.Timestamp(now_utc).tz_localize(None) if pd.Timestamp(now_utc).tzinfo is None else pd.Timestamp(now_utc).tz_convert("UTC").tz_localize(None)
+    if now - times[-1] > pd.Timedelta(minutes=20):
+        return None
+    minutes = close_tod - (now.hour * 60 + now.minute + now.second / 60)
+    if minutes < -1:
+        if close_tod < 180:  # a session that ends just after midnight UTC
+            minutes += 1440
+        else:
+            return None
+    return minutes if 0 <= minutes <= 1440 else None
+
+
+def _resting_order_expiry_hours(symbol: str, now_utc: datetime, broker_offset: timedelta, history_fn=None) -> float | None:
+    """Hours until a NEW resting order should expire on the broker's side: the instrument's learned session close minus
+    config.RESTING_ORDER_EXPIRY_BEFORE_CLOSE_MINUTES, so it can never sit overnight unmanaged (the NVDA case). None for a
+    24h market, an unknown close or when it is too close to be useful (the pre-close guard already blocks those)."""
+    if config.RESTING_ORDER_EXPIRY_BEFORE_CLOSE_MINUTES < 0:
+        return None
+    history_fn = history_fn or (lambda s: fetch_mt5_price_history(s, "M5", count=1500))
+    try:
+        minutes = _minutes_to_session_close(history_fn(symbol), now_utc, broker_offset)
+    except Exception:  # noqa: BLE001 - no estimate = plain GTC, exactly as before
+        return None
+    if minutes is None:
+        return None
+    hours = (minutes - config.RESTING_ORDER_EXPIRY_BEFORE_CLOSE_MINUTES) / 60
+    return hours if hours >= 0.25 else None
+
+
+def _apply_pre_close_guard(
+    merged_allocation: dict[str, AllocationEntry],
+    positions: list[Position],
+    pending_orders: list,
+    now_utc: datetime,
+    broker_offset: timedelta,
+    history_fn=None,
+) -> dict[str, AllocationEntry]:
+    """No NEW resting order in the last config.NO_NEW_ORDER_MINUTES_BEFORE_CLOSE minutes of a non-24h
+    instrument's session (see _minutes_to_session_close): it could not be managed or cancelled overnight. A
+    symbol that already has an order resting or a position is never touched here, and the hold is temporary (no
+    cooldown latch) — the setup is re-evaluated at the next open."""
+    if config.NO_NEW_ORDER_MINUTES_BEFORE_CLOSE <= 0:
+        return merged_allocation
+    history_fn = history_fn or (lambda symbol: fetch_mt5_price_history(symbol, "M5", count=1500))
+    held = {p.symbol for p in positions}
+    resting = {o.symbol for o in pending_orders}
+    for symbol in sorted(merged_allocation):
+        entry = merged_allocation[symbol]
+        if symbol == "CASH" or entry.pct <= 0 or symbol in held or symbol in resting:
+            continue
+        try:
+            if get_symbol_category(symbol).startswith("Crypto"):
+                continue
+            minutes = _minutes_to_session_close(history_fn(symbol), now_utc, broker_offset)
+        except Exception:
+            logger.debug("Pre-close guard: no session estimate for %s (not blocking).", symbol, exc_info=True)
+            continue
+        if minutes is not None and minutes < config.NO_NEW_ORDER_MINUTES_BEFORE_CLOSE:
+            logger.info(
+                "Pre-close guard: %s's session ends in ~%.0f min (< %g) — not placing a new resting order that "
+                "could not be managed overnight.",
+                symbol, minutes, config.NO_NEW_ORDER_MINUTES_BEFORE_CLOSE,
+            )
+            merged_allocation[symbol] = _with_changes(entry, pct=0.0)
+    return merged_allocation
+
+
+def _apply_guard_cooldown(
+    merged_allocation: dict[str, AllocationEntry],
+    positions: list[Position],
+    cooldowns: dict,
+    now_utc: datetime,
+) -> dict[str, AllocationEntry]:
+    """Holds a symbol at pct 0 while its guard-rejection cooldown is active (see _record_guard_rejections).
+    Only ever touches an UNFILLED candidate — a held position's management is never gated here. Expired
+    cooldowns are dropped from `cooldowns` in place. The cooldown lives in the settlement file, which is
+    rebuilt from scratch when a new Mega session supersedes the old one, so a fresh proposal always gets a
+    fresh evaluation."""
+    held = {p.symbol for p in positions}
+    for symbol in list(cooldowns):
+        try:
+            until = datetime.fromisoformat(cooldowns[symbol]["until_utc"])
+        except (KeyError, TypeError, ValueError):
+            del cooldowns[symbol]
+            continue
+        if until <= now_utc:
+            del cooldowns[symbol]
+            continue
+        entry = merged_allocation.get(symbol)
+        if entry is None or entry.pct <= 0 or symbol in held:
+            continue
+        logger.info(
+            "Guard-rejection cooldown: %s was rejected by a guard while unfilled — holding it at 0%% until "
+            "%s UTC (no place/cancel churn).",
+            symbol, until.strftime("%H:%M"),
+        )
+        merged_allocation[symbol] = _with_changes(entry, pct=0.0)
+    return merged_allocation
+
+
+def _record_guard_rejections(
+    pct_before: dict[str, float],
+    merged_allocation: dict[str, AllocationEntry],
+    positions: list[Position],
+    cooldowns: dict,
+    now_utc: datetime,
+    skip: set[str] | frozenset[str] = frozenset(),
+) -> list[str]:
+    """After the guard pipeline: every UNFILLED symbol that had a live pct going in and came out at 0 was
+    rejected by a guard (stale-entry / reward:risk) — start its cooldown so the next polls do not resurrect
+    it, place it, and cancel it again. Returns the newly latched symbols.
+
+    `skip`: symbols rejected by the ENTRY-MODE guard (breakout already extended, market entry not chasable, setup dead):
+    nothing was ever placed for them, so there is no place/cancel churn to prevent, and the condition is TRANSIENT - a
+    breakout that ran 0.99 ATR past its trigger may be back inside the cap two polls later. Latching a 60-minute cooldown
+    there (2026-09-25, XAGUSD) only delayed a trade the Mega session had just approved; they are re-judged every poll."""
+    held = {p.symbol for p in positions}
+    latched = []
+    for symbol, before in pct_before.items():
+        entry = merged_allocation.get(symbol)
+        if symbol == "CASH" or before <= 0 or entry is None or entry.pct > 0 or symbol in held or symbol in cooldowns:
+            continue
+        if symbol in skip:
+            continue
+        until = now_utc + timedelta(minutes=config.GUARD_REJECTION_COOLDOWN_MINUTES)
+        cooldowns[symbol] = {
+            "since_utc": now_utc.isoformat(), "until_utc": until.isoformat(),
+            "reason": _last_guard_note(entry.reason) or "a guard rejection",
+        }
+        latched.append(symbol)
+        logger.info(
+            "Guard-rejection cooldown started: %s rejected by a guard while unfilled — not placing it again for "
+            "%g min (until %s UTC) or until the next Mega session.",
+            symbol, config.GUARD_REJECTION_COOLDOWN_MINUTES, until.strftime("%H:%M"),
+        )
+    return latched
+
+
+def _apply_entry_mode_guard(
+    merged_allocation: dict[str, AllocationEntry],
+    positions: list[Position],
+    pending_orders: list,
+    technical_context_cache: dict[str, tuple[FtmoAssetAnalysis, str]],
+    market_prices: dict,
+    market_entries_today: set[str],
+) -> tuple[dict[str, AllocationEntry], dict[str, float]]:
+    """Re-verifies every fresh entry that asks for a non-limit entry_mode ("stop" breakout trigger or
+    "market") against the LIVE quote and M5 ATR (analysis.entry_mode.resolve_entry_mode: slippage cap,
+    spread share of the stop, breakout not extended, one market entry per symbol per day, kill switch).
+    Whatever fails is downgraded to the plain limit it always was, or rejected (pct -> 0) when the setup is
+    already dead (through the stop / at the target / breakout extended) — never sent as asked. A passing
+    "market" entry is re-priced to the live ask/bid (so the stop-floor and reward:risk guards below judge the
+    real fill) and gets a send-time deviation cap, returned as {symbol: max_deviation_price}.
+
+    Symbols that already rest an order of the requested kind are left alone: re-resolving a resting breakout
+    trigger every poll would nudge it and churn cancel/replace. Held symbols are never candidates."""
+    caps: dict[str, float] = {}
+    resting_kinds: dict[str, set[str]] = {}
+    for order in pending_orders or []:
+        resting_kinds.setdefault(order.symbol, set()).add("stop" if "stop" in order.order_type.lower() else "limit")
+    for symbol in _candidate_symbols(merged_allocation, positions):
+        entry = merged_allocation[symbol]
+        mode = normalise_entry_mode(entry.entry_mode)
+        asset = market_prices.get(symbol)
+        if mode == "limit":
+            # A limit that is ALREADY MARKETABLE - a sell limit at/below the live bid, a buy limit at/above the live ask - cannot
+            # rest: the broker answers "Invalid price". 2026-09-25, EURUSD: a sell limit at 1.1386 with the market at 1.1389 failed
+            # that way on nine consecutive polls (80 minutes) until it filled by accident. Its own price is BETTER than planned, so
+            # treat it as the market entry it is, through exactly the same caps (slippage, spread, one market entry a day, dead
+            # setup) - and the invalidation guard has already removed it if its thesis line is broken.
+            if "limit" in resting_kinds.get(symbol, set()) or asset is None or entry.price is None:
+                continue
+            if not ((asset.bid >= entry.price) if entry.side == "sell" else (asset.ask <= entry.price)):
+                continue
+            mode = "market"
+            logger.info("Entry-mode guard: %s limit %.5g is already marketable at the live %s %.5g - resolving it as a market entry.",
+                        symbol, entry.price, "bid" if entry.side == "sell" else "ask", asset.bid if entry.side == "sell" else asset.ask)
+        if mode in resting_kinds.get(symbol, set()):
+            continue
+        fetched = technical_context_cache.get(symbol)
+        if fetched is None or asset is None or entry.price is None or entry.stop_loss is None:
+            merged_allocation[symbol] = _with_changes(entry, entry_mode="limit")
+            continue
+        analysis, _ = fetched
+        min_stop_pct = analysis.trade_cost.min_stop_distance_pct if analysis.trade_cost is not None else 0.0
+        decision = resolve_entry_mode(
+            requested=mode, side=entry.side, planned_price=entry.price, stop_loss=entry.stop_loss,
+            take_profit=entry.take_profit, bid=asset.bid, ask=asset.ask, atr=analysis.m5_stats.atr,
+            min_stop_distance_price=min_stop_pct / 100 * (asset.ask or 0.0),
+            market_entry_already_used=symbol in market_entries_today,
+        )
+        if decision.mode == "reject":
+            logger.info("Entry-mode guard: %s %s rejected — %s.", symbol, mode, decision.reason)
+            rehunt.record_dead_entry(
+                symbol, entry.side, entry.price, entry.stop_loss, entry.take_profit, f"Entry-mode guard: {decision.reason}"
+            )
+            merged_allocation[symbol] = _with_changes(
+                entry, pct=0.0, entry_mode="limit",
+                reason=f"{entry.reason} [Entry-mode guard: {decision.reason} — rejected.]",
+            )
+            continue
+        note = f" [Entry-mode guard: {decision.reason}.]" if decision.reason else ""
+        logger.info("Entry-mode guard: %s requested %s -> %s at %s. %s", symbol, mode, decision.mode, decision.price, decision.reason)
+        merged_allocation[symbol] = _with_changes(
+            entry, entry_mode=decision.mode, price=decision.price, reason=f"{entry.reason}{note}"
+        )
+        if decision.mode == "market" and decision.max_deviation_price is not None:
+            caps[symbol] = decision.max_deviation_price
+    return merged_allocation, caps
+
+
+def _apply_stale_entry_reanchor(
+    merged_allocation: dict[str, AllocationEntry],
+    positions: list[Position],
+    technical_context_cache: dict[str, tuple[FtmoAssetAnalysis, str]],
+) -> dict[str, AllocationEntry]:
+    """Intraday decision-tier upgrade (2026-09-24). Claude now proposes entry/stop/
+    target from M5 structure, so this guard no longer rewrites every entry (the
+    old 2026-09-22 behavior, which moved just the ENTRY to an M5 zone midpoint while
+    keeping an H1-scale stop and the old target — the exact recipe behind the MSFT
+    loss). It only acts when a proposal has gone STALE between Mega Session's
+    analysis and this poll:
+
+    1. TARGET ALREADY REACHED — live price is already at or beyond the take-profit
+       without the entry ever filling: the trade is obsolete, so it is rejected
+       (pct -> 0) rather than chased. (Real prior incident: a pending buy sat
+       unfilled while price ran through its own target.)
+    2. ENTRY TOO FAR FROM MARKET — the planned limit sits further from live price
+       than config.STALE_ENTRY_M5_ATR_MULTIPLE x the M5 ATR (a limit that far from
+       market will not fill any time soon). If a real, current M5 entry zone exists
+       in the same direction and is genuinely closer to live price, the entry moves
+       to that zone's midpoint and the stop is re-derived at Claude's own original
+       stop DISTANCE from it; the target is kept. No M5 zone -> untouched.
+
+    Uses the M5 reads already carried on the cached analysis (no extra MT5 fetch).
+    A refinement, never a new hard gate beyond case 1."""
+    for symbol in _candidate_symbols(merged_allocation, positions):
+        entry = merged_allocation[symbol]
+        if entry.price is None or entry.stop_loss is None or entry.take_profit is None:
+            continue
+        if normalise_entry_mode(entry.entry_mode) != "limit":
+            continue  # a verified stop/market entry is intentionally at/beyond the market: not "stale"
+        fetched = technical_context_cache.get(symbol)
+        if fetched is None:
+            continue
+        analysis, _ = fetched
+        m5_atr = analysis.m5_stats.atr
+        if m5_atr is None or m5_atr <= 0:
+            continue
+        live = analysis.base.ask if entry.side == "buy" else analysis.base.bid
+        if not live:
+            continue
+
+        target_reached = live >= entry.take_profit if entry.side == "buy" else live <= entry.take_profit
+        if target_reached:
+            logger.info(
+                "Stale-entry guard: %s live price %.5f is already at/through its own target %.5f without "
+                "the entry ever filling — rejecting (pct %.4f%% -> 0), not chasing.",
+                symbol, live, entry.take_profit, entry.pct,
+            )
+            rehunt.record_dead_entry(
+                symbol, entry.side, entry.price, entry.stop_loss, entry.take_profit,
+                f"live price {live:.5g} reached the target {entry.take_profit:.5g} without the entry ever filling",
+            )
+            merged_allocation[symbol] = _with_changes(
+                entry, pct=0.0,
+                reason=f"{entry.reason} [Stale-entry guard: price already reached the target without a fill — rejected.]",
+            )
+            continue
+
+        distance_from_market = (live - entry.price) if entry.side == "buy" else (entry.price - live)
+        if distance_from_market <= config.STALE_ENTRY_M5_ATR_MULTIPLE * m5_atr:
+            continue
+
+        m5_signals = classify_setups(
+            analysis.m5_stats, analysis.m5_structure, analysis.m5_divergence, profile=M5_PROFILE
+        )
+        zone = construct_trade_zone(
+            entry.side, analysis.m5_stats, analysis.m5_structure, m5_signals,
+            min_reward_risk=_M5_ENTRY_MIN_REWARD_RISK, stop_atr=m5_atr,
+        )
+        if zone is None:
+            continue
+        new_entry_price = (zone.entry_low + zone.entry_high) / 2
+        new_distance = (live - new_entry_price) if entry.side == "buy" else (new_entry_price - live)
+        if new_distance < 0 or new_distance >= distance_from_market:
+            continue  # not genuinely closer / not on the fillable side of live price
+
+        old_stop_distance = abs(entry.price - entry.stop_loss)
+        new_stop_loss = (
+            new_entry_price - old_stop_distance if entry.side == "buy" else new_entry_price + old_stop_distance
+        )
+        logger.info(
+            "Stale-entry re-anchor: %s planned entry %.5f is %.2fx M5 ATR from live price %.5f (limit %.2fx) "
+            "— moved to the real M5 %s zone %.5f (%.5f-%.5f), stop distance kept at %.5f, target kept.",
+            symbol, entry.price, distance_from_market / m5_atr, live, config.STALE_ENTRY_M5_ATR_MULTIPLE,
+            zone.basis, new_entry_price, zone.entry_low, zone.entry_high, old_stop_distance,
+        )
+        merged_allocation[symbol] = _with_changes(
+            entry, price=new_entry_price, stop_loss=new_stop_loss,
+            reason=(
+                f"{entry.reason} [Stale-entry re-anchor: the planned entry {entry.price:.5f} had drifted "
+                f"{distance_from_market / m5_atr:.1f}x M5 ATR from live price; moved to a real, current M5 "
+                f"{zone.basis} zone at {new_entry_price:.5f} — same stop distance, same target.]"
+            ),
+        )
+    return merged_allocation
+
+
+_INVALIDATION_LEVEL_RE = re.compile(r"close[sd]?\s+(?:back\s+)?(above|below)\s+\$?(\d[\d,]*(?:\.\d+)?)", re.IGNORECASE)
+
+
+def invalidation_already_true(side: str, condition: str | None, bid: float | None, ask: float | None) -> str | None:
+    """A sentence saying WHY a not-yet-open entry is already invalid, or None. Reads the mechanical part of the Mega session's
+    invalidation_condition ("M5 closes above 1.1397" for a sell, "closes below X" for a buy) and compares the live mid price:
+    when the market is already beyond that line, the thesis is dead BEFORE the trade exists. Conditions it cannot parse, or that
+    point the other way for the side, never block anything."""
+    if not condition or not bid or not ask or side not in ("buy", "sell"):
+        return None
+    match = _INVALIDATION_LEVEL_RE.search(condition)
+    if match is None:
+        return None
+    direction, level = match.group(1).lower(), float(match.group(2).replace(",", ""))
+    mid = (bid + ask) / 2
+    if side == "sell" and direction == "above" and mid > level:
+        return f"live price {mid:.5g} is already above the invalidation level {level:.5g}"
+    if side == "buy" and direction == "below" and mid < level:
+        return f"live price {mid:.5g} is already below the invalidation level {level:.5g}"
+    return None
+
+
+def _apply_invalidation_guard(
+    merged_allocation: dict[str, AllocationEntry], positions: list[Position], market_prices: dict
+) -> dict[str, AllocationEntry]:
+    """No NEW entry whose own invalidation condition is already true at the live price. Real case, 2026-09-25 EURUSD: a sell
+    limit drafted at 1.1386 with the invalidation "M5 closes above 1.1397" kept failing "Invalid price" while the market ran up,
+    finally filled at 1.1400 - already ABOVE its invalidation line - and was closed 13 minutes later as invalidated for +$1.30
+    on a $25 risk. Re-judged every poll (nothing is placed, so no cooldown); the entry comes back if price returns inside."""
+    for symbol in _candidate_symbols(merged_allocation, positions):
+        entry = merged_allocation[symbol]
+        asset = market_prices.get(symbol)
+        if asset is None:
+            continue
+        why = invalidation_already_true(entry.side, entry.invalidation_condition, asset.bid, asset.ask)
+        if why is None:
+            continue
+        logger.info("Invalidation guard: %s not entered - %s (\"%s\").", symbol, why, entry.invalidation_condition)
+        if entry.price is not None and entry.stop_loss is not None:
+            rehunt.record_dead_entry(symbol, entry.side, entry.price, entry.stop_loss, entry.take_profit, f"Invalidation guard: {why}")
+        merged_allocation[symbol] = _with_changes(
+            entry, pct=0.0, reason=f"{entry.reason} [Invalidation guard: {why} - the thesis is dead before entry.]"
+        )
+    return merged_allocation
+
+
+def _apply_event_blackout_guard(
+    merged_allocation: dict[str, AllocationEntry],
+    positions: list[Position],
+    now_utc: datetime,
+    calendar_events: list | None,
+) -> dict[str, AllocationEntry]:
+    """No NEW or RESTING entry orders from config.EVENT_BLACKOUT_BEFORE_MINUTES before
+    to EVENT_BLACKOUT_AFTER_MINUTES after a High-impact economic event for the
+    symbol's own currencies (data/economic_calendar.py). Sets pct to 0 — for a
+    symbol that already has a resting order the plan cancels it, and once the window
+    passes the entry is re-evaluated fresh. Open positions are never touched (their
+    event handling is advisory, via the tactical prompt). No calendar data ->
+    nothing blocked (fail-open: an unofficial feed outage must not freeze trading)."""
+    if not config.EVENT_BLACKOUT_ENABLED or not calendar_events:
+        return merged_allocation
+    for symbol in _candidate_symbols(merged_allocation, positions):
+        status = economic_calendar.blackout_status(symbol, now_utc, calendar_events)
+        if not status.active:
+            continue
+        entry = merged_allocation[symbol]
+        logger.info(
+            "Event blackout: %s entry blocked this poll (%s) — pct %.4f%% -> 0.", symbol, status.reason, entry.pct
+        )
+        merged_allocation[symbol] = _with_changes(
+            entry, pct=0.0, reason=f"{entry.reason} [Event blackout: {status.reason} — no new/resting entry.]"
+        )
+    return merged_allocation
+
+
+def _tactical_event_note(symbol: str, now_utc: datetime, calendar_events: list | None) -> str | None:
+    """One advisory line for the tactical prompt: High-impact events for this symbol's
+    currencies within the next 3 hours (or a very recent one)."""
+    if not calendar_events:
+        return None
+    hits = economic_calendar.upcoming_events(
+        symbol, now_utc, hours_ahead=3.0, events=calendar_events, hours_back=0.25
+    )
+    if not hits:
+        return None
+    parts = []
+    for e in hits[:3]:
+        minutes = (e.time_utc - now_utc).total_seconds() / 60
+        when = f"in {minutes:.0f} min" if minutes >= 0 else f"{abs(minutes):.0f} min ago"
+        parts.append(f"{e.currency} {e.title} {when} ({e.time_utc:%H:%M} UTC)")
+    return "High-impact event(s) for this instrument's currencies: " + "; ".join(parts) + (
+        " — consider tightening the stop or trimming before it lands; volatility and spread can spike."
+    )
+
+
+def _weekly_close_note(symbol: str, now_utc: datetime) -> str | None:
+    """Advisory only (the user chose an advisory, not forced, same-day exit): on a Friday, within
+    3 hours of this instrument's weekly close, say so — a position held through it is held over
+    the weekend gap. Crypto trades through the weekend and gets nothing."""
+    if now_utc.weekday() != 4:
+        return None
+    try:
+        category = get_symbol_category(symbol)
+    except Exception:
+        return None
+    if category.startswith("Crypto"):
+        return None
+    close_hour = (
+        config.WEEKEND_FOREX_CLOSE_HOUR_UTC if category in ("Forex", "Exotics") else config.WEEKEND_OTHER_CLOSE_HOUR_UTC
+    )
+    minutes = close_hour * 60 - (now_utc.hour * 60 + now_utc.minute)
+    if not 0 < minutes <= 180:
+        return None
+    return (
+        f"the market closes for the weekend in about {minutes} min ({close_hour:02d}:00 UTC) — a position "
+        "held past that is held over the weekend gap, consider closing or tightening now."
+    )
+
+
+def _apply_intraday_size_scalar(
+    merged_allocation: dict[str, AllocationEntry],
+    positions: list[Position],
+    technical_context_cache: dict[str, tuple[FtmoAssetAnalysis, str]],
+    now_utc: datetime,
+    calendar_events: list | None,
+    account_equity: float | None = None,
+) -> dict[str, AllocationEntry]:
+    """Deterministic, M5-based risk-% scaling for NEW entries (lot sizing on the
+    decision tier; Python computes it, the pct Claude chose is the ceiling):
+
+    - Volatility scalar = median M5 ATR% / current M5 ATR%, clamped to
+      [config.INTRADAY_VOLATILITY_SCALAR_MIN, 1.0] — in an elevated-volatility tape
+      the same stop distance is less safe, so risk % shrinks; a calm tape never
+      sizes UP past what Claude chose.
+    - Event run-up scalar = config.EVENT_RUNUP_SIZE_SCALAR when a High-impact event
+      for the symbol's currencies lands within config.EVENT_RUNUP_HOURS (outside the
+      hard blackout window, which already zeroed such entries).
+
+    The scalar multiplies pct BEFORE compute_rebalance_plan turns pct into lots at the
+    final stop distance.
+
+    MINIMUM-LOT FLOOR (2026-09-25, XAGUSD on the ~$10k account): a scaled risk below what the broker's
+    minimum lot needs at the entry's own stop distance does not produce a smaller position, it produces NO
+    position ("can't afford even the minimum 0.01-lot"), silently killing a trade the Mega session and every
+    guard had just approved. When the scaled pct falls under the minimum-lot risk but that minimum-lot risk
+    still fits inside the pct Claude chose (its ceiling), the risk is raised to the minimum lot instead, and the
+    reason says so. If even the minimum lot exceeds Claude's ceiling the trade stays infeasible, as before
+    (config.SIZE_SCALAR_MIN_LOT_FLOOR=0 disables this)."""
+    for symbol in _candidate_symbols(merged_allocation, positions):
+        entry = merged_allocation[symbol]
+        fetched = technical_context_cache.get(symbol)
+        scalar = 1.0
+        notes: list[str] = []
+        if fetched is not None:
+            analysis, _ = fetched
+            current, median = analysis.m5_stats.atr_pct, analysis.m5_atr_pct_median
+            if current and median and current > 0 and median > 0:
+                vol_scalar = min(1.0, max(config.INTRADAY_VOLATILITY_SCALAR_MIN, median / current))
+                if vol_scalar < 0.999:
+                    scalar *= vol_scalar
+                    notes.append(f"M5 ATR% {current:.3f} vs its median {median:.3f} -> x{vol_scalar:.2f}")
+        if calendar_events:
+            upcoming = economic_calendar.upcoming_events(
+                symbol, now_utc, hours_ahead=config.EVENT_RUNUP_HOURS, events=calendar_events
+            )
+            if upcoming:
+                scalar *= config.EVENT_RUNUP_SIZE_SCALAR
+                notes.append(
+                    f"{upcoming[0].currency} {upcoming[0].title} within {config.EVENT_RUNUP_HOURS:g}h -> "
+                    f"x{config.EVENT_RUNUP_SIZE_SCALAR:.2f}"
+                )
+        if scalar >= 0.999:
+            continue
+        new_pct = entry.pct * scalar
+        floor_note = ""
+        if config.SIZE_SCALAR_MIN_LOT_FLOOR and account_equity and account_equity > 0 and fetched is not None:
+            spec = fetched[0].base.contract_spec
+            if spec is not None and entry.price is not None and entry.stop_loss is not None:
+                min_lot_pct = spec.volume_min * abs(entry.price - entry.stop_loss) * spec.risk_per_price_unit / account_equity * 100
+                if new_pct < min_lot_pct * 1.001 and min_lot_pct <= entry.pct:
+                    floor_note = f" raised to the minimum-lot risk {min(entry.pct, min_lot_pct * 1.02):.4f}% (the scaled {new_pct:.4f}% would buy no position; still within the chosen {entry.pct:.4f}%)"
+                    new_pct = min(entry.pct, min_lot_pct * 1.02)
+        logger.info(
+            "Intraday size scalar: %s risk %.4f%% -> %.4f%% (%s).%s", symbol, entry.pct, new_pct, "; ".join(notes), floor_note,
+        )
+        merged_allocation[symbol] = _with_changes(
+            entry, pct=new_pct,
+            reason=f"{entry.reason} [Intraday size scalar x{scalar:.2f}: {'; '.join(notes)}.{floor_note}]",
+        )
+    return merged_allocation
+
+
+def _stabilize_resting_orders(
+    merged_allocation: dict[str, AllocationEntry],
+    positions: list[Position],
+    technical_context_cache: dict[str, tuple[FtmoAssetAnalysis, str]],
+    settled: dict,
+) -> dict[str, AllocationEntry]:
+    """Order-churn hysteresis. Every guard above is recomputed from live M5 data each
+    poll, so the freshly computed price/stop/target/risk drift by small amounts poll to
+    poll; compute_rebalance_plan treats anything beyond AMEND_TOLERANCE_PCT (0.05%) as an
+    amend and would cancel-and-replace the resting order every few minutes (and reset its
+    age). When an order is already resting for this symbol and every new value is within
+    config.RESTING_ORDER_STABILITY_M5_ATR_MULTIPLE x the M5 ATR (risk % within
+    config.RESTING_ORDER_PCT_STABILITY_FRACTION) of what is resting, keep the resting
+    order's exact terms so the plan sees it as unchanged. A materially different plan
+    (or a rejected one, pct 0) still goes through untouched."""
+    for symbol in _candidate_symbols(merged_allocation, positions):
+        record = settled.get(symbol) or {}
+        if record.get("state") != "order_placed":
+            continue
+        prior = record.get("entry") or {}
+        entry = merged_allocation[symbol]
+        if prior.get("side") != entry.side:
+            continue
+        if normalise_entry_mode(prior.get("entry_mode")) != normalise_entry_mode(entry.entry_mode):
+            continue  # a different order kind is a real change, never smoothed away
+        p_price, p_stop, p_tp, p_pct = prior.get("price"), prior.get("stop_loss"), prior.get("take_profit"), prior.get("pct")
+        if None in (p_price, p_stop, p_pct) or not p_pct or entry.price is None or entry.stop_loss is None:
+            continue
+        fetched = technical_context_cache.get(symbol)
+        if fetched is None:
+            continue
+        analysis, _ = fetched
+        atr = analysis.m5_stats.atr or analysis.h1_stats.atr
+        if not atr or atr <= 0:
+            continue
+        tolerance = config.RESTING_ORDER_STABILITY_M5_ATR_MULTIPLE * atr
+        tp_same = (entry.take_profit is None and p_tp is None) or (
+            entry.take_profit is not None and p_tp is not None and abs(entry.take_profit - p_tp) <= tolerance
+        )
+        if (
+            abs(entry.price - p_price) <= tolerance
+            and abs(entry.stop_loss - p_stop) <= tolerance
+            and tp_same
+            and abs(entry.pct - p_pct) / p_pct <= config.RESTING_ORDER_PCT_STABILITY_FRACTION
+        ):
+            merged_allocation[symbol] = _with_changes(
+                entry, pct=p_pct, price=p_price, stop_loss=p_stop, take_profit=p_tp
+            )
+    return merged_allocation
+
+
+def _append_stale_pending_setup_cancels(
+    plan: list, pending_orders: list[PendingOrder], settled: dict, now_utc: datetime, max_age_hours: float
+) -> list:
+    """compute_rebalance_plan deliberately never sees a Pending-Setup order once Clerk
+    has placed it (its symbol is absent from the allocation on purpose — see that
+    function's own invariant), so its age ceiling never applied to those orders: an
+    M5-scale limit could rest for days. Cancels any such resting order older than
+    `max_age_hours`; the cancel handler clears the settlement record, so the setup is
+    re-checked fresh next poll. Symbols the plan already covers are left to it."""
+    covered = {o.symbol for o in plan}
+    by_symbol: dict[str, list[PendingOrder]] = {}
+    for order in pending_orders or []:
+        by_symbol.setdefault(order.symbol, []).append(order)
+    for symbol, record in settled.items():
+        if record.get("origin") != "pending_setup" or record.get("state") != "order_placed" or symbol in covered:
+            continue
+        orders = by_symbol.get(symbol, [])
+        setup_times = [o.time_setup for o in orders if o.time_setup is not None]
+        if not setup_times:
+            continue
+        oldest = min(setup_times)
+        if oldest.tzinfo is None:
+            oldest = oldest.replace(tzinfo=timezone.utc)
+        age_hours = (now_utc - oldest).total_seconds() / 3600
+        if age_hours <= max_age_hours:
+            continue
+        side = "buy" if orders[0].order_type.startswith("buy") else "sell"
+        plan.append(
+            PlannedOrder(
+                symbol=symbol, action="cancel", side=side, volume=sum(o.volume for o in orders),
+                order_type="none", price=None, stop_loss=None,
+                pending_tickets_to_cancel=[o.ticket for o in orders],
+                reason=(
+                    f"Cancelling: this confirmed pending-setup entry has rested unfilled for {age_hours:.1f}h, past the "
+                    f"{max_age_hours:g}h intraday ceiling — an M5-scale entry is stale by now; the setup is "
+                    "re-checked fresh next poll."
+                ),
+            )
+        )
+    return plan
 
 
 def _apply_atr_stop_floor_guard(
@@ -3046,11 +4640,15 @@ def _apply_atr_stop_floor_guard(
         if fetched is None:
             continue
         analysis, _ = fetched
-        atr = analysis.h1_stats.atr
-        if atr is None or atr <= 0:
+        # Decision-tier basis (2026-09-24): M5 ATR (H1 only when no M5 read exists), widened
+        # to the spread / broker-minimum / pipeline-minimum floors — one shared definition
+        # (ai.ftmo_suggest.effective_stop_floor) that the Mega Session sizing sheet also uses,
+        # so the numbers Claude sizes against are the numbers this guard enforces.
+        stop_floor = effective_stop_floor(analysis, entry.price)
+        if stop_floor is None:
             continue
-
-        floor_distance = config.ENTRY_ATR_STOP_FLOOR_MULTIPLE * atr
+        floor_distance, atr_label = stop_floor.distance, stop_floor.atr_label
+        atr = stop_floor.atr
         current_distance = abs(entry.price - entry.stop_loss)
         if current_distance >= floor_distance:
             continue
@@ -3060,9 +4658,10 @@ def _apply_atr_stop_floor_guard(
         )
         actual_multiple = current_distance / atr
         logger.info(
-            "ATR stop-floor guard: %s stop %.5f (%.2fx H1 ATR) is tighter than the %.2gx floor "
-            "— widening to %.5f.",
-            symbol, entry.stop_loss, actual_multiple, config.ENTRY_ATR_STOP_FLOOR_MULTIPLE, widened_stop,
+            "ATR stop-floor guard: %s stop %.5f (%.2fx %s ATR) is tighter than the %.2gx floor "
+            "(effective floor %.5f) — widening to %.5f.",
+            symbol, entry.stop_loss, actual_multiple, atr_label, stop_floor.multiple,
+            floor_distance, widened_stop,
         )
         merged_allocation[symbol] = AllocationEntry(
             pct=entry.pct,
@@ -3071,11 +4670,219 @@ def _apply_atr_stop_floor_guard(
             take_profit=entry.take_profit,
             side=entry.side,
             reason=(
-                f"{entry.reason} [ATR stop-floor guard: stop was {actual_multiple:.2f}x H1 ATR, "
-                f"below the {config.ENTRY_ATR_STOP_FLOOR_MULTIPLE:.2g}x floor — widened "
+                f"{entry.reason} [ATR stop-floor guard: stop was {actual_multiple:.2f}x {atr_label} ATR, "
+                f"below the {config.ENTRY_ATR_STOP_FLOOR_MULTIPLE:.2g}x floor (or the spread/broker minimum) — widened "
                 f"{entry.stop_loss:.5f} -> {widened_stop:.5f}.]"
             ),
             invalidation_condition=entry.invalidation_condition,
+            entry_mode=entry.entry_mode,
+        )
+    return merged_allocation
+
+
+def _side_relevant_win_rate(side: str, intraday: IntradayBacktests) -> float | None:
+    """Real M5 win rate (0-100) for the side-matching backtest(s), only
+    when backed by a genuinely large-enough resolved sample
+    (config.MIN_RESOLVED_TRADES_FOR_WIN_RATE_FLOOR) — never a thin-sample
+    number. A buy checks the oversold-RSI-long read and the support-bounce
+    read (the two setups that bet LONG); a sell checks overbought-RSI-
+    short and resistance-rejection (the two that bet SHORT) — see
+    analysis.backtest's own RSIReactionBacktest/SupportResistanceBacktest
+    docstrings for why each condition maps to that side.
+
+    Uses the WORSE (min) of the two when both qualify — the conservative
+    choice when two real, independent pieces of evidence disagree, not an
+    average that could let one optimistic read outvote a poor one.
+
+    None (never fabricated) when nothing qualifies — three real layers of
+    "unknown," not one: the whole backtest object can be None (thin
+    sample at analysis.backtest's own internal gate), `win_rate_pct`
+    itself can be None even when the object exists (every simulated trade
+    timed out — zero resolved, genuinely different from "0% winners"),
+    or `intraday` itself can be the all-None empty default (intraday
+    backtesting disabled, or M5 history came back empty for this
+    symbol)."""
+    if side == "buy":
+        rsi_bt = intraday.rsi_oversold_backtest
+        sr = intraday.support_resistance_backtest
+        sr_win = sr.support_win_rate_pct if sr is not None else None
+        sr_n = sr.support_tests if sr is not None else 0
+    else:
+        rsi_bt = intraday.rsi_overbought_backtest
+        sr = intraday.support_resistance_backtest
+        sr_win = sr.resistance_win_rate_pct if sr is not None else None
+        sr_n = sr.resistance_tests if sr is not None else 0
+
+    # A win-rate-derived (lower) R:R floor may only be earned by a setup the significance test calls
+    # SUPPORTED against the random-entry baseline (analysis.edge_stats): a raw ~27% win rate is what
+    # random entries score too, so it must never lower the bar. No verdict/baseline -> no lowering.
+    verdicts = intraday_edge_verdicts(intraday, side)
+
+    def _supported(key: str) -> bool:
+        verdict = verdicts.get(key)
+        return verdict is not None and verdict.verdict == EDGE_SUPPORTED
+
+    candidates = []
+    if (
+        rsi_bt is not None and rsi_bt.win_rate_pct is not None
+        and rsi_bt.trades >= config.MIN_RESOLVED_TRADES_FOR_WIN_RATE_FLOOR
+        and _supported("rsi")
+    ):
+        candidates.append(rsi_bt.win_rate_pct)
+    if sr_win is not None and sr_n >= config.MIN_RESOLVED_TRADES_FOR_WIN_RATE_FLOOR and _supported("sr"):
+        candidates.append(sr_win)
+    return min(candidates) if candidates else None
+
+
+def _apply_reward_risk_floor_guard(
+    merged_allocation: dict[str, AllocationEntry],
+    positions: list[Position],
+    technical_context_cache: dict[str, tuple[FtmoAssetAnalysis, str]] | None = None,
+) -> dict[str, AllocationEntry]:
+    """Real incident this closes (2026-09-17): a real INTC pending order
+    came out at exactly 1:1 net reward:risk — traced to two genuinely
+    CORRECT mechanisms colliding (INTC's own H1 ATR forcing a stop ~2x
+    that ATR to survive its own noise; the account's own same-session
+    realism ceiling capping the target at ~1.5-2x that SAME ATR), not a
+    bug in either one. When both land on the same ATR multiple, ~1:1 is
+    the best MATHEMATICALLY achievable ratio for that instrument right
+    then — no cleverer entry/stop/target choice fixes it. The account's
+    own instruction text (ai/ftmo_suggest.py:587-623) already names this
+    exact situation and offers "size it smaller, treat it as lower-
+    conviction, or leave it out" as equally-valid options, with no
+    threshold saying when "leave it out" stops being optional — see
+    config.MIN_NET_REWARD_RISK_RATIO's own comment for the real expected-
+    value math (a 38%-win-rate setup, genuinely SUPPORTED by this
+    account's own backtest at a 2:1 target, is NEGATIVE expected value at
+    1:1) showing why "size it smaller" doesn't fix the sign of the
+    problem, only its magnitude.
+
+    Same architectural slot as _apply_atr_stop_floor_guard immediately
+    above, run AFTER it deliberately: that guard may have just WIDENED
+    this candidate's stop (a real risk increase), and this guard must
+    judge the FINAL stop distance, not a pre-widening one that would
+    understate how bad the ratio really is. Same candidate framing too
+    (pct > 0, not already an open position) — an existing position's own
+    tactical management is a completely different decision (adjusting
+    risk already taken), never touched here.
+
+    Unlike the stop-floor guard, this one REJECTS rather than resizes:
+    there is no safe, mechanical adjustment available (tightening the
+    stop reintroduces the noise-stop-out risk the ATR floor exists to
+    prevent; extending the target breaks the same-session realism
+    ceiling) — the honest response to a genuinely unfixable ratio is to
+    not take the trade, exactly as ai/ftmo_suggest.py's own "leave it
+    out" option already names, just enforced instead of left optional.
+
+    Cost-netting is deliberately spread-only for this pass (TradeCost.
+    spread_pct_of_price), not spread+commission — commission would also
+    need get_contract_spec, a second fetch not otherwise needed at this
+    call site; spread is the cost component that always applies and is
+    already on the same TradeCost object. A real, disclosed MVP scoping,
+    not an oversight — commission-inclusion is a cheap, valuable later
+    refinement, not a blocker.
+
+    Skips (never fabricates a verdict) a symbol missing price/stop_loss/
+    take_profit, one whose real TradeCost isn't available (get_trade_
+    economics returns None — real cost data is a prerequisite for a
+    genuinely cost-netted check, same posture used everywhere else real
+    cost feeds this account's math), or one with a zero/invalid risk
+    distance.
+
+    `technical_context_cache` (added 2026-09-18, defaulted to None so no
+    existing caller/test breaks) makes the floor win-rate-aware instead
+    of one flat number for every candidate: when this account's own real
+    M5 intraday backtest evidence (see _side_relevant_win_rate) gives a
+    genuinely reliable win rate for this candidate's own side, the
+    required ratio becomes that win rate's OWN real breakeven point
+    (with a safety margin), which can be LOWER than the flat default for
+    a well-supported small-target setup — see config.MIN_RESOLVED_
+    TRADES_FOR_WIN_RATE_FLOOR's own comment. Falls back to the flat
+    config.MIN_NET_REWARD_RISK_RATIO whenever no cache is given, the
+    symbol isn't in it, no reliable win rate is available, OR (fixed
+    2026-09-21, real incident: a genuine MSFT double-bottom setup with
+    its own cited 44% D1 win rate was rejected here purely because this
+    same symbol's UNRELATED M5 scalp win rate read 23%) the win-rate-
+    derived number would RAISE the requirement above the flat default —
+    this M5 evidence is about one specific generic RSI-reaction/
+    support-touch strategy, not necessarily the candidate's own real
+    entry thesis, so it's only ever trusted to make the bar EASIER, never
+    harder, than the flat default."""
+    exposed_symbols = {p.symbol for p in positions}
+    candidates = sorted(
+        symbol for symbol, entry in merged_allocation.items()
+        if symbol != "CASH" and entry.pct > 0 and symbol not in exposed_symbols
+    )
+    for symbol in candidates:
+        entry = merged_allocation[symbol]
+        if entry.price is None or entry.stop_loss is None or entry.take_profit is None:
+            continue
+        trade_cost = get_trade_economics(symbol)
+        if trade_cost is None:
+            continue
+        risk = abs(entry.price - entry.stop_loss)
+        if risk <= 0:
+            continue
+        reward = abs(entry.take_profit - entry.price)
+        cost_distance = trade_cost.spread_pct_of_price / 100 * entry.price
+        net_rr = (reward - cost_distance) / risk
+
+        required_rr = config.MIN_NET_REWARD_RISK_RATIO
+        floor_basis = f"flat {config.MIN_NET_REWARD_RISK_RATIO:g}:1 default"
+        fetched = technical_context_cache.get(symbol) if technical_context_cache else None
+        if fetched is not None:
+            analysis, _ = fetched
+            win_rate_pct = _side_relevant_win_rate(entry.side, analysis.intraday_backtests)
+            if win_rate_pct is not None and 0 < win_rate_pct < 100:
+                win_rate = win_rate_pct / 100.0
+                breakeven_rr = (1 - win_rate) / win_rate
+                win_rate_derived_rr = max(
+                    config.MIN_ABSOLUTE_NET_REWARD_RISK_RATIO,
+                    breakeven_rr * config.WIN_RATE_FLOOR_SAFETY_MARGIN,
+                )
+                # Real incident found live 2026-09-21, direct user report:
+                # this M5 win rate reflects one specific, generic RSI-
+                # reaction/support-touch scalp strategy — for a candidate
+                # whose own real entry thesis is unrelated to that (e.g. a
+                # D1-pattern-triggered full-session swing with its own,
+                # far more relevant backtest already cited in its reason —
+                # a real MSFT double-bottom setup with a genuine 44% D1
+                # win rate got rejected here on an unrelated 23% M5 scalp
+                # reading), letting an unrelated M5 sample RAISE the bar
+                # rejects a trade on evidence that was never actually
+                # about it. Only ever let this LOWER the requirement below
+                # the flat default (the case this was designed for — a
+                # well-evidenced M5 setup earns an easier bar) — never
+                # raise it above the flat default from a mismatched or
+                # poor M5 sample.
+                if win_rate_derived_rr < required_rr:
+                    required_rr = win_rate_derived_rr
+                    floor_basis = f"win-rate-derived ({win_rate_pct:.0f}% real M5 win rate)"
+
+        if "Stale-entry re-anchor" in (entry.reason or ""):
+            required_rr += config.REANCHORED_ENTRY_RR_MARGIN
+            floor_basis += f" +{config.REANCHORED_ENTRY_RR_MARGIN:g} re-anchor margin"
+
+        if net_rr >= required_rr:
+            continue
+
+        logger.info(
+            "Reward:risk floor guard: %s net R:R %.2f:1 is below the %.2f:1 floor (%s) — "
+            "rejecting (pct %.4f%% -> 0%%), not downsizing.",
+            symbol, net_rr, required_rr, floor_basis, entry.pct,
+        )
+        merged_allocation[symbol] = AllocationEntry(
+            pct=0.0,
+            price=entry.price,
+            stop_loss=entry.stop_loss,
+            take_profit=entry.take_profit,
+            side=entry.side,
+            reason=(
+                f"{entry.reason} [reward:risk floor guard: net R:R {net_rr:.2f}:1 is below the "
+                f"{required_rr:.2f}:1 floor ({floor_basis}) — rejected, not downsized.]"
+            ),
+            invalidation_condition=entry.invalidation_condition,
+            entry_mode=entry.entry_mode,
         )
     return merged_allocation
 
@@ -3159,7 +4966,7 @@ def _export_chart_overlay(
         logger.warning("Chart overlay export failed this poll (cosmetic only, continuing).", exc_info=True)
 
 
-def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> None:
+def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None, fast: bool = False, think: bool = False) -> None:
     """The full execution-check orchestration — see this module's own docstring
     for the design this implements. Never raises for an anticipated
     failure mode (a missing suggestion, a blocked safety gate, an
@@ -3167,28 +4974,47 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
     a genuinely unexpected exception is left to propagate so the caller
     (clerk_execution_job.py, wrapped in run_with_timeout) can record
     it distinctly, matching ai.mega_analysis.run_scheduled_mega_analysis's
-    own "never silently swallow a real failure" convention."""
+    own "never silently swallow a real failure" convention.
+
+    `fast=True` is the FAST LANE (clerk_fast_job.py, every minute): the identical deterministic pipeline - reconcile, every guard,
+    structured triggers, the rebalance plan, order execution, the deterministic circuit-breakers and profit trail - with NO model
+    call (free-text pending triggers, invalidation checks and discretionary tactical verdicts stay with the full poll). It never
+    writes the live progress file, never advances the full poll's review-interval marker and keeps the desk's headline status, so a
+    full poll is neither delayed nor confused by it. Why it exists: one full poll (interval + a minutes-long local-model round)
+    is a whole candle or more, and nothing about placing or amending an order needs a model.
+
+    THINKING vs ACTING (config.CLERK_THINK_SPLIT_ENABLED, default on; see ai/clerk_thinking.py): with the split on, NO acting pass
+    (this function without `think`) ever calls the model - it acts in seconds, using the freshest unused verdict the separate thinking
+    pass stored. `think=True` is that thinking pass (clerk_think_job.py, its own lock): it builds the same lists, runs the model calls,
+    stores the verdicts and returns without touching the settlement file, the journal, the desk status or any order."""
+    quiet = fast or think  # no live-progress line, no headline status
+    act_only = (fast or config.CLERK_THINK_SPLIT_ENABLED) and not think  # this pass never calls the model
+    thinker_applied = 0  # verdicts an acting pass took from the thinking cache
 
     def _notify(message: str) -> None:
         logger.info(message)
-        _write_execution_progress(message)
+        if not quiet:
+            _write_execution_progress(message)
         if on_stage:
             on_stage(message)
 
     if not read_clerk_execution_enabled():
         _notify("Execution Clerk is disabled via the app's toggle — skipping this check.")
-        _write_execution_state("disabled")
+        if not quiet:
+            _write_execution_state("disabled")
         return
 
     if _mega_session_is_live(read_mega_progress(), read_mega_state()):
         _notify("A mega analysis session is currently running — skipping this check.")
-        _write_execution_state("skipped_mega_live")
+        if not quiet:
+            _write_execution_state("skipped_mega_live")
         return
 
     suggestion = read_latest_suggestion()
     if not suggestion:
         _notify("No mega-analysis suggestion on file yet — nothing to check.")
-        _write_execution_state("no_suggestion")
+        if not quiet:
+            _write_execution_state("no_suggestion")
         return
 
     generated_utc = suggestion.get("generated_utc")
@@ -3199,7 +5025,7 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
             symbol=s["symbol"], side=s["side"], pct=s["pct"],
             trigger_condition=s["trigger_condition"], price=s.get("price"),
             stop_loss=s.get("stop_loss"), take_profit=s.get("take_profit"),
-            reason=s.get("reason", ""),
+            reason=s.get("reason", ""), trigger=normalise_trigger(s.get("trigger")),
         )
         for s in pending_setups_raw
     ]
@@ -3224,6 +5050,11 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
     # cleanup widening further down) — see is_symbol_tradable_now's own
     # docstring.
     now_utc = datetime.now(timezone.utc)
+    try:
+        calendar_events = economic_calendar.fetch_calendar_events(now_utc)
+    except Exception:
+        logger.warning("Economic calendar unavailable this poll (event awareness disabled).", exc_info=True)
+        calendar_events = []
     # First position found per symbol — same accepted "compare only the
     # first ticket" simplification risk/apply_suggestion.py::compute_
     # rebalance_plan's own amend-in-place path already documents for a
@@ -3235,12 +5066,37 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
     old_settled = settlement.get("settled", {})
     settlement["settled"] = _reconcile_settlement(old_settled, positions, pending_orders)
     newly_closed_symbols = _detect_newly_closed_symbols(old_settled, settlement["settled"])
-    if newly_closed_symbols and config.CLERK_VAULT_JOURNAL_ENABLED:
+    if newly_closed_symbols and config.CLERK_VAULT_JOURNAL_ENABLED and not think:
         _export_closed_trade_notes(newly_closed_symbols, old_settled)
+    # Trade Journal (direct user request 2026-09-19): purely additive,
+    # best-effort side effects run alongside the existing vault-note
+    # export above — neither call can affect `settlement`, `positions`,
+    # or anything this function returns; see ai.trade_journal's own
+    # module docstring for the full "never puncture existing logic"
+    # contract.
+    for filled_symbol, filled_rec in ([] if think else _detect_newly_filled_symbols(old_settled, settlement["settled"])):
+        trade_journal.record_filled(
+            filled_symbol, filled_rec.get("order_ticket"), filled_rec.get("entry", {}).get("price")
+        )
+    if not think:
+        _record_trade_journal_closures(newly_closed_symbols, old_settled)
+        _reconcile_journal_unknown_closures(settlement["settled"])
     settlement["settled"] = _backfill_settlement_for_held_positions(
         settlement["settled"], positions, immediate_allocation_raw, account.equity, get_contract_spec,
     )
-    _save_settlement(settlement)
+    # The Sentinel's (ai/sentinel.py) trailed stops become the recorded stops BEFORE the carried-forward target and the
+    # drift check are built, so neither treats them as external interference. Best-effort: never blocks the poll.
+    try:
+        settlement["settled"], sentinel_notes = ingest_sentinel_stops(
+            settlement["settled"], {p.symbol: p for p in positions}, read_sentinel_state().get("stops", {}),
+            account.equity, get_contract_spec, pct_for_target_lots,
+        )
+        for note in sentinel_notes:
+            logger.info("Sentinel: %s", note)
+    except Exception:  # noqa: BLE001
+        logger.warning("Could not ingest the Sentinel's stops - continuing without them.", exc_info=True)
+    if not think:  # the thinking pass reads the settlement, never writes it
+        _save_settlement(settlement)
 
     carried_forward = _build_carried_forward_allocation(
         immediate_allocation_raw, settlement["settled"], held_symbols=frozenset(positions_by_symbol)
@@ -3256,7 +5112,15 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
     # position into a real loss: "do not wait for any human intervention
     # just act and save the equity." See _restore_external_stop_drift's
     # own docstring for the full reasoning.
-    for drift_outcome in _restore_external_stop_drift(positions_by_symbol, settlement["settled"], carried_forward):
+    # The restore MODIFIES (or even closes) a live position - an action, so never in the thinking pass.
+    # ...and never against a CLOSED market or a symbol already in "Market closed" backoff: every attempt (a stop modify, then the
+    # market-close fallback) is rejected by the broker, once per pass - 2026-09-26, XAGUSD on a Saturday, dozens of rejected orders.
+    _drift_backoff = settlement.get("order_backoff", {})
+    _drift_candidates = {
+        s: p for s, p in positions_by_symbol.items()
+        if is_symbol_tradable_now(s, now_utc) and _order_backoff_until(_drift_backoff, s, now_utc) is None
+    }
+    for drift_outcome in ([] if think else _restore_external_stop_drift(_drift_candidates, settlement["settled"], carried_forward)):
         # "STILL OPEN" marks the one genuinely dangerous residual case
         # (see _close_after_failed_stop_restore's own docstring): both
         # the restore AND the market-close fallback failed, so the
@@ -3382,14 +5246,26 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
     # "immediate allocation" instead. See the unconditional pass over
     # merged_allocation further down, right before _export_chart_overlay,
     # which now covers exactly this gap.
+    # A symbol the Clerk only has to DEFEND (an open position with no new entry / pending setup on it) gets the LEAN analysis:
+    # measured 3.5 s -> ~1 s per symbol, and it is fetched once per acting pass, every minute.
+    _new_entry_symbols = {s.symbol for s in pending_setups}
+    _lean_symbols = (
+        {s for s in positions_by_symbol if s not in _new_entry_symbols} if config.CLERK_LEAN_ANALYSIS else set()
+    )
+
     def _cached_technical_context(symbol: str) -> tuple[FtmoAssetAnalysis, str] | None:
         if symbol not in technical_context_cache:
-            fetched = _fetch_technical_context(symbol, market_prices, account.equity)
+            fetched = (
+                _fetch_technical_context(symbol, market_prices, account.equity, lean=True)
+                if symbol in _lean_symbols else _fetch_technical_context(symbol, market_prices, account.equity)
+            )
             if fetched is None:
                 return None
             technical_context_cache[symbol] = fetched
         return technical_context_cache[symbol]
 
+    quick_lane_notes: list[str] = []  # what the deterministic gates decided this poll (shown in the desk's status line)
+    llm_lane_counts = {"pending setups": 0, "invalidation checks": 0, "tactical checks": 0}
     if not_yet_settled or watched_positions or tactical_candidates:
         if not_yet_settled:
             _notify(f"Checking {len(not_yet_settled)} pending setup(s) against live technicals...")
@@ -3406,6 +5282,10 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
         # tactical candidate) is only ever fetched once.
 
         checkable: list[tuple[PendingSetup, str, str]] = []
+        # Structured triggers (analysis/triggers.py) are evaluated HERE in Python on the completed M5 bars - no LLM call -
+        # and their (setup, fired, reason) results join the merge loop first, in the same shape as an LLM verdict.
+        trigger_results: list[tuple[PendingSetup, bool, str]] = []
+        deterministic_invalidations: list[tuple[str, bool, str]] = []  # mechanical M5 invalidation lines, decided in Python
         for setup in not_yet_settled:
             # Real gap this closes, caught on a self-recheck: this is the
             # one Clerk decision point that places a genuinely NEW order
@@ -3430,7 +5310,16 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
             if fetched is None:
                 logger.warning("%s is not currently visible in Market Watch — skipped.", setup.symbol)
                 continue
-            _, technical_context = fetched
+            trigger_analysis, technical_context = fetched
+            technical_context = _context_for_condition(trigger_analysis, technical_context, setup.trigger_condition, account.equity)
+            if setup.trigger is not None:
+                quote = market_prices[setup.symbol]
+                outcome = evaluate_trigger(
+                    setup.trigger, setup.side, trigger_analysis.m5_recent, quote.bid, quote.ask,
+                    trigger_analysis.m5_stats.atr if trigger_analysis.m5_stats is not None else None,
+                )
+                trigger_results.append((setup, outcome.fired, f"[structured trigger] {outcome.reason}"))
+                continue
             checkable.append((setup, technical_context, market_prices[setup.symbol].description))
 
         checkable_watched: list[tuple[str, dict, str, str, str]] = []
@@ -3439,7 +5328,12 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
             if fetched is None:
                 logger.warning("%s (watched) is not currently visible in Market Watch — skipped.", symbol)
                 continue
-            _, technical_context = fetched
+            watched_analysis, technical_context = fetched
+            mechanical = deterministic_invalidation(raw, invalidation_condition, watched_analysis)
+            if mechanical is not None:
+                deterministic_invalidations.append((symbol, mechanical[0], mechanical[1]))
+                continue
+            technical_context = _context_for_condition(watched_analysis, technical_context, invalidation_condition, account.equity)
             checkable_watched.append((symbol, raw, invalidation_condition, state, technical_context))
 
         checkable_tactical: list[tuple[str, AllocationEntry, Position, str, dict | None, TacticalSignals]] = []
@@ -3456,7 +5350,13 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
             position = positions_by_symbol[symbol]
             signals = _compute_tactical_signals(
                 position, entry, analysis.h1_stats, analysis.h4_stats, analysis.h1_structure, analysis.base,
-                prior_tactical,
+                prior_tactical, trade_cost=analysis.trade_cost,
+                m5_stats=analysis.m5_stats, m5_structure=analysis.m5_structure,
+                m5_atr_pct_median=analysis.m5_atr_pct_median,
+                intraday_backtests=analysis.intraday_backtests,
+                event_note=" ".join(
+                    n for n in (_tactical_event_note(symbol, now_utc, calendar_events), _weekly_close_note(symbol, now_utc)) if n
+                ) or None,
             )
             checkable_tactical.append((symbol, entry, position, technical_context, prior_tactical, signals))
 
@@ -3469,6 +5369,13 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
         # share the same isinstance(result[1], TacticalVerdict) dispatch
         # against.
         tactical_signals_by_symbol = {s: sig for s, _e, _p, _tc, _pt, sig in checkable_tactical}
+        llm_lane_counts["pending setups"] = len(checkable)
+        llm_lane_counts["invalidation checks"] = len(checkable_watched)
+        llm_lane_counts["tactical checks"] = len(checkable_tactical)
+        for _setup, _fired, _text in trigger_results:
+            quick_lane_notes.append(
+                f"{_setup.symbol} {'trigger FIRED' if _fired else 'trigger not fired'} ({_text.replace('[structured trigger] ', '')})"
+            )
 
         # Phase 2 (submitted in parallel, LLM-bound): pure local HTTP
         # calls, no MT5 involvement. Known limitation as of 2026-08-30
@@ -3495,35 +5402,78 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
         # rule: by the time a tactical result is merged, any invalidation
         # CONFIRMED (or the mega session's own fresh 0% target) for the
         # same symbol has already been applied.
-        if checkable or checkable_watched or checkable_tactical:
+        tactical_fingerprints: dict[str, str] = {}
+        if checkable or checkable_watched or checkable_tactical or trigger_results or deterministic_invalidations:
             elapsed_description = _describe_elapsed(generated_utc, datetime.now(timezone.utc))
-            with ThreadPoolExecutor(
-                max_workers=len(checkable) + len(checkable_watched) + len(checkable_tactical)
-            ) as pool:
-                futures = [
-                    pool.submit(
-                        _run_clerk_verdict, setup, technical_context, account.equity, elapsed_description, description
+            if act_only:
+                # An acting pass NEVER waits for the model: deterministic breakers fire now, and the freshest unused thinking verdict
+                # (if any) is taken from the cache the thinking job keeps filled.
+                cached_results, thinker_applied = _cached_thinking_results(
+                    checkable, checkable_watched, checkable_tactical, account.equity, generated_utc
+                )
+                results = trigger_results + deterministic_invalidations + cached_results
+            elif config.CLERK_LLM_SEQUENTIAL:
+                # One model call at a time, most urgent first (an open position's tactical review, then invalidation checks, then
+                # pending triggers). The local Ollama server runs ONE generation at a time anyway, so submitting them all at once
+                # bought no speed and made every request wait in its queue against the same per-call timeout: the later ones timed
+                # out (300 s) and fell back to the backup model - the multi-minute polls of 2026-09-25/26.
+                think_cache = clerk_thinking.for_suggestion(clerk_thinking.load_cache(), generated_utc) if think else {}
+                think_now = datetime.now(timezone.utc)
+                tactical_done = []
+                for symbol, entry, position, technical_context, prior_tactical, signals in checkable_tactical:
+                    tactical_fingerprints[symbol] = _tactical_fingerprint(position, signals)
+                    if think and config.CLERK_THINK_REUSE_MAX_MINUTES > 0 and _tactical_unchanged(
+                        think_cache, symbol, tactical_fingerprints[symbol], think_now
+                    ):
+                        logger.info("%s: nothing moved since the last HOLD - not asking the model again.", symbol)
+                        tactical_done.append((symbol, TacticalVerdict(tier="hold"), _REUSED_RAW))
+                        continue
+                    tactical_done.append(
+                        _run_clerk_tactical_check(symbol, entry, position, technical_context, account.equity, prior_tactical, signals)
                     )
-                    for setup, technical_context, description in checkable
-                ] + [
-                    pool.submit(
-                        _run_clerk_invalidation_check, symbol, raw, cond, technical_context,
-                        account.equity, elapsed_description, state,
+                invalidation_done = [
+                    _run_clerk_invalidation_check(
+                        symbol, raw, cond, technical_context, account.equity, elapsed_description, state
                     )
                     for symbol, raw, cond, state, technical_context in checkable_watched
-                ] + [
-                    pool.submit(
-                        _run_clerk_tactical_check, symbol, entry, position, technical_context,
-                        account.equity, prior_tactical, signals,
-                    )
-                    for symbol, entry, position, technical_context, prior_tactical, signals in checkable_tactical
                 ]
-                results = [f.result() for f in futures]
+                pending_done = [
+                    _run_clerk_verdict(setup, technical_context, account.equity, elapsed_description, description)
+                    for setup, technical_context, description in checkable
+                ]
+                results = trigger_results + deterministic_invalidations + pending_done + invalidation_done + tactical_done
+            else:
+                with ThreadPoolExecutor(
+                    max_workers=max(1, len(checkable) + len(checkable_watched) + len(checkable_tactical))
+                ) as pool:
+                    futures = [
+                        pool.submit(
+                            _run_clerk_verdict, setup, technical_context, account.equity, elapsed_description, description
+                        )
+                        for setup, technical_context, description in checkable
+                    ] + [
+                        pool.submit(
+                            _run_clerk_invalidation_check, symbol, raw, cond, technical_context,
+                            account.equity, elapsed_description, state,
+                        )
+                        for symbol, raw, cond, state, technical_context in checkable_watched
+                    ] + [
+                        pool.submit(
+                            _run_clerk_tactical_check, symbol, entry, position, technical_context,
+                            account.equity, prior_tactical, signals,
+                        )
+                        for symbol, entry, position, technical_context, prior_tactical, signals in checkable_tactical
+                    ]
+                    results = trigger_results + deterministic_invalidations + [f.result() for f in futures]
 
             ollama_health_note = _detect_ollama_outage(results)
             if ollama_health_note:
                 logger.warning(ollama_health_note)
                 _notify(f"WARNING — {ollama_health_note}")
+            if think:
+                _store_thinking_results(results, generated_utc, tactical_fingerprints)
+                _notify(f"Thinking pass finished: {len(results)} verdict(s) stored for the acting passes.")
+                return
             # Merged on the main thread, in original list order, after
             # every future resolves — never inside a worker thread — so
             # completion order can never make this non-deterministic.
@@ -3541,6 +5491,10 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
                         "confirmed": confirmed, "raw_text": raw,
                         "checked_utc": datetime.now(timezone.utc).isoformat(),
                     }
+                    # Trade Journal (direct user request 2026-09-19):
+                    # purely additive, best-effort — see this call's own
+                    # sibling below for the full rationale.
+                    trade_journal.record_clerk_check(setup.symbol, "pending_setup_trigger", confirmed, raw)
                     # The full reasoning text is logged here too (direct
                     # user request 2026-08-23: "also write this in a log
                     # somewhere") — previously it only ever landed in
@@ -3553,11 +5507,19 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
                     )
                     if confirmed:
                         merged_allocation[setup.symbol] = AllocationEntry(
-                            pct=setup.pct, price=setup.price, stop_loss=setup.stop_loss,
+                            # A fired trigger's plan price is the TRIGGER LEVEL (what the entry guard measures the market
+                            # entry's slippage from), not the model's estimate of the price at trigger time.
+                            pct=setup.pct, price=setup.trigger["level"] if setup.trigger is not None else setup.price,
+                            stop_loss=setup.stop_loss,
                             take_profit=setup.take_profit, side=setup.side, reason=setup.reason,
+                            # A fired structured trigger means "go now with the trend": the market kind still passes every
+                            # entry-mode guard (caps, extension, stale re-anchor, kill switch) further down this poll.
+                            entry_mode="market" if setup.trigger is not None else "limit",
                         )
                 elif isinstance(result[1], TacticalVerdict):
                     symbol, verdict, raw = result
+                    if raw == _FAST_LANE_RAW:
+                        continue  # nothing fired and no thinking verdict yet: never overwrite the last real verdict with a placeholder
                     logger.info(
                         "Clerk tactical check for %s: %s — %s", symbol, verdict.tier.upper(),
                         raw[:1000] if raw else "(no response text)",
@@ -3630,12 +5592,18 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
                         "shadow_mode": not tactical_enabled and not verdict.hard_exit,
                         "skipped_reason": skipped_reason,
                     }
+                    # Trade Journal (direct user request 2026-09-19):
+                    # purely additive, best-effort — records the SAME
+                    # decision already reflected above, never influences
+                    # `applied`/`merged_allocation`/`settlement` itself.
+                    trade_journal.record_tactical_action(symbol, verdict.tier, applied, skipped_reason, raw)
                 else:
                     symbol, confirmed, raw = result
                     last_verdicts[symbol] = {
                         "confirmed": confirmed, "raw_text": raw,
                         "checked_utc": datetime.now(timezone.utc).isoformat(),
                     }
+                    trade_journal.record_clerk_check(symbol, "invalidation", confirmed, raw)
                     logger.info(
                         "Clerk invalidation check for %s: %s — %s", symbol,
                         "CONFIRMED (invalidated)" if confirmed else "NOT_CONFIRMED (still holds)",
@@ -3662,6 +5630,11 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
                             reason=f"Invalidation condition fired: {raw[:200] if raw else ''}",
                         )
 
+    if think:  # nothing needed a model this pass: it still counts as completed
+        _store_thinking_results([], generated_utc)
+        _notify("Thinking pass finished: nothing needed a model.")
+        return
+
     merged_allocation = _apply_correlation_guard(merged_allocation, positions)
 
     # Fills the real gap _cached_technical_context's own comment above
@@ -3681,8 +5654,43 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
 
     # Runs AFTER the fetch-loop above, never before: every pct>0 symbol's
     # fresh H1 ATR is only guaranteed to be in technical_context_cache
-    # once that loop has run.
+    # once that loop has run. Intraday entry refinement runs FIRST in
+    # this trio — see its own docstring for why: the ATR-stop-floor
+    # guard must validate the FINAL (possibly just-refined) stop
+    # distance, not a pre-refinement one.
+    pct_pre_guard = {symbol: entry.pct for symbol, entry in merged_allocation.items()}
+    merged_allocation = _apply_invalidation_guard(merged_allocation, positions, market_prices)
+    merged_allocation = _apply_event_blackout_guard(merged_allocation, positions, now_utc, calendar_events)
+    guard_cooldowns = settlement.setdefault("guard_cooldowns", {})
+    merged_allocation = _apply_guard_cooldown(merged_allocation, positions, guard_cooldowns, now_utc)
+    merged_allocation = _apply_pre_close_guard(
+        merged_allocation, positions, pending_orders, now_utc, _broker_clock_offset(sorted(market_prices))
+    )
+    pct_before_guards = {symbol: entry.pct for symbol, entry in merged_allocation.items()}
+    today_key = now_utc.strftime("%Y-%m-%d")
+    market_entries = settlement.setdefault("market_entries", {})
+    merged_allocation, entry_deviation_caps = _apply_entry_mode_guard(
+        merged_allocation, positions, pending_orders, technical_context_cache, market_prices,
+        {symbol for symbol, day in market_entries.items() if day == today_key},
+    )
+    entry_mode_rejected = {
+        symbol for symbol, before in pct_before_guards.items()
+        if before > 0 and merged_allocation.get(symbol) is not None and merged_allocation[symbol].pct <= 0
+    }
+    merged_allocation = _apply_stale_entry_reanchor(merged_allocation, positions, technical_context_cache)
     merged_allocation = _apply_atr_stop_floor_guard(merged_allocation, positions, technical_context_cache)
+    merged_allocation = _apply_reward_risk_floor_guard(merged_allocation, positions, technical_context_cache)
+    if _record_guard_rejections(
+        pct_before_guards, merged_allocation, positions, guard_cooldowns, now_utc, skip=entry_mode_rejected
+    ):
+        _save_settlement(settlement)
+    guard_blocks = _guard_blocks_this_poll(pct_pre_guard, merged_allocation, positions, guard_cooldowns)
+    merged_allocation = _apply_intraday_size_scalar(
+        merged_allocation, positions, technical_context_cache, now_utc, calendar_events, account_equity=account.equity
+    )
+    merged_allocation = _stabilize_resting_orders(
+        merged_allocation, positions, technical_context_cache, settlement["settled"]
+    )
 
     _export_chart_overlay(technical_context_cache, merged_allocation, positions_by_symbol, pending_orders)
 
@@ -3735,6 +5743,8 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
         blocked_detail = fundamental_block_reason
         if ollama_health_note:
             blocked_detail += f" | WARNING: {ollama_health_note}"
+        if fast:
+            return  # logged above; the full poll records the blocked status
         _write_execution_state(
             "blocked", blocked_detail, last_verdicts=last_verdicts, last_tactical_verdicts=last_tactical_verdicts,
         )
@@ -3784,16 +5794,24 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
                 s for s in pending_symbols if is_symbol_tradable_now(s, now_utc)
             }
 
+    broker_now = now_utc + _broker_clock_offset(sorted(market_prices))
+    deliberate_resize = _pending_partial_symbols(settlement["settled"], positions_by_symbol, merged_allocation)
     plan = compute_rebalance_plan(
         positions, account, merged_allocation, get_contract_spec, market_prices,
         price_sanity_band_pct=config.PRICE_SANITY_BAND_PCT,
         pending_orders=pending_orders,
         amend_tolerance_pct=config.AMEND_TOLERANCE_PCT,
-        max_pending_order_age_hours=config.MAX_PENDING_ORDER_AGE_HOURS,
+        max_pending_order_age_hours=config.INTRADAY_PENDING_ORDER_MAX_AGE_HOURS,
         min_stop_distance_pct=config.MIN_STOP_DISTANCE_PCT,
         held_position_size_tolerance_pct=config.HELD_POSITION_SIZE_TOLERANCE_PCT,
         is_pre_weekend=pre_weekend_due,
         weekend_tradable_symbols=weekend_tradable_symbols,
+        deliberate_resize_symbols=deliberate_resize,
+        max_position_margin_pct_of_equity=config.MAX_POSITION_MARGIN_PCT_OF_EQUITY,
+        now=broker_now,
+    )
+    plan = _append_stale_pending_setup_cancels(
+        plan, pending_orders, settlement["settled"], broker_now, config.INTRADAY_PENDING_ORDER_MAX_AGE_HOURS
     )
 
     executed_count = 0
@@ -3810,8 +5828,21 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
         results_this_poll[symbol] = {
             "action": action, "success": success, "detail": detail, "checked_utc": checked_utc,
         }
+        if action == "hold" and symbol in guard_blocks:
+            # Nothing was sent because a guard held the target at 0% - say so, instead of "on target, no change needed".
+            results_this_poll[symbol]["detail"] = f"held back by a guard: {guard_blocks[symbol]}"
+            results_this_poll[symbol]["guard_blocked"] = True
 
+    order_backoff = settlement.setdefault("order_backoff", {})
     for o in plan:
+        deferred_until = _order_backoff_until(order_backoff, o.symbol, now_utc)
+        if deferred_until is not None and o.action != "infeasible":
+            logger.info(
+                "%s (%s): deferred — the market was closed on the last attempt; not retrying before %s UTC.",
+                o.symbol, o.action, deferred_until.strftime("%H:%M"),
+            )
+            _record_result(o.symbol, o.action, False, f"deferred until {deferred_until.strftime('%H:%M')} UTC (market closed)")
+            continue
         if ftmo_heat_blocked and o.action != "cancel":
             # See the fundamental/heat gate split above — only a pure
             # cancel (real risk reduction, never new/maintained exposure)
@@ -3838,11 +5869,39 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
                 _record_result(o.symbol, o.action, True, f"already has an outstanding order (ticket {existing.get('order_ticket')})")
                 continue
             try:
-                result = open_position(o.symbol, o.side, o.volume, o.price, o.stop_loss, o.take_profit)
+                result = open_position(
+                    o.symbol, o.side, o.volume, o.price, o.stop_loss, o.take_profit,
+                    kind=o.order_type, max_deviation_price=entry_deviation_caps.get(o.symbol),
+                    expiration_hours=(
+                        _resting_order_expiry_hours(o.symbol, now_utc, _broker_clock_offset([o.symbol]))
+                        if o.order_type in ("limit", "stop") else None
+                    ),
+                )
             except MT5ConnectionError as e:
                 result = OrderResult(False, None, str(e), None)
-            logger.info("%s (%s): %s", o.symbol, o.action, "placed" if result.success else f"failed ({result.comment})")
+            if result.success and o.order_type == "market":
+                market_entries[o.symbol] = today_key
+                _save_settlement(settlement)
+            logger.info(
+                "%s (%s %s): %s", o.symbol, o.action, o.order_type, "placed" if result.success else f"failed ({result.comment})"
+            )
+            _learn_order_outcome(order_backoff, o.symbol, result, now_utc)
             _record_result(o.symbol, o.action, result.success, "placed" if result.success else result.comment)
+            # Trade Journal (direct user request 2026-09-19): purely
+            # additive, best-effort — record_order_result swallows its
+            # own exceptions and never raises, and only ever appends to
+            # a story ai.ftmo_suggest.py already created; it can't
+            # affect `result`, `settlement`, or anything below.
+            trade_journal.record_order_result(
+                o.symbol, o.action, result.success, "placed" if result.success else (result.comment or ""),
+                terms={
+                    "price": o.price, "stop_loss": o.stop_loss, "take_profit": o.take_profit, "volume": o.volume,
+                    # Which guards changed Claude's numbers before this order went out (re-anchor, stop
+                    # floor, size scalar, ...) — the journal note then explains why the numbers are what
+                    # they are, not just what they are.
+                    "guards": _GUARD_NOTE_RE.findall(merged_allocation[o.symbol].reason or ""),
+                },
+            )
             if result.success:
                 executed_count += 1
                 origin = "pending_setup" if o.symbol in last_verdicts else "immediate"
@@ -3857,6 +5916,7 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
                             "side": o.side,
                             "reason": merged_allocation[o.symbol].reason,
                             "invalidation_condition": merged_allocation[o.symbol].invalidation_condition,
+                            "entry_mode": merged_allocation[o.symbol].entry_mode,
                         },
                         order_ticket=result.ticket,
                     )
@@ -3876,6 +5936,7 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
                 except MT5ConnectionError as e:
                     result = OrderResult(False, None, str(e), None)
                 logger.info("%s (%s): %s", o.symbol, o.action, "closed" if result.success else f"failed ({result.comment})")
+                _learn_order_outcome(order_backoff, o.symbol, result, now_utc)
                 if result.success:
                     executed_count += 1
                 else:
@@ -3901,6 +5962,7 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
                 except MT5ConnectionError as e:
                     result = OrderResult(False, None, str(e), None)
                 logger.info("%s (cancel): %s", o.symbol, "cancelled" if result.success else f"failed ({result.comment})")
+                _learn_order_outcome(order_backoff, o.symbol, result, now_utc)
                 if result.success:
                     executed_count += 1
                 else:
@@ -3934,6 +5996,7 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
                     result = cancel_pending_order(ticket)
                 except MT5ConnectionError as e:
                     result = OrderResult(False, None, str(e), None)
+                _learn_order_outcome(order_backoff, o.symbol, result, now_utc)
                 if not result.success:
                     cancel_ok = False
                     last_detail = result.comment
@@ -3948,12 +6011,23 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
                 _record_result(o.symbol, o.action, False, f"cancel failed, not replaced this poll: {last_detail}")
             else:
                 try:
-                    result = open_position(o.symbol, o.side, o.volume, o.price, o.stop_loss, o.take_profit)
+                    result = open_position(
+                        o.symbol, o.side, o.volume, o.price, o.stop_loss, o.take_profit,
+                        kind=o.order_type, max_deviation_price=entry_deviation_caps.get(o.symbol),
+                        expiration_hours=(
+                            _resting_order_expiry_hours(o.symbol, now_utc, _broker_clock_offset([o.symbol]))
+                            if o.order_type in ("limit", "stop") else None
+                        ),
+                    )
                 except MT5ConnectionError as e:
                     result = OrderResult(False, None, str(e), None)
+                if result.success and o.order_type == "market":
+                    market_entries[o.symbol] = today_key
+                    _save_settlement(settlement)
                 logger.info(
-                    "%s (amend_pending): %s", o.symbol, "replaced" if result.success else f"failed ({result.comment})"
+                    "%s (amend_pending %s): %s", o.symbol, o.order_type, "replaced" if result.success else f"failed ({result.comment})"
                 )
+                _learn_order_outcome(order_backoff, o.symbol, result, now_utc)
                 _record_result(o.symbol, o.action, result.success, "replaced" if result.success else result.comment)
                 if result.success:
                     executed_count += 1
@@ -3969,6 +6043,7 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
                                 "side": o.side,
                                 "reason": merged_allocation[o.symbol].reason,
                                 "invalidation_condition": merged_allocation[o.symbol].invalidation_condition,
+                            "entry_mode": merged_allocation[o.symbol].entry_mode,
                             },
                             order_ticket=result.ticket,
                         )
@@ -3986,6 +6061,7 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
                     result = modify_position_sltp(matching, o.stop_loss, o.take_profit)
                 except MT5ConnectionError as e:
                     result = OrderResult(False, None, str(e), None)
+                _learn_order_outcome(order_backoff, o.symbol, result, now_utc)  # a "Market closed" answer defers the next attempts
                 logger.info(
                     "%s (amend_position): %s", o.symbol, "updated" if result.success else f"failed ({result.comment})"
                 )
@@ -3996,7 +6072,11 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
                     last_detail = result.comment
             _record_result(o.symbol, o.action, not any_failed, "updated" if not any_failed else last_detail)
         else:
-            _record_result(o.symbol, o.action, True, "on target, no change needed")
+            zero_target = merged_allocation.get(o.symbol)
+            if o.symbol not in guard_blocks and zero_target is not None and zero_target.pct <= 0 and o.symbol != "CASH":
+                _record_result(o.symbol, o.action, True, "target is 0% - nothing to place or hold")
+            else:
+                _record_result(o.symbol, o.action, True, "on target, no change needed")
 
     _save_settlement(settlement)
     _notify(f"Execution-check complete — {executed_count} order(s) sent this poll.")
@@ -4007,8 +6087,30 @@ def run_clerk_execution_check(on_stage: Callable[[str], None] | None = None) -> 
     # that made an unreachable Ollama server look like ordinary
     # NOT_CONFIRMED/HOLD activity instead of a real, ongoing outage.
     success_detail = f"{executed_count} order(s) sent"
+    for _symbol, _why in sorted(guard_blocks.items()):
+        quick_lane_notes.append(f"{_symbol} held back ({_why})")
+    if quick_lane_notes:
+        success_detail += " | quick gates: " + "; ".join(quick_lane_notes)[:900]
+    llm_total = sum(llm_lane_counts.values())
+    if act_only:
+        success_detail += (
+            f" | thinking runs separately: {thinker_applied} thinker verdict(s) applied this pass"
+            if thinker_applied else " | thinking runs separately: no new thinker verdict to apply"
+        )
+    elif llm_total:
+        success_detail += " | LLM: " + ", ".join(f"{n} {label}" for label, n in llm_lane_counts.items() if n)
+    else:
+        success_detail += " | LLM: nothing needed a model this poll (no free-text pending setup, no open position to review)"
     if ollama_health_note:
         success_detail += f" — WARNING: {ollama_health_note}"
+    if fast:
+        # Keep the desk's headline (the last FULL poll's status/detail/time) and its review countdown; only merge this pass's
+        # per-symbol results, which is what shows an order placed / a guard hold between full polls.
+        _write_execution_state(
+            "success", success_detail, last_verdicts=last_verdicts, last_execution_results=results_this_poll,
+            last_tactical_verdicts=last_tactical_verdicts, preserve_headline=True,
+        )
+        return
     _write_execution_state(
         "success", success_detail,
         last_verdicts=last_verdicts, last_execution_results=results_this_poll,

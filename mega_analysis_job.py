@@ -114,7 +114,7 @@ from pathlib import Path
 import config
 from ai.clerk_execution import EXECUTION_LOCK_PATH, EXECUTION_LOCK_STALE_AFTER_SECONDS, run_clerk_execution_check
 from ai.mega_analysis import is_due, next_run_utc, read_mega_analysis_enabled, read_state, run_scheduled_mega_analysis
-from job_lock import acquire_lock, release_lock
+from job_lock import acquire_lock, acquire_lock_wait, release_lock
 from utils import run_with_timeout
 
 _LOG_PATH = Path(__file__).resolve().parent / "mega_analysis_log.txt"
@@ -155,7 +155,9 @@ def _run_inline_execution_check_if_successful(state_before: dict, now_utc: datet
     if not ran_today_successfully:
         return
 
-    if not acquire_lock(EXECUTION_LOCK_PATH, EXECUTION_LOCK_STALE_AFTER_SECONDS):
+    # Wait (up to twice the usual time) rather than skip: this pass is what places the fresh Mega session's immediate entries, and a
+    # skip used to leave them to the next poll - a whole candle later.
+    if not acquire_lock_wait(EXECUTION_LOCK_PATH, EXECUTION_LOCK_STALE_AFTER_SECONDS, 2 * config.CLERK_LOCK_WAIT_SECONDS):
         logger.info(
             "Skipping the inline Execution Clerk check pass — the standalone "
             "poll already holds the execution lock right now; it will pick up any "

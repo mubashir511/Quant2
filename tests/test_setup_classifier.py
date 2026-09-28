@@ -5,14 +5,16 @@ from analysis.chart_structure import (
     ChartPattern,
     ChartStructureSnapshot,
     FibonacciLevels,
+    LiquiditySweepEvent,
     SRLevel,
     SRLevelsResult,
+    StructureBreak,
     Trendline,
     TrendlineAnalysis,
     compute_chart_structure,
 )
-from analysis.setup_classifier import _true_retracement_ratio, classify_setups
-from analysis.technical import TechnicalStats, compute_technical_stats
+from analysis.setup_classifier import CHOCH_GATE_LOOKBACK_BARS, _true_retracement_ratio, classify_setups
+from analysis.technical import DivergenceSignal, TechnicalStats, compute_technical_stats
 
 
 def _zigzag(extrema: list[float], seg_len: int) -> list[float]:
@@ -122,6 +124,122 @@ def test_pullback_continuation_from_a_real_uptrend_retracing_into_the_golden_zon
     structure = compute_chart_structure(history)
     names = [s.name for s in classify_setups(stats, structure)]
     assert "pullback_continuation" in names
+
+
+# --- confidence/arbitration: added 2026-09-20, direct user challenge -----
+# ("differential between trend and reversal") -----------------------------
+
+
+def _uptrend_pullback_structure(**overrides) -> ChartStructureSnapshot:
+    span = 150.0 - 110.0
+    price_at_ratio_050 = 150.0 - 0.5 * span
+    defaults = dict(
+        patterns=[ChartPattern(name="uptrend_structure", detail="higher highs and higher lows")],
+        fibonacci=_fib(
+            swing_high=150.0, swing_low=110.0, high_is_more_recent=True,
+            current_price=price_at_ratio_050, nearest_level_name="50.0%",
+        ),
+    )
+    return _empty_structure(**{**defaults, **overrides})
+
+
+def test_pullback_continuation_does_not_fire_after_a_recent_choch_against_the_trend():
+    structure = _uptrend_pullback_structure(
+        structure_breaks=[
+            StructureBreak(kind="CHOCH", direction="bearish", broken_level=110.0, break_price=105.0, bars_ago=3)
+        ]
+    )
+    names = [s.name for s in classify_setups(_stats(last_price=125.0), structure)]
+    assert "pullback_continuation" not in names
+
+
+def test_pullback_continuation_still_fires_when_the_choch_is_too_old():
+    structure = _uptrend_pullback_structure(
+        structure_breaks=[
+            StructureBreak(
+                kind="CHOCH", direction="bearish", broken_level=110.0, break_price=105.0,
+                bars_ago=CHOCH_GATE_LOOKBACK_BARS + 5,
+            )
+        ]
+    )
+    names = [s.name for s in classify_setups(_stats(last_price=125.0), structure)]
+    assert "pullback_continuation" in names
+
+
+def test_pullback_continuation_still_fires_with_a_choch_in_the_same_direction_as_the_trend():
+    # A BOS-worthy break in the trend's OWN direction (bullish, for an
+    # uptrend) must never gate this off — only a break AGAINST it does.
+    structure = _uptrend_pullback_structure(
+        structure_breaks=[
+            StructureBreak(kind="BOS", direction="bullish", broken_level=150.0, break_price=155.0, bars_ago=1)
+        ]
+    )
+    names = [s.name for s in classify_setups(_stats(last_price=125.0), structure)]
+    assert "pullback_continuation" in names
+
+
+def test_reversal_candidate_gets_weak_confidence_without_any_confirmation():
+    structure = _empty_structure(patterns=[ChartPattern(name="double_top", detail="two peaks")])
+    signals = classify_setups(_stats(last_price=100.0), structure)
+    reversal = next(s for s in signals if s.name == "reversal_candidate")
+    assert reversal.confidence == "weak"
+
+
+def test_reversal_candidate_gets_strong_confidence_with_a_confirming_choch():
+    structure = _empty_structure(
+        patterns=[ChartPattern(name="double_top", detail="two peaks")],
+        structure_breaks=[
+            StructureBreak(kind="CHOCH", direction="bearish", broken_level=100.0, break_price=95.0, bars_ago=2)
+        ],
+    )
+    signals = classify_setups(_stats(last_price=100.0), structure)
+    reversal = next(s for s in signals if s.name == "reversal_candidate")
+    assert reversal.confidence == "strong"
+
+
+def test_reversal_candidate_gets_strong_confidence_with_a_liquidity_sweep():
+    structure = _empty_structure(
+        patterns=[ChartPattern(name="double_top", detail="two peaks")],
+        liquidity_sweeps=[
+            LiquiditySweepEvent(
+                level_price=100.0, direction="swept_above", wick_penetration_pct=0.2, bars_ago=1, volume_ratio=None
+            )
+        ],
+    )
+    signals = classify_setups(_stats(last_price=100.0), structure)
+    reversal = next(s for s in signals if s.name == "reversal_candidate")
+    assert reversal.confidence == "strong"
+
+
+def test_reversal_candidate_gets_strong_confidence_with_matching_rsi_divergence():
+    structure = _empty_structure(patterns=[ChartPattern(name="double_top", detail="two peaks")])
+    divergence = DivergenceSignal(
+        kind="bearish", price_bars_ago=1, rsi_at_recent=55.0, rsi_at_prior=75.0, detail="bearish divergence"
+    )
+    signals = classify_setups(_stats(last_price=100.0), structure, divergence=divergence)
+    reversal = next(s for s in signals if s.name == "reversal_candidate")
+    assert reversal.confidence == "strong"
+
+
+def test_reversal_candidate_stays_weak_with_a_mismatched_direction_divergence():
+    # A BULLISH divergence doesn't confirm a double_top's own implied
+    # BEARISH reversal — must not upgrade confidence just because SOME
+    # divergence exists.
+    structure = _empty_structure(patterns=[ChartPattern(name="double_top", detail="two peaks")])
+    divergence = DivergenceSignal(
+        kind="bullish", price_bars_ago=1, rsi_at_recent=45.0, rsi_at_prior=25.0, detail="bullish divergence"
+    )
+    signals = classify_setups(_stats(last_price=100.0), structure, divergence=divergence)
+    reversal = next(s for s in signals if s.name == "reversal_candidate")
+    assert reversal.confidence == "weak"
+
+
+def test_classify_setups_still_works_with_divergence_omitted():
+    # Back-compat: every pre-existing caller that doesn't know about
+    # `divergence` yet must keep working unchanged.
+    structure = _empty_structure(patterns=[ChartPattern(name="double_top", detail="two peaks")])
+    signals = classify_setups(_stats(last_price=100.0), structure)
+    assert any(s.name == "reversal_candidate" for s in signals)
 
 
 def test_reversal_and_range_fade_can_coexist_on_a_real_choppy_double_top():

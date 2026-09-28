@@ -136,3 +136,12 @@ def test_run_ollama_logs_empty_content_reason(mock_post, caplog):
         run_ollama("some prompt", model="gemma4:12b")
     assert "empty content" in caplog.text.lower()
     assert "gemma4:12b" in caplog.text
+
+
+def test_run_ollama_caps_generated_tokens_only_when_asked():
+    with patch("requests.post") as mock_post:
+        mock_post.return_value = _fake_response("ok")
+        run_ollama("some prompt", model="gemma4:12b")
+        assert "options" not in mock_post.call_args.kwargs["json"]
+        run_ollama("some prompt", model="gemma4:12b", max_tokens=450)
+        assert mock_post.call_args.kwargs["json"]["options"] == {"num_predict": 450}

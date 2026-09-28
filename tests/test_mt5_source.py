@@ -25,6 +25,8 @@ from data.mt5_source import (
     group_closed_trades,
     is_symbol_tradable_now,
     is_trading_permitted,
+    read_ftmo_symbol_mix,
+    set_ftmo_symbol_mix,
 )
 
 
@@ -36,6 +38,18 @@ def _no_csv_fallback_by_default():
     # Tests that specifically exercise the CSV fallback override this via
     # their own nested patch.object(config, "MT5_SYMBOL_SPECS_CSV_PATH", ...).
     with patch.object(config, "MT5_SYMBOL_SPECS_CSV_PATH", ""):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _no_symbol_mix_by_default(tmp_path):
+    # Real accounts (this one included) persist a real ftmo_symbol_mix.json
+    # in the repo root once the user configures one — get_market_watch()
+    # tests must not depend on that being absent, or filtered to whatever
+    # the real account's own current mix happens to be. Tests that
+    # specifically exercise the mix filter override this via their own
+    # nested patch.object(config, "FTMO_SYMBOL_MIX_FILE", ...).
+    with patch.object(config, "FTMO_SYMBOL_MIX_FILE", str(tmp_path / "_unused_mix.json")):
         yield
 
 
@@ -667,6 +681,169 @@ def test_get_market_watch_logs_when_select_fails_but_still_tries_the_tick(
     assert "select failed" in caplog.text
 
 
+def test_read_ftmo_symbol_mix_none_when_file_missing(tmp_path):
+    with patch.object(config, "FTMO_SYMBOL_MIX_FILE", str(tmp_path / "missing.json")):
+        assert read_ftmo_symbol_mix() is None
+
+
+def test_read_ftmo_symbol_mix_none_on_corrupt_file(tmp_path):
+    corrupt = tmp_path / "ftmo_symbol_mix.json"
+    corrupt.write_text("{not valid json")
+    with patch.object(config, "FTMO_SYMBOL_MIX_FILE", str(corrupt)):
+        assert read_ftmo_symbol_mix() is None
+
+
+def test_read_ftmo_symbol_mix_none_when_symbols_field_is_not_a_string_list(tmp_path):
+    bad = tmp_path / "ftmo_symbol_mix.json"
+    bad.write_text('{"symbols": [1, 2, 3]}')
+    with patch.object(config, "FTMO_SYMBOL_MIX_FILE", str(bad)):
+        assert read_ftmo_symbol_mix() is None
+
+
+def test_set_then_read_ftmo_symbol_mix_round_trips(tmp_path):
+    path = tmp_path / "ftmo_symbol_mix.json"
+    with patch.object(config, "FTMO_SYMBOL_MIX_FILE", str(path)):
+        set_ftmo_symbol_mix(["EURUSD", "GBPUSD", "XAUUSD"])
+        assert read_ftmo_symbol_mix() == ["EURUSD", "GBPUSD", "XAUUSD"]
+
+
+def test_set_ftmo_symbol_mix_none_clears_the_file(tmp_path):
+    path = tmp_path / "ftmo_symbol_mix.json"
+    path.write_text('{"symbols": ["EURUSD"]}')
+    with patch.object(config, "FTMO_SYMBOL_MIX_FILE", str(path)):
+        set_ftmo_symbol_mix(None)
+        assert not path.exists()
+        assert read_ftmo_symbol_mix() is None
+
+
+def test_set_ftmo_symbol_mix_empty_list_clears_the_file(tmp_path):
+    path = tmp_path / "ftmo_symbol_mix.json"
+    path.write_text('{"symbols": ["EURUSD"]}')
+    with patch.object(config, "FTMO_SYMBOL_MIX_FILE", str(path)):
+        set_ftmo_symbol_mix([])
+        assert not path.exists()
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info_tick")
+@patch("MetaTrader5.symbols_get")
+def test_get_market_watch_returns_everything_visible_when_no_mix_configured(
+    mock_symbols_get, mock_tick, mock_select, tmp_path
+):
+    mock_symbols_get.return_value = [_make_symbol("EURUSD"), _make_symbol("USDCHF")]
+    mock_tick.return_value = _make_tick(1.0, 1.0)
+
+    with patch.object(config, "FTMO_SYMBOL_MIX_FILE", str(tmp_path / "missing.json")):
+        assets = get_market_watch()
+
+    assert {a.symbol for a in assets} == {"EURUSD", "USDCHF"}
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info_tick")
+@patch("MetaTrader5.symbols_get")
+def test_get_market_watch_filters_to_the_configured_mix_even_when_extra_symbols_are_visible(
+    mock_symbols_get, mock_tick, mock_select, tmp_path
+):
+    # Real incident this covers: the broker terminal re-populated old
+    # symbols in Market Watch on login/reconnect, and a stray open
+    # browser tab kept resurrecting them on every page refresh — neither
+    # is a code path this account controls, so the filter has to hold
+    # even when "visible" includes symbols the user has explicitly moved
+    # on from.
+    mock_symbols_get.return_value = [
+        _make_symbol("EURUSD"), _make_symbol("USDCHF"), _make_symbol("NVDA"),
+    ]
+    mock_tick.return_value = _make_tick(1.0, 1.0)
+    mix_path = tmp_path / "ftmo_symbol_mix.json"
+
+    with patch.object(config, "FTMO_SYMBOL_MIX_FILE", str(mix_path)):
+        set_ftmo_symbol_mix(["EURUSD"])
+        assets = get_market_watch()
+
+    assert {a.symbol for a in assets} == {"EURUSD"}
+    mock_select.assert_called_once_with("EURUSD", True)
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info_tick")
+@patch("MetaTrader5.symbols_get")
+def test_get_market_watch_mix_filter_force_selects_a_non_visible_configured_symbol(
+    mock_symbols_get, mock_tick, mock_select, tmp_path
+):
+    # Real gap found live 2026-09-20, direct user report: a real
+    # Researcher run that day only covered 8 of the 20 configured mix
+    # symbols, because this used to filter by `visible` FIRST — a symbol
+    # genuinely in the mix but not currently shown in MT5's own Market
+    # Watch window (which is known to not durably reflect the account's
+    # real configured mix — see this function's own docstring) was
+    # silently dropped before ever getting a chance to be selected.
+    # Fixed: when an allowlist is configured, EVERY one of its symbols
+    # gets force-selected regardless of its prior `visible` state — the
+    # allowlist is now authoritative, not merely a narrowing filter on
+    # top of whatever the terminal's own history happens to show.
+    mock_symbols_get.return_value = [_make_symbol("EURUSD", visible=False)]
+    mock_tick.return_value = _make_tick(1.0, 1.0)
+    mix_path = tmp_path / "ftmo_symbol_mix.json"
+
+    with patch.object(config, "FTMO_SYMBOL_MIX_FILE", str(mix_path)):
+        set_ftmo_symbol_mix(["EURUSD"])
+        assets = get_market_watch()
+
+    assert {a.symbol for a in assets} == {"EURUSD"}
+    mock_select.assert_called_once_with("EURUSD", True)
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info_tick", return_value=None)
+@patch("MetaTrader5.symbols_get")
+def test_get_market_watch_mix_still_drops_a_configured_symbol_with_no_live_tick(
+    mock_symbols_get, mock_tick, mock_select, tmp_path
+):
+    # The allowlist forces a SELECT attempt, not a fabricated result —
+    # a configured symbol that genuinely has no live quote right now
+    # (market closed, broker doesn't offer it, real outage) still drops,
+    # same as any other real-data gap in this file.
+    mock_symbols_get.return_value = [_make_symbol("EURUSD", visible=False)]
+    mix_path = tmp_path / "ftmo_symbol_mix.json"
+
+    with patch.object(config, "FTMO_SYMBOL_MIX_FILE", str(mix_path)):
+        set_ftmo_symbol_mix(["EURUSD"])
+        assets = get_market_watch()
+
+    assert assets == []
+    mock_select.assert_called_once_with("EURUSD", True)
+
+
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.symbol_info_tick")
+@patch("MetaTrader5.symbols_get")
+def test_get_market_watch_mix_drops_a_configured_symbol_the_broker_does_not_offer_at_all(
+    mock_symbols_get, mock_tick, mock_select, tmp_path
+):
+    # A symbol named in the mix that doesn't exist in symbols_get()'s own
+    # result at all (never fabricated a description for it) still gets a
+    # real select/tick attempt — degrading via the normal no-tick path,
+    # not a special case.
+    mock_symbols_get.return_value = [_make_symbol("EURUSD")]
+    mock_tick.return_value = None
+    mix_path = tmp_path / "ftmo_symbol_mix.json"
+
+    with patch.object(config, "FTMO_SYMBOL_MIX_FILE", str(mix_path)):
+        set_ftmo_symbol_mix(["GHOSTSYM"])
+        assets = get_market_watch()
+
+    assert assets == []
+    mock_select.assert_called_once_with("GHOSTSYM", True)
+
+
+@pytest.fixture(autouse=True)
+def _no_attach_shortcut_or_backoff(monkeypatch, tmp_path):
+    # The legacy tests below exercise the credentialed login path; the attach shortcut and the backoff have their own tests.
+    monkeypatch.setattr("data.mt5_source._attach_without_login", lambda *a, **k: False)
+    monkeypatch.setattr(config, "MT5_AUTH_BACKOFF_FILE", str(tmp_path / "_backoff.json"))
+
+
 def _make_account_info(login, server):
     info = MagicMock()
     info.login = login
@@ -1060,6 +1237,35 @@ def test_fetch_mt5_price_history_shapes_dataframe(mock_copy_rates, mock_select):
     mock_select.assert_called_once_with("EURUSD", True)
 
 
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.copy_rates_from_pos")
+def test_fetch_mt5_price_history_supports_m5_and_m15(mock_copy_rates, mock_select):
+    # Real gap closed 2026-09-17 (direct user push-back after an initial
+    # wrong assumption these weren't real MT5 API constants): M5/M15 are
+    # genuine, live-verified TIMEFRAME_* constants in the installed
+    # MetaTrader5 package, not a platform limitation — _MT5_TIMEFRAMES
+    # was just this codebase's own earlier subset. Confirms the mapping
+    # actually resolves to the real mt5.TIMEFRAME_M5/M15 constants, not
+    # just that the ValueError gate accepts the string.
+    import MetaTrader5 as mt5
+    import numpy as np
+
+    dtype = np.dtype(
+        [
+            ("time", "i8"), ("open", "f8"), ("high", "f8"), ("low", "f8"),
+            ("close", "f8"), ("tick_volume", "i8"), ("spread", "i4"), ("real_volume", "i8"),
+        ]
+    )
+    ts = int(datetime(2026, 8, 10, 12, 0, 0).timestamp())
+    mock_copy_rates.return_value = np.array([_make_rate(ts, 1.1, 1.2, 1.05, 1.15, 1000)], dtype=dtype)
+
+    fetch_mt5_price_history("EURUSD", "M15", count=5)
+    assert mock_copy_rates.call_args.args[1] == mt5.TIMEFRAME_M15
+
+    fetch_mt5_price_history("EURUSD", "M5", count=5)
+    assert mock_copy_rates.call_args.args[1] == mt5.TIMEFRAME_M5
+
+
 @patch("MetaTrader5.last_error", return_value=(-2, "no history"))
 @patch("MetaTrader5.symbol_select", return_value=True)
 @patch("MetaTrader5.copy_rates_from_pos", return_value=None)
@@ -1073,8 +1279,12 @@ def test_fetch_mt5_price_history_empty_on_no_data(mock_copy_rates, mock_select, 
 
 
 def test_fetch_mt5_price_history_rejects_unsupported_timeframe():
+    # M15 used to be the example unsupported timeframe here — it's real
+    # and supported now (see _MT5_TIMEFRAMES's own 2026-09-17 comment,
+    # added for ai.ftmo_suggest's intraday-calibrated backtest evidence).
+    # M30 remains genuinely unsupported.
     with pytest.raises(ValueError, match="Unsupported timeframe"):
-        fetch_mt5_price_history("EURUSD", "M15")
+        fetch_mt5_price_history("EURUSD", "M30")
 
 
 @patch("MetaTrader5.symbol_select", return_value=True)
@@ -1134,8 +1344,10 @@ def test_fetch_mt5_price_history_range_empty_on_no_data(mock_copy_rates_range, m
 
 
 def test_fetch_mt5_price_history_range_rejects_unsupported_timeframe():
+    # See test_fetch_mt5_price_history_rejects_unsupported_timeframe's own
+    # comment — M15 is real and supported now, M30 is not.
     with pytest.raises(ValueError, match="Unsupported timeframe"):
-        fetch_mt5_price_history_range("EURUSD", "M15", datetime(2026, 8, 1), datetime(2026, 8, 10))
+        fetch_mt5_price_history_range("EURUSD", "M30", datetime(2026, 8, 1), datetime(2026, 8, 10))
 
 
 def _make_terminal_info(trade_allowed=True):
@@ -1191,3 +1403,136 @@ def test_is_trading_permitted_false_when_info_unavailable(mock_terminal, mock_ac
     permitted, reason = is_trading_permitted()
     assert permitted is False
     assert reason != ""
+
+
+# --- stale first-fetch guard (real, live-verified 2026-09-24: the first M5 fetch for USDJPY/GBPUSD
+# in a fresh process returned bars ending 17h before the live tick; the next call was fresh) ---
+
+
+def _rates_ending_at(server_epoch, n=3, bar_seconds=300):
+    import numpy as np
+
+    dtype = np.dtype(
+        [
+            ("time", "i8"), ("open", "f8"), ("high", "f8"), ("low", "f8"),
+            ("close", "f8"), ("tick_volume", "i8"), ("spread", "i4"), ("real_volume", "i8"),
+        ]
+    )
+    return np.array(
+        [_make_rate(server_epoch - (n - 1 - i) * bar_seconds, 1.1, 1.2, 1.05, 1.15, 1000) for i in range(n)], dtype=dtype
+    )
+
+
+@patch("data.mt5_source.time.sleep")
+@patch("MetaTrader5.symbol_info_tick")
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.copy_rates_from_pos")
+def test_stale_first_fetch_is_retried_until_the_bars_catch_up_to_the_live_tick(
+    mock_copy, mock_select, mock_tick, mock_sleep
+):
+    from unittest.mock import MagicMock
+
+    tick_time = 1_790_000_000
+    mock_tick.return_value = MagicMock(time=tick_time)
+    stale = _rates_ending_at(tick_time - 17 * 3600)
+    fresh = _rates_ending_at(tick_time - 5)
+    mock_copy.side_effect = [stale, fresh]
+
+    df = fetch_mt5_price_history("USDJPY", "M5", count=3)
+
+    assert mock_copy.call_count == 2
+    assert mock_sleep.call_count == 1
+    assert df.index[-1] == pd.Timestamp(tick_time - 5, unit="s")
+
+
+@patch("data.mt5_source.time.sleep")
+@patch("MetaTrader5.symbol_info_tick")
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.copy_rates_from_pos")
+def test_fresh_bars_are_never_refetched(mock_copy, mock_select, mock_tick, mock_sleep):
+    from unittest.mock import MagicMock
+
+    tick_time = 1_790_000_000
+    mock_tick.return_value = MagicMock(time=tick_time)
+    mock_copy.return_value = _rates_ending_at(tick_time - 200)  # within one bar of the tick
+    fetch_mt5_price_history("EURUSD", "M5", count=3)
+    assert mock_copy.call_count == 1 and mock_sleep.call_count == 0
+
+
+@patch("data.mt5_source.time.sleep")
+@patch("MetaTrader5.symbol_info_tick")
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.copy_rates_from_pos")
+def test_a_closed_market_is_not_mistaken_for_stale_bars(mock_copy, mock_select, mock_tick, mock_sleep):
+    from unittest.mock import MagicMock
+
+    # A closed market's last TICK is also old: tick and last bar agree, so nothing to retry.
+    last_tick = 1_790_000_000 - 20 * 3600
+    mock_tick.return_value = MagicMock(time=last_tick)
+    mock_copy.return_value = _rates_ending_at(last_tick - 300, bar_seconds=900)
+    fetch_mt5_price_history("MSFT", "M15", count=3)
+    assert mock_copy.call_count == 1 and mock_sleep.call_count == 0
+
+
+@patch("data.mt5_source.time.sleep")
+@patch("MetaTrader5.symbol_info_tick")
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.copy_rates_from_pos")
+def test_persistently_stale_bars_stop_after_the_retry_cap_and_are_logged(
+    mock_copy, mock_select, mock_tick, mock_sleep, caplog
+):
+    from unittest.mock import MagicMock
+
+    tick_time = 1_790_000_000
+    mock_tick.return_value = MagicMock(time=tick_time)
+    mock_copy.return_value = _rates_ending_at(tick_time - 17 * 3600)
+    with caplog.at_level(logging.WARNING):
+        df = fetch_mt5_price_history("USDJPY", "M15", count=3)
+    assert not df.empty  # returned as fetched, never dropped
+    assert mock_copy.call_count == 1 + 3  # the original + the retry cap
+    assert "still trail the live tick" in caplog.text
+
+
+@patch("MetaTrader5.symbol_info_tick", return_value=None)
+@patch("MetaTrader5.symbol_select", return_value=True)
+@patch("MetaTrader5.copy_rates_from_pos")
+def test_no_tick_means_no_staleness_check(mock_copy, mock_select, mock_tick):
+    mock_copy.return_value = _rates_ending_at(1_790_000_000 - 100 * 3600)
+    fetch_mt5_price_history("UNKNOWN", "M5", count=3)
+    assert mock_copy.call_count == 1
+
+
+def test_connect_attaches_to_an_already_logged_in_terminal_without_sending_credentials(monkeypatch):
+    monkeypatch.undo()  # drop the autouse shortcut-off patch for this test
+    with patch("MetaTrader5.initialize", return_value=True) as init, patch("MetaTrader5.account_info", return_value=_make_account_info(999, "FTMO-Demo")):
+        connect(login=999, password="pw", server="FTMO-Demo")
+    assert init.call_count == 1 and "login" not in init.call_args.kwargs and "password" not in init.call_args.kwargs
+
+
+def test_connect_logs_in_with_credentials_when_the_terminal_is_on_another_account_or_not_ready(monkeypatch):
+    monkeypatch.undo()
+    with patch("MetaTrader5.initialize", return_value=True) as init, patch("MetaTrader5.account_info", side_effect=[_make_account_info(111, "Other"), _make_account_info(999, "FTMO-Demo")]):
+        connect(login=999, password="pw", server="FTMO-Demo")
+    assert init.call_count == 2 and init.call_args.kwargs["login"] == 999
+
+
+def test_an_authorization_failure_starts_a_backoff_that_stops_further_credentialed_logins_until_it_clears(tmp_path, monkeypatch):
+    monkeypatch.undo()
+    monkeypatch.setattr(config, "MT5_AUTH_BACKOFF_FILE", str(tmp_path / "backoff.json"))
+    calls = {"n": 0}
+
+    def fake_initialize(**kwargs):
+        calls["n"] += 1
+        return False
+
+    with patch("MetaTrader5.initialize", side_effect=fake_initialize), patch("MetaTrader5.last_error", return_value=(-6, "Terminal: Authorization failed")):
+        with pytest.raises(MT5ConnectionError, match="Authorization failed"):
+            connect(login=999, password="pw", server="FTMO-Demo")
+        first = calls["n"]  # the attach attempt + the credentialed login
+        with pytest.raises(MT5ConnectionError, match="not retrying until"):
+            connect(login=999, password="pw", server="FTMO-Demo")
+        assert calls["n"] == first + 1  # only the (free) attach attempt; no second credentialed login
+    # once the terminal is logged in by hand, the very next connect attaches and the backoff is cleared
+    with patch("MetaTrader5.initialize", return_value=True), patch("MetaTrader5.account_info", return_value=_make_account_info(999, "FTMO-Demo")):
+        connect(login=999, password="pw", server="FTMO-Demo")
+    assert not (tmp_path / "backoff.json").exists()

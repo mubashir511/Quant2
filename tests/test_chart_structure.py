@@ -4,13 +4,21 @@ import pytest
 from analysis.chart_structure import (
     SR_CLUSTER_TOLERANCE_PCT,
     SR_TOLERANCE_ATR_MULTIPLE,
+    SWEEP_MAX_BARS_TO_CLOSE_BACK,
+    SRLevel,
+    SRLevelsResult,
+    SwingPoint,
     _cluster_prices,
+    _cluster_swing_points,
     atr_scaled_sr_tolerance,
     compute_chart_structure,
     compute_fibonacci_levels,
     compute_sr_levels,
     compute_trendlines,
+    detect_breakouts,
     detect_chart_patterns,
+    detect_liquidity_sweeps,
+    detect_structure_breaks,
     find_mtf_confluence,
     find_swing_points,
 )
@@ -170,6 +178,27 @@ def test_cluster_prices_empty_input():
     assert _cluster_prices([], tolerance_pct=0.3) == []
 
 
+def test_cluster_swing_points_never_lets_a_cluster_drift_beyond_tolerance():
+    # Same anchor-to-first-point discipline as _cluster_prices' own test
+    # above, applied to the new SwingPoint-based clustering.
+    points = [SwingPoint(index=i, price=p) for i, p in enumerate([100.0, 100.09, 100.18, 100.27])]
+    clusters = _cluster_swing_points(points, tolerance_pct=0.3, last_index=10)
+    assert len(clusters) == 1
+    assert clusters[0].low == 100.0
+    assert clusters[0].high == pytest.approx(100.27)
+
+
+def test_cluster_swing_points_weighted_score_decays_with_bars_ago():
+    fresh = _cluster_swing_points([SwingPoint(index=10, price=100.0)], tolerance_pct=0.3, last_index=10, half_life_bars=30.0)
+    stale = _cluster_swing_points([SwingPoint(index=10, price=100.0)], tolerance_pct=0.3, last_index=40, half_life_bars=30.0)
+    assert fresh[0].weighted_score == pytest.approx(1.0)
+    assert stale[0].weighted_score == pytest.approx(0.5)
+
+
+def test_cluster_swing_points_empty_input():
+    assert _cluster_swing_points([], tolerance_pct=0.3, last_index=10) == []
+
+
 # --- compute_sr_levels ---
 
 
@@ -193,13 +222,67 @@ def test_sr_levels_none_without_any_swing_structure():
     assert compute_sr_levels(history) is None
 
 
-def test_sr_levels_touches_beat_a_higher_untested_level_for_ranking():
-    # A well-tested level (3 touches, farther from price) should rank
-    # ahead of a once-touched level (1 touch, nearer to price) — real
-    # evidence of a level mattering beats mere proximity.
+def test_sr_levels_touches_beat_a_higher_untested_level_for_ranking_when_rank_by_touches():
+    # A well-tested level (2 touches, farther from price) should rank
+    # ahead of a once-touched level (1 touch, nearer to price) under the
+    # explicit rank_by="touches" back-compat path — real evidence of a
+    # level mattering beats mere proximity. re-verified 2026-09-20 after
+    # switching the DEFAULT ranking to weighted_score (see
+    # test_sr_levels_weighted_score_favors_recent_touches_over_stale_
+    # ones below for the new default's own behavior on this exact
+    # fixture) — this old assertion only still holds when touches is
+    # explicitly requested.
+    history = _make_history(_zigzag([120, 150.0, 100.0, 150.1, 100.05, 149.95, 160, 105], 8))
+    sr = compute_sr_levels(history, rank_by="touches")
+    assert sr.resistance_levels[0].touches >= sr.resistance_levels[-1].touches
+
+
+def test_sr_levels_rank_by_rejects_an_unknown_value():
+    history = _make_history(_zigzag([120, 150.0, 100.0, 150.1, 100.05, 149.95, 160, 105], 8))
+    with pytest.raises(ValueError):
+        compute_sr_levels(history, rank_by="bogus")
+
+
+def test_sr_levels_rejects_a_non_positive_half_life():
+    # Real footgun found on self-review: half_life_bars=0 crashes on
+    # division by zero, and a negative value silently INVERTS the decay
+    # direction (stale touches would outscore recent ones) with no error
+    # at all — no real caller passes anything but the default today, but
+    # both must fail loudly, not silently misbehave or crash obscurely.
+    history = _make_history(_zigzag([120, 150.0, 100.0, 150.1, 100.05, 149.95, 160, 105], 8))
+    with pytest.raises(ValueError):
+        compute_sr_levels(history, half_life_bars=0.0)
+    with pytest.raises(ValueError):
+        compute_sr_levels(history, half_life_bars=-10.0)
+
+
+def test_sr_levels_weighted_score_favors_recent_touches_over_stale_ones():
+    # Same fixture as the touches-ranking test above, but under the new
+    # DEFAULT ranking (weighted_score): the 160 level is touched only
+    # ONCE, but it's the MOST RECENT swing in the whole window, while the
+    # 150-cluster's 2 touches sit much earlier — real gap found 2026-09-20,
+    # direct user challenge: a stale multi-touch level was outranking a
+    # level price is actively respecting right now. This is the test that
+    # proves recency weighting actually changes an outcome, not just
+    # attaches an unused extra number.
+    history = _make_history(_zigzag([120, 150.0, 100.0, 150.1, 100.05, 149.95, 160, 105], 8))
+    sr = compute_sr_levels(history)  # default rank_by="weighted_score"
+    assert sr.resistance_levels[0].price == pytest.approx(160.0, abs=0.5)
+
+
+def test_sr_levels_band_reflects_real_min_max_of_clustered_touches():
+    # The two real swing highs near 150.0 and 150.1 cluster into one
+    # level (149.95 is a monotonic waypoint between 100.05 and 160 in
+    # this zigzag, not itself a confirmed swing point, so it never joins
+    # this cluster — confirmed against the real computed swing points,
+    # not assumed) — the resulting band's low/high must be the real
+    # min/max of those two swing prices, not just their mean.
     history = _make_history(_zigzag([120, 150.0, 100.0, 150.1, 100.05, 149.95, 160, 105], 8))
     sr = compute_sr_levels(history)
-    assert sr.resistance_levels[0].touches >= sr.resistance_levels[-1].touches
+    clustered = next(lvl for lvl in sr.resistance_levels if lvl.touches >= 2)
+    assert clustered.low == pytest.approx(150.0, abs=0.01)
+    assert clustered.high == pytest.approx(150.1, abs=0.01)
+    assert clustered.low < clustered.high
 
 
 def test_sr_levels_result_echoes_back_the_real_tolerance_actually_used():
@@ -510,3 +593,222 @@ def test_find_mtf_confluence_labels_support_vs_resistance_by_current_price():
 
 def test_find_mtf_confluence_empty_with_no_candidate_levels():
     assert find_mtf_confluence([], [], current_price=100.0) == []
+
+
+# --- detect_breakouts / detect_liquidity_sweeps: real vs. fake, added ----
+# 2026-09-20 direct user challenge after reviewing real trades -----------
+
+
+def _ohlcv(closes: list[float], highs=None, lows=None, volumes=None) -> pd.DataFrame:
+    n = len(closes)
+    index = pd.date_range("2026-01-01", periods=n, freq="h")
+    highs = closes if highs is None else highs
+    lows = closes if lows is None else lows
+    volumes = [100.0] * n if volumes is None else volumes
+    return pd.DataFrame(
+        {"Open": closes, "High": highs, "Low": lows, "Close": closes, "Volume": volumes}, index=index
+    )
+
+
+def _resistance_sr(band_low=100.0, band_high=101.0) -> SRLevelsResult:
+    return SRLevelsResult(
+        resistance_levels=[SRLevel(price=100.5, touches=2, distance_pct=0.5, low=band_low, high=band_high)],
+        support_levels=[],
+    )
+
+
+def _support_sr(band_low=99.0, band_high=100.0) -> SRLevelsResult:
+    return SRLevelsResult(
+        resistance_levels=[],
+        support_levels=[SRLevel(price=99.5, touches=2, distance_pct=-0.5, low=band_low, high=band_high)],
+    )
+
+
+def test_detect_breakouts_confirms_a_genuine_high_volume_close_through_resistance():
+    closes = [95.0] * 20 + [101.5]
+    volumes = [100.0] * 20 + [250.0]  # 2.5x the 20-bar baseline
+    history = _ohlcv(closes, volumes=volumes)
+    events = detect_breakouts(history, _resistance_sr())
+    assert len(events) == 1
+    assert events[0].direction == "up"
+    assert events[0].volume_confirmed is True
+    assert events[0].volume_ratio == pytest.approx(2.5)
+
+
+def test_detect_breakouts_does_not_confirm_a_low_volume_close_through():
+    closes = [95.0] * 20 + [101.5]
+    volumes = [100.0] * 20 + [110.0]  # only 1.1x baseline — below the 1.3x confirm threshold
+    history = _ohlcv(closes, volumes=volumes)
+    events = detect_breakouts(history, _resistance_sr())
+    assert len(events) == 1  # the real close-through is still reported...
+    assert events[0].volume_confirmed is False  # ...just not confirmed
+
+
+def test_detect_breakouts_none_when_no_volume_column():
+    closes = [95.0] * 20 + [101.5]
+    history = _ohlcv(closes).drop(columns=["Volume"])
+    events = detect_breakouts(history, _resistance_sr())
+    assert len(events) == 1
+    assert events[0].volume_ratio is None
+    assert events[0].volume_confirmed is False
+
+
+def test_detect_breakouts_ignores_a_close_that_never_clears_the_band_edge():
+    closes = [95.0] * 20 + [100.5]  # inside the 100-101 band, not through it
+    history = _ohlcv(closes)
+    assert detect_breakouts(history, _resistance_sr()) == []
+
+
+def test_detect_breakouts_empty_without_sr_levels():
+    history = _ohlcv([95.0] * 21)
+    assert detect_breakouts(history, None) == []
+
+
+def test_detect_breakouts_empty_history_does_not_crash():
+    # Real regression found on self-review: the transition-walk fix above
+    # (test_detect_breakouts_credits_the_original_breakout_bars_volume_
+    # not_todays) unconditionally checked the LAST bar before any length
+    # guard, which raised IndexError on a genuinely empty (but correctly
+    # columned) history — a real SRLevel with no matching price data.
+    empty_history = pd.DataFrame({"Open": [], "High": [], "Low": [], "Close": [], "Volume": []})
+    assert detect_breakouts(empty_history, _resistance_sr()) == []
+
+
+def test_detect_breakouts_support_side_bets_down():
+    closes = [105.0] * 20 + [98.5]  # closes below the 99-100 support band
+    history = _ohlcv(closes, volumes=[100.0] * 20 + [200.0])
+    events = detect_breakouts(history, _support_sr())
+    assert len(events) == 1
+    assert events[0].direction == "down"
+    assert events[0].volume_confirmed is True
+
+
+def test_detect_breakouts_credits_the_original_breakout_bars_volume_not_todays():
+    # Real bug found on self-review: walking backward and stopping at the
+    # FIRST (i.e. today's) qualifying bar meant a SUSTAINED breakout —
+    # price closes beyond the level for several bars running — always
+    # reported bars_ago=0 using TODAY's volume, silently discarding the
+    # ORIGINAL breakout bar's own real volume signature. A genuine 5x
+    # breakout 3 bars ago, followed by 3 more bars still beyond the level
+    # but at ordinary volume, must still be credited to the REAL
+    # breakout bar (bars_ago=3, volume confirmed) — not misreported as an
+    # unconfirmed breakout using today's ordinary volume.
+    closes = [95.0] * 20 + [101.5, 101.6, 101.7, 101.8]
+    volumes = [100.0] * 20 + [500.0, 100.0, 100.0, 100.0]
+    history = _ohlcv(closes, volumes=volumes)
+    events = detect_breakouts(history, _resistance_sr(), lookback_bars=5)
+    assert len(events) == 1
+    assert events[0].bars_ago == 3
+    assert events[0].volume_ratio == pytest.approx(5.0)
+    assert events[0].volume_confirmed is True
+
+
+def test_detect_liquidity_sweeps_flags_a_same_bar_wick_and_close_back_inside():
+    # A single spike bar: High wicks through resistance, but the SAME
+    # bar's own Close reverts back inside — the most common real sweep
+    # shape (a fast stop-hunt, not a slow multi-bar failure).
+    closes = [95.0] * 20 + [100.5]
+    highs = [95.0] * 20 + [102.0]  # wicks well above the 101.0 band edge
+    history = _ohlcv(closes, highs=highs)
+    events = detect_liquidity_sweeps(history, _resistance_sr())
+    assert len(events) == 1
+    assert events[0].direction == "swept_above"
+    assert events[0].wick_penetration_pct > 0
+
+
+def test_detect_liquidity_sweeps_flags_a_wick_that_closes_back_inside_a_few_bars_later():
+    closes = [95.0] * 20 + [101.5, 100.8]  # wick bar closes beyond, next bar reverts inside
+    highs = [95.0] * 20 + [102.0, 100.8]
+    history = _ohlcv(closes, highs=highs)
+    events = detect_liquidity_sweeps(history, _resistance_sr(), lookback_bars=5)
+    assert len(events) == 1
+    assert events[0].bars_ago == 1  # the wick bar itself, one bar before the latest
+
+
+def test_detect_liquidity_sweeps_does_not_fire_on_a_real_breakout_that_holds():
+    # Close stays beyond the band edge for MORE than SWEEP_MAX_BARS_TO_
+    # CLOSE_BACK bars — a real, held breakout, not a fast sweep.
+    hold_bars = SWEEP_MAX_BARS_TO_CLOSE_BACK + 3
+    closes = [95.0] * 20 + [101.5] * hold_bars
+    highs = [95.0] * 20 + [102.0] * hold_bars
+    history = _ohlcv(closes, highs=highs)
+    events = detect_liquidity_sweeps(history, _resistance_sr(), lookback_bars=hold_bars + 2)
+    assert events == []
+
+
+def test_detect_liquidity_sweeps_empty_without_sr_levels():
+    history = _ohlcv([95.0] * 21)
+    assert detect_liquidity_sweeps(history, None) == []
+
+
+def test_compute_chart_structure_wires_breakouts_and_sweeps():
+    # Regression test, same style as the existing atr-scaled-tolerance
+    # wiring test — proves compute_chart_structure actually threads
+    # breakouts/liquidity_sweeps through, not just the four original reads.
+    history = _make_history(_zigzag([120, 150.0, 100.0, 150.1, 100.05, 149.95, 160, 105], 8))
+    snapshot = compute_chart_structure(history)
+    assert isinstance(snapshot.breakouts, list)
+    assert isinstance(snapshot.liquidity_sweeps, list)
+
+
+# --- detect_structure_breaks: BOS/CHOCH, added 2026-09-20 direct user ----
+# challenge ("differential between trend and reversal") ------------------
+
+
+def test_detect_structure_breaks_labels_a_break_with_the_prevailing_trend_as_bos():
+    # A real, confirmed uptrend (higher highs 140->160, higher lows
+    # 110->130), then a fresh close (165) above the latest confirmed
+    # swing high (160) — a break WITH the trend's own direction.
+    history = _make_history(_zigzag([100, 90, 120, 95, 140, 110, 160, 130, 165], 8))
+    events = detect_structure_breaks(history)
+    assert len(events) == 1
+    assert events[0].kind == "BOS"
+    assert events[0].direction == "bullish"
+    assert events[0].broken_level == pytest.approx(160.001, abs=0.01)
+
+
+def test_detect_structure_breaks_labels_the_first_counter_trend_break_as_choch():
+    # Same confirmed uptrend as above, but this time price dives straight
+    # through the latest confirmed swing LOW (110) instead — a break
+    # AGAINST the established trend's own direction, the first real
+    # structural evidence of a possible reversal.
+    history = _make_history(_zigzag([100, 90, 120, 95, 140, 110, 160, 90], 8))
+    events = detect_structure_breaks(history)
+    assert len(events) == 1
+    assert events[0].kind == "CHOCH"
+    assert events[0].direction == "bearish"
+    assert events[0].broken_level == pytest.approx(109.999, abs=0.01)
+
+
+def test_detect_structure_breaks_empty_with_no_confirmed_swings():
+    history = _make_history(_zigzag([100, 150], 20))  # one pure monotonic rise, no reversal at all
+    assert detect_structure_breaks(history) == []
+
+
+def test_detect_structure_breaks_empty_when_price_never_breaks_the_last_swing():
+    # A real uptrend where the latest close stays comfortably INSIDE the
+    # existing structure — nothing has actually broken yet.
+    history = _make_history(_zigzag([100, 90, 120, 95, 140, 110, 160, 130, 140], 8))
+    assert detect_structure_breaks(history) == []
+
+
+def test_detect_structure_breaks_reports_the_real_crossing_bar_not_todays():
+    # Real bug found on self-review: walking backward and stopping at the
+    # FIRST (i.e. today's) bar that satisfied "broke" meant a SUSTAINED
+    # break — price has closed beyond the swing low for several bars
+    # running, not just today — always reported bars_ago=0, silently
+    # misrepresenting an old, already-known structural fact as brand new
+    # every time this was recomputed. Same confirmed uptrend as the CHOCH
+    # test above, but this time price breaks the swing low (90) and stays
+    # below it for several more bars — bars_ago must point at the ACTUAL
+    # crossing bar, not just "today."
+    history = _make_history(_zigzag([100, 90, 120, 95, 140, 110, 160, 90], 8) + [89.0, 88.0, 87.0])
+    events = detect_structure_breaks(history)
+    assert len(events) == 1
+    assert events[0].kind == "CHOCH"
+    # The real crossing bar (first close below the 109.999 swing low) is
+    # 5 bars before the series' own last bar — verified empirically, not
+    # guessed — and must NOT be reported as bars_ago=0 just because price
+    # has stayed below that level ever since.
+    assert events[0].bars_ago == 5
+    assert events[0].break_price == pytest.approx(107.5, abs=0.01)  # the crossing bar's own close, not today's (87.0)

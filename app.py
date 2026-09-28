@@ -1,6 +1,8 @@
 import logging
+import re
 import secrets
 import threading
+import uuid
 import time
 from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
@@ -12,6 +14,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import config
+from ai import trade_journal
+from data import symbol_news
 from ai.claude_cli import CLI_FAILED_PREFIX, CLI_MISSING_MESSAGE
 from ai.ftmo_suggest import (
     LONG_TERM_ALIGNMENT_SHORT_MESSAGES,
@@ -96,6 +100,7 @@ from data.mt5_source import (
     get_contract_spec,
     get_server_time_offset,
     group_closed_trades,
+    read_ftmo_symbol_mix,
 )
 from data.psx_source import PSX_INDICES, PSXAsset, PSXConnectionError, get_psx_market_watch
 from risk.apply_suggestion import (
@@ -172,6 +177,8 @@ def _color_pnl(val: float) -> str:
     """Shared green/red/inherit styling for a P&L column — used by both
     the Open Positions and Trade History tables (previously two identical
     closures defined inline at each call site)."""
+    if val is None or val != val:  # a missing/NaN P&L (e.g. a closure whose deal was not matched yet) must not crash the page
+        return "color: inherit"
     color = "green" if val > 0 else "red" if val < 0 else "inherit"
     return f"color: {color}"
 
@@ -334,6 +341,201 @@ def _mega_analysis_timer_state() -> dict:
     return {"thread": None}
 
 
+@st.cache_resource
+def _manual_mega_runs() -> dict:
+    """Process-lifetime holder for manual (button-triggered) mega runs: {"threads": {run_id: Thread}, "results": {run_id: dict}}.
+    Shared across sessions (st.cache_resource) because the worker thread outlives the script run that started it."""
+    return {"threads": {}, "results": {}}
+
+
+def _manual_mega_worker(run_id: str, model: str) -> None:
+    """The manual run itself, on a background thread: run_mega_analysis (which writes the shared progress file the live log
+    reads), the state-file bookkeeping the old inline branch did, and the Clerk hand-off. NO st.* calls here - a thread has no
+    script context; the outcome is stored for the owning session to pick up."""
+    result: dict = {"suggestion": None, "analyses": None, "error": None, "warning": None, "finished_utc": None}
+    try:
+        try:
+            captured: list = []
+            suggestion = run_mega_analysis(model=model, on_analyses=captured.append)
+            result["analyses"] = captured[0] if captured else None
+            result["suggestion"] = suggestion
+        except MT5ConnectionError as e:
+            result["error"] = str(e)
+            _write_mega_analysis_state("error", result["error"])
+        except RuntimeError as e:
+            # e.g. "No instruments are visible in this FTMO account's MT5 Market Watch." - data availability, not a connection failure.
+            result["warning"] = str(e)
+            _write_mega_analysis_state("error", result["warning"])
+        except Exception as e:  # noqa: BLE001 - a background thread must never die silently
+            logger.exception("Manual mega session failed unexpectedly")
+            result["error"] = f"Unexpected error: {e}"
+            _write_mega_analysis_state("error", result["error"][:500])
+        finally:
+            release_lock(_MEGA_ANALYSIS_LOCK_PATH)
+
+        suggestion = result["suggestion"]
+        if suggestion is not None:
+            if suggestion == CLI_MISSING_MESSAGE or suggestion.startswith(CLI_FAILED_PREFIX):
+                result["error"] = suggestion
+                _write_mega_analysis_state("cli_failed", suggestion[:500])
+            else:
+                _write_mega_analysis_state("success")
+                # Same hand-off the scheduled job does (mega_analysis_job.py), sharing the literal same lock.
+                logger.info("Manual mega session finished - handing off to the Clerk for an immediate execution-check.")
+                if acquire_lock(EXECUTION_LOCK_PATH, EXECUTION_LOCK_STALE_AFTER_SECONDS):
+                    try:
+                        timed_out = object()
+                        outcome = run_with_timeout(
+                            lambda: run_clerk_execution_check(on_stage=lambda msg: logger.info("Clerk hand-off: %s", msg)),
+                            config.CLERK_EXECUTION_RUN_TIMEOUT_SECONDS,
+                            default=timed_out,
+                            catch_exceptions=False,
+                        )
+                        if outcome is timed_out:
+                            logger.error("The Clerk's execution-check timed out after %.0f minutes.", config.CLERK_EXECUTION_RUN_TIMEOUT_SECONDS / 60)
+                    except Exception:
+                        logger.exception("The Clerk's execution-check after a manual mega session failed")
+                    finally:
+                        release_lock(EXECUTION_LOCK_PATH)
+                else:
+                    logger.info("The Clerk's execution check is already running - it will pick the new suggestion up on its own next run.")
+    finally:
+        result["finished_utc"] = datetime.now(timezone.utc)
+        _manual_mega_runs()["results"][run_id] = result
+
+
+def _start_manual_mega_run(model: str) -> tuple[str | None, str | None]:
+    """(run_id, None) when a background run started, (None, message) when one is already running (the same cross-process
+    lock the scheduled run uses, so a manual click can never overlap it or another tab's click)."""
+    if not acquire_lock(_MEGA_ANALYSIS_LOCK_PATH, _MEGA_ANALYSIS_LOCK_STALE_AFTER_SECONDS):
+        return None, (
+            "A mega session is already running (the daily schedule, or another tab's own click) - see its live progress in "
+            "the Mega Market Analysis section above; this click will not start a second, overlapping run."
+        )
+    run_id = uuid.uuid4().hex
+    thread = threading.Thread(target=_manual_mega_worker, args=(run_id, model), daemon=True)
+    _manual_mega_runs()["threads"][run_id] = thread
+    thread.start()
+    return run_id, None
+
+
+def _consume_manual_mega_result() -> None:
+    """Folds a finished manual run into THIS session (the exact session_state updates the old inline branch made). Runs early in
+    every script pass, before the Apply button is drawn, so its enabled state sees the new suggestion."""
+    run_id = st.session_state.get("_ftmo_manual_run_id")
+    if not run_id:
+        return
+    holder = _manual_mega_runs()
+    result = holder["results"].get(run_id)
+    if result is None:
+        thread = holder["threads"].get(run_id)
+        if thread is not None and not thread.is_alive():  # died without a result (should not happen: the worker always stores one)
+            result = {"suggestion": None, "analyses": None, "error": "The manual mega run ended without a result - see the app log.", "warning": None}
+        else:
+            return  # still running
+    holder["results"].pop(run_id, None)
+    holder["threads"].pop(run_id, None)
+    st.session_state.pop("_ftmo_manual_run_id", None)
+
+    suggestion, analyses = result.get("suggestion"), result.get("analyses")
+    error_message, warning_message = result.get("error"), result.get("warning")
+    st.session_state["ftmo_suggestion_error"] = error_message
+    st.session_state["ftmo_suggestion_warning"] = warning_message
+    if suggestion is not None and not error_message:
+        allocation = parse_final_allocation(suggestion, require_side=True)
+        display_text = strip_pending_setups_block(strip_allocation_block(suggestion))
+        if len(display_text) < 200 and len(suggestion) > 200:
+            display_text = suggestion
+        display_text = strip_leading_process_narration(display_text)
+        st.session_state["ftmo_last_suggestion_text"] = display_text
+        st.session_state["ftmo_last_suggestion_generated_at"] = datetime.now(timezone.utc)
+        st.session_state["ftmo_last_suggestion_analyses"] = analyses
+        if allocation:
+            st.session_state["ftmo_suggested_allocation"] = allocation
+            st.session_state["ftmo_suggestion_generated_this_session"] = True
+            st.session_state["ftmo_rebalance_plan"] = None
+        st.toast("Mega session finished - Latest Suggestion updated.", icon=":material/check_circle:")
+    else:
+        st.session_state["ftmo_last_suggestion_text"] = None
+        st.session_state["ftmo_last_suggestion_analyses"] = None
+        st.toast(error_message or warning_message or "Mega session ended without a suggestion.", icon=":material/error:")
+
+
+def _watch_manual_mega_run() -> None:
+    """Every 2 s: when THIS session's manual run has finished, force a full rerun so _consume_manual_mega_result folds it in
+    (the outer script would otherwise only notice on the next unrelated interaction)."""
+    run_id = st.session_state.get("_ftmo_manual_run_id")
+    if run_id and run_id in _manual_mega_runs()["results"]:
+        st.rerun()
+
+
+_watch_manual_mega_run = st.fragment(run_every=2)(_watch_manual_mega_run)
+
+
+def _pull_control(widget_key: str, last_synced_key: str, widget_value, synced_value=None) -> None:
+    """Make a persisted control show the FILE's value, every run.
+
+    Real incident 2026-09-25: right after a mega session finished, the Clerk was switched OFF, its review interval became
+    1 minute, its tactical toggle went off and the mega trigger time became "now" - all within seconds, from no user action:
+    the fragments' keyed widgets had lost their state and re-rendered with their DEFAULTS, and the old "write when the
+    widget differs from what this session last synced" logic saved those defaults to the files. Persisted controls now
+    write ONLY from an on_change callback (which Streamlit fires for a real user interaction, never for a re-render with
+    default state) and always display the file's value, so lost widget state can no longer change a setting."""
+    st.session_state[widget_key] = widget_value
+    st.session_state[last_synced_key] = widget_value if synced_value is None else synced_value
+
+
+def _is_current(record: dict | None, generated_utc: str | None) -> bool:
+    """True when a per-symbol Clerk record (a verdict or an execution result) was written for the CURRENT Mega suggestion:
+    its checked_utc is not older than the suggestion's generated_utc. The state file merges records across sessions, so an
+    older record for the same symbol (e.g. XAGUSD's verdict from a pending setup on 2026-09-17) used to be shown as if the
+    new suggestion had been checked - and a symbol with no record at all read as "not yet checked" even when the Clerk had
+    decided about it this very poll."""
+    if not record or not generated_utc:
+        return bool(record) and not generated_utc
+    try:
+        return datetime.fromisoformat(record["checked_utc"]) >= datetime.fromisoformat(generated_utc)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _on_clerk_enabled_change() -> None:
+    value = bool(st.session_state["clerk_execution_enabled_toggle"])
+    set_clerk_execution_enabled(value)
+    st.session_state["_clerk_execution_enabled_last_synced"] = value
+    _clerk_timer_state()["next_check_utc"] = None  # re-enabling restarts the countdown fresh
+    logger.info("UI: the Execution Clerk 'Enabled' toggle was set to %s by a user click.", value)
+
+
+def _on_tactical_defense_change() -> None:
+    value = bool(st.session_state["tactical_defense_enabled_toggle"])
+    set_tactical_defense_enabled(value)
+    st.session_state["_tactical_defense_enabled_last_synced"] = value
+    logger.info("UI: the Clerk tactical-defense toggle was set to %s by a user click.", value)
+
+
+def _on_clerk_interval_change() -> None:
+    value = int(st.session_state["clerk_execution_interval_select"])
+    set_clerk_execution_interval_minutes(value)
+    st.session_state["_clerk_execution_interval_last_synced"] = value
+    _clerk_timer_state()["next_check_utc"] = None  # re-base the countdown on the new interval
+    logger.info("UI: the Clerk review interval was set to %s min by a user selection.", value)
+
+
+def _on_mega_trigger_change() -> None:
+    picked = st.session_state["mega_analysis_trigger_time"]
+    set_mega_analysis_trigger(picked.hour, picked.minute)
+    st.session_state["_mega_analysis_trigger_last_synced"] = (picked.hour, picked.minute)
+    logger.info("UI: the mega daily trigger time was set to %02d:%02d UTC by a user edit.", picked.hour, picked.minute)
+
+
+def _on_mega_enabled_change() -> None:
+    value = bool(st.session_state["mega_analysis_enabled_toggle"])
+    set_mega_analysis_enabled(value)
+    st.session_state["_mega_analysis_enabled_last_synced"] = value
+    logger.info("UI: the automated daily mega analysis toggle was set to %s by a user click.", value)
+
+
 def _render_mega_analysis_countdown() -> None:
     """FTMO-only: shows the countdown to the next unattended daily "mega
     market analysis" (Claude Sonnet + the full audit pool — Copilot is
@@ -488,29 +690,13 @@ def _render_mega_analysis_countdown() -> None:
     # when its OWN widget value changed relative to what IT last knew,
     # never merely because the file diverged from under it.
     _trigger_hour, _trigger_minute = read_mega_analysis_trigger()
-    _file_trigger_pair = (_trigger_hour, _trigger_minute)
-    if "mega_analysis_trigger_time" not in st.session_state:
-        st.session_state["mega_analysis_trigger_time"] = dt_time(_trigger_hour, _trigger_minute)
-        st.session_state["_mega_analysis_trigger_last_synced"] = _file_trigger_pair
-    else:
-        # Live cross-device sync (this fragment already ticks every
-        # second) — pulls a change made from another tab/device into
-        # THIS session's own display, but only when nothing typed here
-        # is still pending; see _sync_pull_from_file's own docstring.
-        _sync_pull_from_file(
-            "mega_analysis_trigger_time",
-            "_mega_analysis_trigger_last_synced",
-            _file_trigger_pair,
-            widget_to_comparable=lambda t: (t.hour, t.minute),
-            comparable_to_widget=lambda pair: dt_time(*pair),
-        )
-    _new_trigger_time = st.time_input(
-        "Change daily trigger time (UTC)", key="mega_analysis_trigger_time", step=300
+    _pull_control(
+        "mega_analysis_trigger_time", "_mega_analysis_trigger_last_synced",
+        dt_time(_trigger_hour, _trigger_minute), (_trigger_hour, _trigger_minute),
     )
-    _new_trigger_pair = (_new_trigger_time.hour, _new_trigger_time.minute)
-    if _new_trigger_pair != st.session_state["_mega_analysis_trigger_last_synced"]:
-        set_mega_analysis_trigger(*_new_trigger_pair)
-        st.session_state["_mega_analysis_trigger_last_synced"] = _new_trigger_pair
+    st.time_input(
+        "Change daily trigger time (UTC)", key="mega_analysis_trigger_time", step=300, on_change=_on_mega_trigger_change
+    )
 
     last_status = state.get("last_status")
     last_attempt = state.get("last_attempt_utc")
@@ -765,32 +951,8 @@ def _render_clerk_execution_panel() -> None:
             # a second, stale tab would otherwise flip this back within
             # seconds of a real change made elsewhere. Compare against
             # this session's own last-synced value, never the file's.
-            if "clerk_execution_enabled_toggle" not in st.session_state:
-                st.session_state["clerk_execution_enabled_toggle"] = read_clerk_execution_enabled()
-                st.session_state["_clerk_execution_enabled_last_synced"] = (
-                    st.session_state["clerk_execution_enabled_toggle"]
-                )
-            else:
-                # Live cross-device sync — this whole panel already
-                # ticks every second and nothing outside it depends on
-                # this toggle, so a plain pull-on-tick is enough (no
-                # st.rerun() needed, unlike the mega-analysis toggle).
-                _sync_pull_from_file(
-                    "clerk_execution_enabled_toggle",
-                    "_clerk_execution_enabled_last_synced",
-                    read_clerk_execution_enabled(),
-                )
-            clerk_enabled = st.toggle("Enabled", key="clerk_execution_enabled_toggle")
-            if clerk_enabled != st.session_state["_clerk_execution_enabled_last_synced"]:
-                set_clerk_execution_enabled(clerk_enabled)
-                st.session_state["_clerk_execution_enabled_last_synced"] = clerk_enabled
-                # Direct user request 2026-08-30: re-enabling restarts the
-                # "Next review" countdown fresh from this moment, rather
-                # than resuming some stale reference from before it was
-                # switched off — the reset below (which also runs every
-                # tick while disabled) already guarantees this, this is
-                # just the immediate case of flipping it on right now.
-                _clerk_timer_state()["next_check_utc"] = None
+            _pull_control("clerk_execution_enabled_toggle", "_clerk_execution_enabled_last_synced", read_clerk_execution_enabled())
+            clerk_enabled = st.toggle("Enabled", key="clerk_execution_enabled_toggle", on_change=_on_clerk_enabled_change)
         with tactical_toggle_col:
             # New, separately-staged authority (added 2026-08-27, direct
             # user request after a real gold position went from +$28 to
@@ -802,22 +964,10 @@ def _render_clerk_execution_panel() -> None:
             # and reports every poll even while off (shadow mode, see the
             # Tactical columns below), it just never touches a real
             # order until switched on. Same multi-tab-race-safe pattern.
-            if "tactical_defense_enabled_toggle" not in st.session_state:
-                st.session_state["tactical_defense_enabled_toggle"] = read_tactical_defense_enabled()
-                st.session_state["_tactical_defense_enabled_last_synced"] = (
-                    st.session_state["tactical_defense_enabled_toggle"]
-                )
-            else:
-                # Live cross-device sync — same reasoning as the toggle above.
-                _sync_pull_from_file(
-                    "tactical_defense_enabled_toggle",
-                    "_tactical_defense_enabled_last_synced",
-                    read_tactical_defense_enabled(),
-                )
-            tactical_enabled = st.toggle("Tactical defense (DEFEND/EXIT)", key="tactical_defense_enabled_toggle")
-            if tactical_enabled != st.session_state["_tactical_defense_enabled_last_synced"]:
-                set_tactical_defense_enabled(tactical_enabled)
-                st.session_state["_tactical_defense_enabled_last_synced"] = tactical_enabled
+            _pull_control("tactical_defense_enabled_toggle", "_tactical_defense_enabled_last_synced", read_tactical_defense_enabled())
+            tactical_enabled = st.toggle(
+                "Tactical defense (DEFEND/EXIT)", key="tactical_defense_enabled_toggle", on_change=_on_tactical_defense_change
+            )
 
         st.caption(
             "Checks each Pending Setup against fresh live technicals and executes a "
@@ -840,8 +990,11 @@ def _render_clerk_execution_panel() -> None:
         # Scheduled Task poll; with no such task configured on this
         # machine (direct user choice, "webapp-only, no independent
         # Clerk task"), nothing ever advanced that function's own
-        # last_run_interval_utc marker, so it permanently read "due now"
-        # — a real bug, not a rendering issue.
+        # dedup marker (last_run_interval_utc at the time; since renamed
+        # to last_run_completed_utc when is_execution_due switched from
+        # a fixed clock-aligned window to a rolling cooldown, 2026-09-21
+        # — see ai.clerk_execution's own module comment for why), so it
+        # permanently read "due now" — a real bug, not a rendering issue.
         #
         # _clerk_timer_state() (process-lifetime, shared across every
         # open tab — see its own docstring) drives this, NOT
@@ -917,35 +1070,13 @@ def _render_clerk_execution_panel() -> None:
             # against this session's own last-synced value, never the
             # file's current one, so a second stale tab can't flip this
             # back within seconds of a real change made elsewhere.
-            if "clerk_execution_interval_select" not in st.session_state:
-                st.session_state["clerk_execution_interval_select"] = interval_minutes
-                st.session_state["_clerk_execution_interval_last_synced"] = interval_minutes
-            else:
-                # Live cross-device sync — same reasoning as the toggles
-                # above. _freq_options below already includes whatever
-                # this pulls in (it always includes the fresh file value).
-                _sync_pull_from_file(
-                    "clerk_execution_interval_select",
-                    "_clerk_execution_interval_last_synced",
-                    interval_minutes,
-                )
-            # Always includes the CURRENT file value AND this session's
-            # own last-synced value (they can differ if another tab
-            # changed it) so a custom/hand-edited interval never breaks
-            # this selectbox — st.selectbox requires its key's stored
-            # value to be one of the options offered.
-            _freq_options = sorted({
-                1, 2, 5, 10, 15, 30, 60, interval_minutes,
-                st.session_state["_clerk_execution_interval_last_synced"],
-            })
-            new_interval = st.selectbox("Review every (min)", _freq_options, key="clerk_execution_interval_select")
-            if new_interval != st.session_state["_clerk_execution_interval_last_synced"]:
-                set_clerk_execution_interval_minutes(new_interval)
-                st.session_state["_clerk_execution_interval_last_synced"] = new_interval
-                # Re-base the countdown on the new interval immediately,
-                # rather than finishing out a countdown sized for the old
-                # one.
-                _clerk_timer_state()["next_check_utc"] = None
+            _pull_control("clerk_execution_interval_select", "_clerk_execution_interval_last_synced", interval_minutes)
+            # Always includes the CURRENT file value so a custom/hand-edited interval never breaks this selectbox
+            # (st.selectbox requires its key's stored value to be one of the options offered).
+            _freq_options = sorted({1, 2, 5, 10, 15, 30, 60, interval_minutes})
+            st.selectbox(
+                "Review every (min)", _freq_options, key="clerk_execution_interval_select", on_change=_on_clerk_interval_change
+            )
 
         if clerk_enabled and not mega_session_live and remaining_seconds is not None and remaining_seconds <= 0:
             # Backgrounded (see _fire_scheduled_job_once's own docstring
@@ -963,8 +1094,9 @@ def _render_clerk_execution_panel() -> None:
 
         if interval_minutes < 5:
             st.caption(
-                ":gray[The Windows Scheduled Task itself only polls every 5 min, so anything "
-                "below that still checks at most every ~5 min in practice.]"
+                ":gray[A short review interval re-runs the quick gates (live quotes, entry-mode/stop/R:R guards, "
+                "structured triggers) every time; the local model only runs when a free-text pending setup, an "
+                "open position or an invalidation condition needs it - the status line below says which.]"
             )
 
         if not clerk_enabled:
@@ -998,10 +1130,40 @@ def _render_clerk_execution_panel() -> None:
                 entry = immediate_allocation[symbol]
                 rec = settled.get(symbol)
                 result = last_execution_results.get(symbol)
+                if result is not None and not _is_current(result, suggestion.get("generated_utc")):
+                    result = None  # left over from an earlier Mega session: not a decision about THIS suggestion
                 if rec is not None:
                     status = rec.get("state", "unknown")
+                elif result is not None and result.get("guard_blocked"):
+                    status = "held back by guard"
                 elif result is not None:
-                    status = "placed" if result.get("success") else "failed"
+                    # Real bug found live 2026-09-21, direct user report: a
+                    # "hold" (nothing held, nothing pending, target already
+                    # 0% — e.g. this exact symbol rejected by the reward:risk
+                    # floor guard this poll) always records success=True
+                    # (there's nothing to fail at), and this used to blindly
+                    # map success->"placed" regardless of what o.action
+                    # actually was — showing "placed" for a symbol Clerk
+                    # never even attempted to open, with nothing in MT5 to
+                    # show for it. A successful "close"/"cancel" hit the same
+                    # bug the other way (a real close showed as "placed").
+                    # Label from the real action, not a blind success bool.
+                    action = result.get("action")
+                    success = result.get("success")
+                    if not success:
+                        status = "infeasible" if action == "infeasible" else "failed"
+                    elif action in ("open", "increase", "amend_pending"):
+                        status = "placed"
+                    elif action in ("close", "reduce"):
+                        status = "closed"
+                    elif action == "cancel":
+                        status = "cancelled"
+                    elif action == "amend_position":
+                        status = "updated"
+                    elif action == "hold":
+                        status = "no action needed"
+                    else:
+                        status = "unknown"
                 else:
                     status = "not yet checked"
                 # Watch condition / verdict: added 2026-08-23 direct user
@@ -1024,11 +1186,18 @@ def _render_clerk_execution_panel() -> None:
                 # show verdict/reasoning here when this symbol genuinely
                 # HAS an invalidation_condition (i.e. was actually a
                 # watched_positions candidate this poll).
+                _has_position = rec is not None and rec.get("state") in ("filled", "closed_after_fill")
                 verdict = last_verdicts.get(symbol, {}) if invalidation_condition else {}
-                if invalidation_condition:
+                if verdict and not _is_current(verdict, suggestion.get("generated_utc")):
+                    verdict = {}  # an older session's verdict for this symbol - never shown as this suggestion's
+                if invalidation_condition and not _has_position:
+                    # The invalidation condition is a watch on an OPEN position; before a fill there is nothing to
+                    # invalidate, so "not yet checked" here only ever meant "no position yet".
+                    verdict_text = "n/a until a position is open"
+                elif invalidation_condition:
                     verdict_text = (
                         ("INVALIDATED" if verdict.get("confirmed") else "still holds")
-                        if symbol in last_verdicts else "not yet checked"
+                        if verdict else "not yet checked"
                     )
                 elif entry.get("pct", 0) == 0:
                     # Real user question 2026-08-25: a pct: 0 row has no
@@ -1160,8 +1329,17 @@ def _render_clerk_execution_panel() -> None:
                 # file is entirely self-managed, but a display function
                 # should degrade to a placeholder rather than crash the
                 # whole page if it's ever hand-edited or half-written.
-                status = rec.get("state", "unknown") if rec is not None else "unchecked"
                 verdict = last_verdicts.get(symbol, {})
+                _verdict_current = _is_current(verdict, suggestion.get("generated_utc"))
+                if not _verdict_current:
+                    verdict = {}
+                if rec is not None:
+                    status = rec.get("state", "unknown")
+                elif _verdict_current:
+                    _checked = str(last_verdicts[symbol].get("checked_utc", ""))[11:16]
+                    status = f"watching (last checked {_checked} UTC)" if _checked else "watching"
+                else:
+                    status = "waiting for the first check"
                 raw_text = verdict.get("raw_text", "") or ""
                 # Direct user request 2026-08-23: when the Clerk judges a
                 # setup genuinely STALE (not just "hasn't triggered yet")
@@ -1175,8 +1353,9 @@ def _render_clerk_execution_panel() -> None:
                         "Side": s.get("side"),
                         "Status": status,
                         "Last verdict": (
-                            "CONFIRMED" if verdict.get("confirmed") else "NOT_CONFIRMED"
-                        ) if symbol in last_verdicts else "not yet checked",
+                            ("CONFIRMED" if verdict.get("confirmed") else "NOT_CONFIRMED")
+                            if _verdict_current else "not yet checked"
+                        ),
                         "Trigger condition": s.get("trigger_condition"),
                         "Clerk's reasoning": reasoning,
                     }
@@ -2072,7 +2251,7 @@ def _render_live_positions(selected_exchange: str) -> None:
                     # at entry. None (blank in the table) when this
                     # symbol's contract spec isn't available right now,
                     # rather than a fabricated/misleading 0%.
-                    notional = t.open_price * t.volume * spec.trade_contract_size if spec is not None else 0.0
+                    notional = t.open_price * t.volume * spec.risk_per_price_unit if spec is not None else 0.0
                     pct_change = (t.gross_profit / notional * 100) if notional else None
                     history_rows.append(
                         {
@@ -2537,15 +2716,31 @@ if _watchlist_expander.open:
 
 def _list_researcher_symbols() -> list[str]:
     """Every symbol with at least one saved Researcher report, sorted
-    alphabetically. Report filenames are "<SYMBOL>_<YYYY-MM-DD>_
-    <HHMMSS>.md" (see ai.researcher.save_research_report) — the symbol
-    itself never contains an underscore, so splitting on the FIRST one
-    reliably recovers it even though the timestamp portion has its own
-    underscore between the date and time."""
+    alphabetically, filtered down to the CURRENT ftmo_symbol_mix.json
+    allowlist when one is configured. Report filenames are "<SYMBOL>_
+    <YYYY-MM-DD>_<HHMMSS>.md" (see ai.researcher.save_research_report) —
+    the symbol itself never contains an underscore, so splitting on the
+    FIRST one reliably recovers it even though the timestamp portion has
+    its own underscore between the date and time.
+
+    Real gap found 2026-09-20, direct user report: records/researcher/
+    is a deliberate, permanent history (one file per run, never deleted
+    — see save_research_report's own docstring), so without this filter
+    a symbol removed from the mix weeks ago would still show up here
+    forever, alongside the genuinely current mix. Filtered against
+    read_ftmo_symbol_mix() (the same allowlist ai.researcher._prune_
+    stale_research_notes prunes the Obsidian vault against), not this
+    session's own live get_market_watch() snapshot — Market Watch
+    visibility is known to be non-durable, so a symbol genuinely still
+    in the mix but transiently not loaded into MT5's terminal this
+    session must still show its last real report, not disappear."""
     records_dir = Path(config.RESEARCHER_RECORDS_DIR)
     if not records_dir.exists():
         return []
     symbols = {path.name.split("_", 1)[0] for path in records_dir.glob("*.md")}
+    allowlist = read_ftmo_symbol_mix()
+    if allowlist is not None:
+        symbols &= set(allowlist)
     return sorted(symbols)
 
 
@@ -2680,6 +2875,439 @@ def _render_researcher_panel() -> None:
                         st.markdown(_report_text)
 
 
+_TRADE_NOTE_OPEN_CLOSE_RE = re.compile(
+    r"Opened (?P<opened_at>\S+) at (?P<open_price>[\d.]+), "
+    r"closed (?P<closed_at>\S+) at (?P<close_price>[\d.]+) "
+    r"\((?P<volume>[\d.]+) lots\)"
+)
+_TRADE_NOTE_PNL_RE = re.compile(
+    r"\*\*Realized P&L: (?P<pnl>[+-]?[\d.]+)\*\*.*?Realized: (?P<r>[+-]?[\d.]+R|not computable[^.\n]*)"
+)
+
+
+def _format_note_timestamp(raw: str | None) -> str:
+    """Reformats a trade note's raw ISO timestamp (e.g.
+    "2026-09-18T17:01:27+00:00", exactly what closed_trade.opened_at.
+    isoformat() produces in _format_closed_trade_note) to this app's own
+    "%Y-%m-%d %H:%M:%S" display convention — the same one the existing
+    Trade History table (under Account Overview) already uses, so the
+    two tables read consistently rather than one showing a raw ISO
+    string and the other a friendly one. "—" on anything unparseable,
+    including the deliberate placeholder this function is often handed
+    when the note itself never had a parseable timestamp line at all."""
+    if not raw or raw == "—":
+        return "—"
+    try:
+        return datetime.fromisoformat(raw).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return "—"
+
+
+def _parse_trade_note(path: Path) -> dict | None:
+    """Parses one real closed-trade note (written by ai.clerk_execution.
+    _export_closed_trade_notes the moment a position actually closed,
+    filename "{symbol} {closed_at %Y-%m-%d_%H%M%S} {side}.md") into a
+    table row. This — not a live MT5 call — is this journal's PRIMARY
+    source, precisely because it's a local file, unaffected by which
+    MT5 account happens to be connected right now (see this panel's own
+    docstring for the real incident that made this the deliberate
+    choice, not group_closed_trades(get_history_deals(...))'s own live,
+    inherently account-scoped pull).
+
+    None on any read/parse failure — a foreign file in this folder, or
+    one whose own content doesn't match the expected shape, is skipped
+    rather than crashing the whole journal or fabricating a row from a
+    half-parsed note. The "Opened X at Y, closed X at Y" line and the
+    "Realized P&L" line are each optional independently (the fallback
+    "could not be matched to an MT5 deal record" note variant has
+    neither) — a row with blank price/P&L cells is still shown, same
+    "honesty over completeness" contract the note itself documents,
+    rather than being dropped outright just because those two fields
+    are missing."""
+    try:
+        text = path.read_text(encoding="utf-8")
+        parts = path.stem.split(" ")
+        if len(parts) < 3:
+            return None
+        symbol, side = parts[0], parts[-1]
+    except OSError:
+        return None
+
+    open_close = _TRADE_NOTE_OPEN_CLOSE_RE.search(text)
+    pnl = _TRADE_NOTE_PNL_RE.search(text)
+    thesis = re.search(r"\*\*Original thesis:\*\* (.+)", text)
+    invalidation = re.search(r"\*\*Invalidation condition:\*\* (.+)", text)
+
+    return {
+        "Symbol": symbol,
+        "Side": side,
+        "Volume": float(open_close.group("volume")) if open_close else None,
+        "Open Price": float(open_close.group("open_price")) if open_close else None,
+        "Close Price": float(open_close.group("close_price")) if open_close else None,
+        "Opened At": _format_note_timestamp(open_close.group("opened_at") if open_close else None),
+        "Closed At": _format_note_timestamp(open_close.group("closed_at") if open_close else None),
+        "Net P&L": float(pnl.group("pnl")) if pnl else None,
+        "Realized R": pnl.group("r") if pnl else "—",
+        "Original Thesis": thesis.group(1).strip() if thesis else "(no thesis recorded)",
+        "Invalidation Condition": invalidation.group(1).strip() if invalidation else "—",
+        # Sort key only, not displayed — the timestamp token embedded in
+        # every filename by construction, lexically sortable since it's
+        # always %Y-%m-%d_%H%M%S regardless of whether the note's own
+        # body had a parseable "closed at" line.
+        "_sort_key": parts[1] if len(parts) >= 2 else "",
+    }
+
+
+def _color_pnl_safe(val) -> str:
+    if not isinstance(val, (int, float)) or val != val:  # None / NaN / text
+        return ""
+    return _color_pnl(val)
+
+
+def _legacy_note_sort_iso(sort_key: str) -> str | None:
+    """A Trades/ note's filename timestamp ("%Y-%m-%d_%H%M%S", UTC) as an
+    ISO string, or None if unparseable."""
+    try:
+        return datetime.strptime(sort_key, "%Y-%m-%d_%H%M%S").replace(tzinfo=timezone.utc).isoformat()
+    except ValueError:
+        return None
+
+
+def _journal_table_rows() -> list[dict]:
+    """One row per real trade, newest lifecycle milestone first.
+
+    PRIMARY source: ai.trade_journal's per-trade stories (every Mega
+    Session suggestion from proposal through fill and close, with
+    timestamps, planned/actual terms, P&L, thesis and Clerk's latest
+    analysis). SECONDARY: closed-trade notes in the Obsidian vault's
+    Trades/ folder for older trades that predate the journal — a note is
+    skipped when a story for the same symbol closed within a day of it
+    (that is the same trade, already shown from the richer story)."""
+    summaries = [trade_journal.summarize_story(st) for st in trade_journal.list_all_stories()]
+    rows = []
+    for m in summaries:
+        milestones = [t for t in (m["proposed_at"], m["filled_at"], m["closed_at"]) if t]
+        rows.append(
+            {
+                "Symbol": m["symbol"],
+                "Side": m["side"] or "—",
+                "Status": m["status_label"],
+                "Proposed (UTC)": trade_journal.format_ts(m["proposed_at"]).replace(" UTC", ""),
+                "Filled (UTC)": trade_journal.format_ts(m["filled_at"]).replace(" UTC", ""),
+                "Closed (UTC)": trade_journal.format_ts(m["closed_at"]).replace(" UTC", ""),
+                "Planned Entry": m["planned_price"],
+                "Fill Price": m["fill_price"],
+                "Close Price": m["close_price"],
+                "Stop": m["order_stop"] if m["order_stop"] is not None else m["planned_stop"],
+                "Target": m["order_target"] if m["order_target"] is not None else m["planned_target"],
+                "Net P&L": m["net_pnl"],
+                "Cause": m["cause"] or "—",
+                "Thesis": m["thesis"] or "(no reason recorded)",
+                "Trigger / Invalidation": " | ".join(
+                    x for x in (m["trigger_condition"], m["invalidation_condition"]) if x
+                ) or "—",
+                "Latest Clerk Analysis": (
+                    f"[{m['analysis']['label']}] {m['analysis']['text']}" if m["analysis"]["text"] else "—"
+                ),
+                "Events": m["events"],
+                "_sort": max(milestones) if milestones else "",
+                "_summary": m,
+            }
+        )
+
+    story_closes = [(m["symbol"], m["closed_at"]) for m in summaries if m["closed_at"]]
+    vault_dir = Path(config.OBSIDIAN_VAULT_PATH) / "Trades"
+    note_paths = [p for p in vault_dir.glob("*.md") if p.stem != "Trade Journal"] if vault_dir.exists() else []
+    for path in note_paths:
+        note = _parse_trade_note(path)
+        if note is None:
+            continue
+        note_iso = _legacy_note_sort_iso(note["_sort_key"])
+        if note_iso is not None and any(
+            sym == note["Symbol"]
+            and abs((datetime.fromisoformat(note_iso) - datetime.fromisoformat(closed)).total_seconds()) < 86400
+            for sym, closed in story_closes
+        ):
+            continue
+        pnl = note["Net P&L"]
+        rows.append(
+            {
+                "Symbol": note["Symbol"],
+                "Side": note["Side"],
+                "Status": "Closed — Won" if (pnl or 0) > 0 else "Closed — Lost" if (pnl or 0) < 0 else "Closed — P&L not matched",
+                "Proposed (UTC)": "—",
+                "Filled (UTC)": note["Opened At"],
+                "Closed (UTC)": note["Closed At"],
+                "Planned Entry": None,
+                "Fill Price": note["Open Price"],
+                "Close Price": note["Close Price"],
+                "Stop": None,
+                "Target": None,
+                "Net P&L": pnl,
+                "Cause": "—",
+                "Thesis": note["Original Thesis"],
+                "Trigger / Invalidation": note["Invalidation Condition"],
+                "Latest Clerk Analysis": "—",
+                "Events": None,
+                "_sort": note_iso or "",
+                "_summary": None,
+            }
+        )
+    rows.sort(key=lambda r: r["_sort"], reverse=True)
+    return rows
+
+
+def _render_trading_journal_panel() -> None:
+    """Trading Journal: every real trade this account has been proposed
+    or has made, newest first, with lifecycle timestamps, status
+    (including won/lost), planned vs actual prices, P&L, the original
+    thesis and Clerk's latest analysis. Reads ai.trade_journal's JSON
+    stories (the same source the Obsidian Lifecycle notes are rendered
+    from, so the two always agree) plus the vault's older closed-trade
+    notes — local files only, deliberately NOT a live MT5 query, so it
+    survives switching FTMO accounts."""
+    st.header(":material/menu_book: Trading Journal", divider=True)
+    _journal_open_key = "_trading_journal_section_open"
+    _journal_expander = st.expander(
+        "Show trade journal",
+        icon=":material/menu_book:",
+        expanded=st.session_state.get(_journal_open_key, False),
+        on_change="rerun",
+    )
+    if _journal_expander.open is not None:
+        st.session_state[_journal_open_key] = _journal_expander.open
+    if not _journal_expander.open:
+        return
+    with _journal_expander:
+        rows = _journal_table_rows()
+        if not rows:
+            st.write(
+                "No trades recorded yet — this fills in automatically the "
+                "moment Mega Session next proposes a symbol."
+            )
+            return
+        st.caption(
+            "Newest first (by latest lifecycle milestone: proposed, filled or "
+            "closed). All times UTC. Each trade's full reasoning and the "
+            "complete Clerk activity log are in the Obsidian vault "
+            "(Trades/Lifecycle/)."
+        )
+
+        pnls = [r["Net P&L"] for r in rows if isinstance(r["Net P&L"], (int, float))]
+        n_won = sum(1 for p in pnls if p > 0)
+        n_lost = sum(1 for p in pnls if p < 0)
+        n_active = sum(1 for r in rows if r["Status"] in ("Filled — Open",))
+        n_pending = sum(1 for r in rows if r["Status"] in ("Proposed", "Order Placed"))
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Realized P&L", f"{sum(pnls):,.2f}" if pnls else "—")
+        c2.metric("Won", n_won)
+        c3.metric("Lost", n_lost)
+        c4.metric("Open", n_active)
+        c5.metric("Pending", n_pending)
+
+        df = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith("_")} for r in rows])
+        st.dataframe(
+            df.style.map(_color_pnl_safe, subset=["Net P&L"]),
+            hide_index=True,
+            column_config={
+                "Thesis": st.column_config.TextColumn(width="large"),
+                "Trigger / Invalidation": st.column_config.TextColumn(width="large"),
+                "Latest Clerk Analysis": st.column_config.TextColumn(width="large"),
+            },
+        )
+
+        st.subheader("Trade details")
+        for r in rows[:12]:
+            m = r["_summary"]
+            pnl_text = f" — {r['Net P&L']:+.2f}" if isinstance(r["Net P&L"], (int, float)) else ""
+            with st.expander(f"{r['Symbol']} · {r['Side']} · {r['Status']}{pnl_text}", expanded=False):
+                st.markdown(f"**Thesis:** {r['Thesis']}".replace("$", "\\$"))
+                if m is not None:
+                    if m["latest_thesis"] and m["latest_thesis"] != m["thesis"]:
+                        st.markdown(f"**Latest thesis (carried forward):** {m['latest_thesis']}".replace("$", "\\$"))
+                    st.markdown(
+                        f"**Plan:** entry {m['planned_price']}, stop {m['planned_stop']}, target {m['planned_target']}"
+                        + (
+                            f" · **Order sent:** entry {m['order_price']}, stop {m['order_stop']}, "
+                            f"target {m['order_target']}, volume {m['order_volume']}"
+                            if m["order_price"] is not None
+                            else ""
+                        )
+                    )
+                    if m["trigger_condition"]:
+                        st.markdown(f"**Trigger:** {m['trigger_condition']}")
+                    if m["invalidation_condition"]:
+                        st.markdown(f"**Invalidation:** {m['invalidation_condition']}")
+                    if m["analysis"]["text"]:
+                        st.markdown(
+                            f"**Latest analysis — {m['analysis']['label']} "
+                            f"({trade_journal.format_ts(m['analysis']['at'])}):**"
+                        )
+                        st.text(m["analysis"]["text"][:1500])
+                    if m["audit"]:
+                        st.markdown("**Retrospective audit:**")
+                        _render_ai_report(m["audit"][:4000])
+                else:
+                    st.markdown(f"**Invalidation:** {r['Trigger / Invalidation']}")
+
+
+def _render_symbol_news_panel() -> None:
+    """"News" section (direct user request 2026-09-20, extended the same
+    day after a direct challenge: "news quantity and sources are very
+    less... where those all sources gone?"), positioned right after
+    Trading Journal — shows all THREE of Researcher's own news layers,
+    not just the per-symbol one the first version of this panel had:
+    (1) market-wide/geopolitical (index/oil/gold proxies + CNBC), shown
+    ONCE at the top since it's account-wide, not per-symbol; (2) each
+    symbol's own category-specialty coverage (FXStreet/CoinDesk/
+    Investing.com); (3) each symbol's own per-symbol Yahoo/Google news,
+    with its full persisted history. All three go through the exact same
+    shared cache (data.symbol_news) Clerk/Researcher/Mega Session read
+    from, so nothing shown here is a separate or stale copy.
+
+    Opening this outer section only fetches the ONE shared macro block
+    (already normally warm) plus a local, no-network read of each
+    symbol's persisted history for its readiness dot. The real per-
+    symbol/category fetch for a given symbol only happens once THAT
+    symbol's own sub-expander is opened — real perf bug fixed 2026-09-20
+    (direct user report: opening this section made every symbol's news
+    load sequentially, "one by one like old windows 98 style"), caused
+    by eagerly fetching for every symbol up front just to color its dot.
+    Any fetch that does happen still only hits the real source on a
+    genuine cache miss (config.SYMBOL_NEWS_CACHE_MINUTES, 20 by default)
+    — a warm cache (the common case, since Clerk/Researcher/Mega Session
+    are usually already populating it) makes it effectively free. Only
+    the per-symbol layer persists to the Obsidian vault (config.
+    SYMBOL_NEWS_RETENTION_DAYS-day rolling window) — category/macro are
+    account-/category-wide context, shown live, same as how Researcher's
+    own report uses them (recomputed each run, never saved standalone).
+
+    This webapp table is deliberately kept to title/source only (direct
+    user request 2026-09-20: "keep the ui simple like before") — the
+    full article text (data.symbol_news.fetch_full_article_text, a real
+    page fetch + paragraph extraction, never model-generated) is instead
+    written straight into the Obsidian vault note for whichever new
+    headlines actually get persisted (see _record_symbol_news_to_vault),
+    so the "complete version" the user wants lives there, not in a UI
+    that has to stay fast to open."""
+    st.header(":material/newspaper: News", divider=True)
+    _news_open_key = "_symbol_news_section_open"
+    _news_expander = st.expander(
+        "Show symbol news",
+        icon=":material/newspaper:",
+        expanded=st.session_state.get(_news_open_key, False),
+        on_change="rerun",
+    )
+    if _news_expander.open is not None:
+        st.session_state[_news_open_key] = _news_expander.open
+    if not _news_expander.open:
+        return
+    with _news_expander:
+        st.caption(
+            "Real, live news for this account's current FTMO symbol mix — "
+            "the exact same data Clerk, Researcher, and Mega Session read "
+            "from the one shared cache, so nothing here is a separate or "
+            "stale copy. Each symbol's per-symbol news history (sequence + "
+            "timestamp) is kept in the Obsidian vault on a rolling 30-day "
+            "window; category and market-wide news are shown live."
+        )
+        try:
+            assets = sorted(get_market_watch(), key=lambda a: a.symbol)
+        except MT5ConnectionError as e:
+            st.error(f"Could not load the current symbol mix: {e}")
+            return
+        if not assets:
+            st.write("No instruments in the current FTMO symbol mix.")
+            return
+
+        st.subheader("Market-Wide / Geopolitical")
+        st.caption("Account-wide context, shared across every symbol — not symbol-specific.")
+        try:
+            macro_items = symbol_news.get_macro_news_items()
+        except Exception:
+            macro_items = []
+        if macro_items:
+            st.dataframe(
+                pd.DataFrame([{"Title": i["title"], "Source": i.get("source") or "—"} for i in macro_items]),
+                hide_index=True,
+            )
+        else:
+            st.write("No market-wide news available right now.")
+
+        st.divider()
+        for asset in assets:
+            category = _cached_symbol_category(asset.symbol)
+            # Real perf bug found 2026-09-20, direct user report ("loads
+            # one by one like old windows 98 style"): this used to call
+            # get_symbol_news_block/get_category_news_items for EVERY
+            # symbol as soon as the outer "Show symbol news" expander
+            # opened, just to pick the readiness emoji -- meaning opening
+            # the section triggered a real, synchronous, potentially
+            # cache-miss network fetch per symbol before the user had
+            # even asked to see any of them. The emoji now comes from
+            # the already-persisted vault history (a local file read,
+            # no network) and the real fetch is deferred until the
+            # user actually opens THAT symbol's own sub-expander.
+            has_history = bool(symbol_news.list_symbol_news(asset.symbol))
+            emoji = "🟢" if has_history else "⚪"
+            _sym_open_key = f"_symbol_news_open_{asset.symbol}"
+            _sym_expander = st.expander(
+                f"{emoji} {asset.symbol}",
+                expanded=st.session_state.get(_sym_open_key, False),
+                on_change="rerun",
+            )
+            if _sym_expander.open is not None:
+                st.session_state[_sym_open_key] = _sym_expander.open
+            if not _sym_expander.open:
+                continue
+            with _sym_expander:
+                try:
+                    symbol_news.get_symbol_news_block(
+                        asset.symbol,
+                        category,
+                        limit=config.RESEARCHER_HEADLINES_PER_SYMBOL,
+                        description=asset.description,
+                    )
+                except Exception:
+                    pass
+                entries = symbol_news.list_symbol_news(asset.symbol)
+                st.markdown(f"**Per-symbol news** — {category}")
+                if not entries:
+                    st.write("No real per-symbol news recorded for this symbol yet.")
+                else:
+                    rows = [
+                        {
+                            "#": e["seq"],
+                            "Recorded": _format_note_timestamp(e["recorded_utc"]),
+                            "Title": e["title"],
+                            "Source": e.get("source") or "—",
+                        }
+                        for e in entries
+                    ]
+                    st.dataframe(pd.DataFrame(rows), hide_index=True)
+
+                st.markdown(f"**Category news** — {category}")
+                try:
+                    category_items = symbol_news.get_category_news_items(
+                        category, limit=config.RESEARCHER_HEADLINES_PER_SYMBOL
+                    )
+                except Exception:
+                    category_items = []
+                if not category_items:
+                    st.write(
+                        "No category-specialty feed for this category."
+                        if symbol_news.category_rss_feed_url(category) is None
+                        else "No real items found right now."
+                    )
+                else:
+                    st.dataframe(
+                        pd.DataFrame(
+                            [{"Title": i["title"], "Source": i.get("source") or "—"} for i in category_items]
+                        ),
+                        hide_index=True,
+                    )
+
+
 # 30s: frequent enough to catch is_researcher_due's own once-daily
 # trigger window comfortably (see RESEARCHER_GRACE_MINUTES) without
 # re-running every second the way Clerk's own live-countdown-focused
@@ -2690,6 +3318,8 @@ _SENTIMENT_EMOJI = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}
 
 if selected_exchange == "FTMO":
     _render_researcher_panel()
+    _render_trading_journal_panel()
+    _render_symbol_news_panel()
 
 
 _SETUP_BADGE_COLORS = {
@@ -2957,10 +3587,10 @@ def _render_rsi_gauge(rsi: float | None, label: str) -> None:
     st.plotly_chart(fig, width="stretch", key=f"wl_gauge_{label}")
 
 
-def _render_sr_ladder(current_price: float, mn1_sr, d1_sr, h4_sr, h1_sr) -> None:
+def _render_sr_ladder(current_price: float, d1_sr, h4_sr, h1_sr, m5_sr) -> None:
     """One combined horizontal price ladder for ALL FOUR timeframes' real
-    support/resistance levels — Monthly on the top row (biggest
-    markers) down to H1 on the bottom row (smallest), current price as
+    support/resistance levels — D1 on the top row (biggest
+    markers) down to M5 on the bottom row (smallest; Monthly and M15 were dropped 2026-09-24), current price as
     an amber diamond. Doubles as an implicit multi-timeframe-confluence
     view: when markers from different timeframes visually cluster at
     the same price, that IS the confluence signal, read directly off
@@ -2970,10 +3600,10 @@ def _render_sr_ladder(current_price: float, mn1_sr, d1_sr, h4_sr, h1_sr) -> None
     and monthly and display combined charts") matching the D1/monthly
     chart-structure computation already added to ai/ftmo_suggest.py."""
     rows = [
-        ("Monthly", mn1_sr, 0.45, 3.0),
-        ("D1", d1_sr, 0.15, 2.4),
-        ("H4", h4_sr, -0.15, 1.8),
-        ("H1", h1_sr, -0.45, 1.2),
+        ("D1", d1_sr, 0.45, 3.0),
+        ("H4", h4_sr, 0.15, 2.4),
+        ("H1", h1_sr, -0.15, 1.8),
+        ("M5", m5_sr, -0.45, 1.2),
     ]
     if all(sr is None or (not sr.support_levels and not sr.resistance_levels) for _, sr, _, _ in rows):
         st.caption("No confirmed support/resistance levels yet on any timeframe.")
@@ -3015,7 +3645,7 @@ def _render_sr_ladder(current_price: float, mn1_sr, d1_sr, h4_sr, h1_sr) -> None
         transition={"duration": 500, "easing": "cubic-in-out"},  # see _render_rsi_gauge's own note
     )
     st.plotly_chart(fig, width="stretch", key="wl_sr_ladder")  # stable key — see _render_rsi_gauge's own note
-    st.caption("◆ current price · rows top→bottom: Monthly, D1, H4, H1 · marker size = touch count")
+    st.caption("◆ current price · rows top→bottom: D1, H4, H1, M5 · marker size = touch count")
 
 
 def _render_setup_badges(label: str, signals: list) -> None:
@@ -3333,13 +3963,13 @@ def _live_asset_dashboard(symbol: str, exchange: str, description: str) -> None:
         # matching HOLDING HORIZON, H4/H1 still primary for the actual
         # entry/stop/target, Monthly/D1 real context alongside them.
         timeframes = [
-            ("Monthly", analysis.mn1_stats, analysis.mn1_structure),
             ("D1", analysis.base.stats, analysis.d1_structure),
             ("H4", analysis.h4_stats, analysis.h4_structure),
             ("H1", analysis.h1_stats, analysis.h1_structure),
+            ("M5", analysis.m5_stats, analysis.m5_structure),
         ]
 
-        st.caption("Monthly · D1 · H4 · H1 — combined RSI read across every timeframe")
+        st.caption("D1 · H4 · H1 · M5 — combined RSI read across every timeframe")
         gauge_cols = st.columns(4)
         for col, (label, stats, _structure) in zip(gauge_cols, timeframes):
             with col:
@@ -3347,10 +3977,10 @@ def _live_asset_dashboard(symbol: str, exchange: str, description: str) -> None:
 
         _render_sr_ladder(
             mid,
-            analysis.mn1_structure.sr_levels,
             analysis.d1_structure.sr_levels,
             analysis.h4_structure.sr_levels,
             analysis.h1_structure.sr_levels,
+            analysis.m5_structure.sr_levels,
         )
 
         st.caption("Trend / regime and volatility per timeframe")
@@ -3551,6 +4181,9 @@ for _prefix, _records_dir in (
 
 st.header(":material/insights: Portfolio Suggestion", divider=True)
 _portfolio_controls_box = st.container(border=True)
+if selected_exchange == "FTMO":
+    _consume_manual_mega_result()
+
 with _portfolio_controls_box:
     # Direct user request 2026-08-23: the manual "Suggest Portfolio Mix"
     # controls now live inside the same box as the Mega Market Analysis
@@ -3574,33 +4207,16 @@ with _portfolio_controls_box:
         # last-synced value, never the file's current one, so a second,
         # stale tab can't flip this back the next time IT reruns for any
         # unrelated reason (any click anywhere on that tab's page).
-        if "mega_analysis_enabled_toggle" not in st.session_state:
-            st.session_state["mega_analysis_enabled_toggle"] = read_mega_analysis_enabled()
-            st.session_state["_mega_analysis_enabled_last_synced"] = (
-                st.session_state["mega_analysis_enabled_toggle"]
-            )
-        else:
-            # Live cross-device sync — this toggle lives in the OUTER
-            # script (see the comment above for why), so a pull here
-            # only actually shows up when a full rerun happens for some
-            # reason. _watch_for_external_mega_toggle_change below is
-            # what forces that rerun to happen within a couple of
-            # seconds even with zero other interaction on this tab.
-            _sync_pull_from_file(
-                "mega_analysis_enabled_toggle",
-                "_mega_analysis_enabled_last_synced",
-                read_mega_analysis_enabled(),
-            )
+        _pull_control("mega_analysis_enabled_toggle", "_mega_analysis_enabled_last_synced", read_mega_analysis_enabled())
         mega_analysis_enabled = st.toggle(
             "Automated daily analysis",
             key="mega_analysis_enabled_toggle",
-            help="Mutually exclusive with the manual button below — only one "
+            help="Mutually exclusive with the manual button below - only one "
             "trigger path is armed at a time.",
+            on_change=_on_mega_enabled_change,
         )
-        if mega_analysis_enabled != st.session_state["_mega_analysis_enabled_last_synced"]:
-            set_mega_analysis_enabled(mega_analysis_enabled)
-            st.session_state["_mega_analysis_enabled_last_synced"] = mega_analysis_enabled
         _watch_for_external_mega_toggle_change()
+        _watch_manual_mega_run()
     button_col, model_col, apply_col = st.columns([2, 1, 1])
     with button_col:
         suggest_clicked = st.button(
@@ -3777,147 +4393,16 @@ if suggest_clicked and selected_exchange == "PSX":
     st.rerun()
 
 elif suggest_clicked and selected_exchange == "FTMO":
-    error_message = None
-    warning_message = None
-    already_running_message = None
-    suggestion = None
-    analyses = None
-
-    with st.status("Building an FTMO portfolio suggestion...", expanded=True) as status:
-        # Same lock run_scheduled_mega_analysis (via _fire_scheduled_job_
-        # once) already uses — see _MEGA_ANALYSIS_LOCK_PATH's own comment
-        # above. Wrapping the WHOLE run in it (not just the Clerk hand-off
-        # below, which already had its own separate EXECUTION_LOCK_PATH)
-        # is the actual fix for two real, reported bugs that turned out
-        # to share one root cause: this branch used to call analyze_ftmo_
-        # assets/build_ftmo_summary/suggest_ftmo_portfolio directly,
-        # inline, completely bypassing run_mega_analysis() — so a manual
-        # click never wrote to the shared progress file (see
-        # ai.mega_analysis._write_step/_write_current_activity):
-        # (1) no live status ever showed in the shared Mega Session
-        # section the way a scheduled run's does, and (2) mega_session_
-        # is_live() — what the Clerk panel's own "paused" display and
-        # firing logic both depend on — had nothing to go on, so Clerk's
-        # periodic check never actually paused for a manual run either.
-        # Calling the SAME run_mega_analysis() the scheduled trigger uses
-        # fixes both at once, for free — no separate UI code needed here.
-        if not acquire_lock(_MEGA_ANALYSIS_LOCK_PATH, _MEGA_ANALYSIS_LOCK_STALE_AFTER_SECONDS):
-            already_running_message = (
-                "A mega session is already running (the daily schedule, or another "
-                "tab's own click) — see its live progress in the Mega Market Analysis "
-                "section above; this click will not start a second, overlapping run."
-            )
-        else:
-            st.write(
-                "Running now — live step-by-step progress is shown in the Mega "
-                "Market Analysis section above, exactly like a scheduled run."
-            )
-            try:
-                _captured_analyses: list = []
-                suggestion = run_mega_analysis(model=selected_model, on_analyses=_captured_analyses.append)
-                analyses = _captured_analyses[0] if _captured_analyses else None
-            except MT5ConnectionError as e:
-                error_message = str(e)
-                # Real gap found live 2026-09-16: a manual click never
-                # wrote to MEGA_ANALYSIS_STATE_FILE at all (only
-                # run_scheduled_mega_analysis did), so the "Last run"
-                # status shown elsewhere on this page kept reporting a
-                # stale scheduled-run result — up to several days old —
-                # even immediately after a real, successful manual run.
-                # Mirrors run_scheduled_mega_analysis's own outcome
-                # classification exactly, just for this second call site.
-                _write_mega_analysis_state("error", error_message)
-            except RuntimeError as e:
-                # e.g. "No instruments are visible in this FTMO account's
-                # MT5 Market Watch." — a data-availability issue, not a
-                # connection failure, same distinction the old inline
-                # check made before delegating this check to
-                # run_mega_analysis() itself.
-                warning_message = str(e)
-                _write_mega_analysis_state("error", warning_message)
-            finally:
-                release_lock(_MEGA_ANALYSIS_LOCK_PATH)
-
-            if suggestion is not None:
-                if suggestion == CLI_MISSING_MESSAGE or suggestion.startswith(CLI_FAILED_PREFIX):
-                    error_message = suggestion
-                    _write_mega_analysis_state("cli_failed", suggestion[:500])
-                else:
-                    _write_mega_analysis_state("success")
-                    def _on_stage(msg: str) -> None:
-                        st.write(msg)
-
-                    # Manual and scheduled runs differ only in what
-                    # triggers them, never in what they produce or feed
-                    # downstream (direct user correction 2026-08-23) —
-                    # this mirrors mega_analysis_job.py's own inline
-                    # wiring exactly, down to sharing the literal same
-                    # lock, so a manual click and the standalone poll
-                    # can never run the Clerk's execution-check at
-                    # once. Skips gracefully (not blocking) if the
-                    # standalone poll already holds the lock right now.
-                    _on_stage("Handing off to the Clerk for an immediate execution-check...")
-                    if acquire_lock(EXECUTION_LOCK_PATH, EXECUTION_LOCK_STALE_AFTER_SECONDS):
-                        try:
-                            # Same hard timeout ceiling and sentinel
-                            # pattern as mega_analysis_job.py's own
-                            # inline call — a hang here must never
-                            # freeze this whole Streamlit session
-                            # indefinitely.
-                            _clerk_timed_out = object()
-                            _clerk_result = run_with_timeout(
-                                lambda: run_clerk_execution_check(on_stage=_on_stage),
-                                config.CLERK_EXECUTION_RUN_TIMEOUT_SECONDS,
-                                default=_clerk_timed_out,
-                                catch_exceptions=False,
-                            )
-                            if _clerk_result is _clerk_timed_out:
-                                _on_stage(
-                                    "The Clerk's execution-check timed out after "
-                                    f"{config.CLERK_EXECUTION_RUN_TIMEOUT_SECONDS / 60:.0f} minutes."
-                                )
-                        except Exception as e:
-                            _on_stage(f"The Clerk's execution-check failed: {e}")
-                        finally:
-                            release_lock(EXECUTION_LOCK_PATH)
-                    else:
-                        _on_stage(
-                            "The Clerk's execution check is already running right now — "
-                            "it will pick this up on its own next run instead."
-                        )
-
-        if error_message:
-            status.update(label="Failed", state="error")
-        elif warning_message:
-            status.update(label="No FTMO data available", state="error")
-        elif already_running_message:
-            status.update(label="Skipped — already running", state="complete")
-        else:
-            status.update(label="Suggestion ready", state="complete")
-
-    # Own session_state namespace (ftmo_* rather than PMEX's unprefixed
-    # keys or PSX's psx_* keys) — same isolation reasoning as PSX's own
-    # comment below: a stale FTMO allocation can never make "Apply
-    # Suggestion" look enabled against the wrong account, and vice versa.
-    st.session_state["ftmo_suggestion_error"] = error_message
-    st.session_state["ftmo_suggestion_warning"] = warning_message
-    st.session_state["ftmo_suggestion_already_running"] = already_running_message
-    if suggestion is not None and not error_message:
-        allocation = parse_final_allocation(suggestion, require_side=True)
-        display_text = strip_pending_setups_block(strip_allocation_block(suggestion))
-        if len(display_text) < 200 and len(suggestion) > 200:
-            display_text = suggestion
-        display_text = strip_leading_process_narration(display_text)
-        st.session_state["ftmo_last_suggestion_text"] = display_text
-        st.session_state["ftmo_last_suggestion_generated_at"] = datetime.now(timezone.utc)
-        st.session_state["ftmo_last_suggestion_analyses"] = analyses
-        if allocation:
-            st.session_state["ftmo_suggested_allocation"] = allocation
-            st.session_state["ftmo_suggestion_generated_this_session"] = True
-            st.session_state["ftmo_rebalance_plan"] = None
-    else:
-        st.session_state["ftmo_last_suggestion_text"] = None
-        st.session_state["ftmo_last_suggestion_analyses"] = None
+    # The run happens in a BACKGROUND thread (see _start_manual_mega_run): running it inline blocked this script for the whole
+    # session, and Streamlit cannot rerun the run_every fragments (the live progress log in the Mega Market Analysis box, the Clerk
+    # panel) while the script is busy - so nothing appeared until the page was refreshed. Now the click returns at once, the
+    # fragments keep ticking, and _consume_manual_mega_result folds the finished suggestion into this session when it is done.
+    _manual_run_id, _manual_already_running = _start_manual_mega_run(selected_model)
+    st.session_state["ftmo_suggestion_error"] = None
+    st.session_state["ftmo_suggestion_warning"] = None
+    st.session_state["ftmo_suggestion_already_running"] = _manual_already_running
+    if _manual_run_id:
+        st.session_state["_ftmo_manual_run_id"] = _manual_run_id
     st.rerun()
 
 elif suggest_clicked:
@@ -4256,6 +4741,12 @@ if apply_clicked:
             st.error(str(e))
         else:
             market_prices = {a.symbol: a for a in fresh_assets}
+            # The manual Apply button always sends plain limit orders: the stop/market entry kinds
+            # (analysis/entry_mode.py) are only ever sent by the Clerk, which re-verifies each one against a
+            # live quote, the M5 ATR and a slippage cap first — a manual click has none of that.
+            from dataclasses import replace as _replace_entry
+
+            allocation = {symbol: _replace_entry(entry, entry_mode="limit") for symbol, entry in allocation.items()}
             plan = compute_rebalance_plan(
                 fresh_positions,
                 fresh_account,

@@ -119,50 +119,21 @@ from ai.openrouter_client import (
 from ai.portfolio_suggest import AUDIT_MODELS, build_macro_snapshot
 from data.fundamentals_source import EquityFundamentals, fetch_equity_fundamentals
 from data.macro_source import fetch_country_fiscal_indicators
-from data.mt5_source import connect, get_market_watch, get_symbol_category
+from data.mt5_source import connect, get_market_watch, get_symbol_category, read_ftmo_symbol_mix
 from data.news_source import fetch_google_news, fetch_recent_news, fetch_rss_feed
+from data import symbol_news
 
 logger = logging.getLogger(__name__)
 
-# Broad, real, well-known tickers used purely to catch market-wide/
-# geopolitical headlines (Fed policy, energy shocks, broad risk-on/
-# risk-off sentiment) that a single instrument's own headline feed
-# wouldn't surface — S&P 500 (broad risk sentiment), crude oil (energy/
-# geopolitical proxy), gold (safe-haven/macro proxy). Fetched ONCE per
-# run, shared across every symbol's report, not per-symbol. Each ticker
-# is paired with a plain, human-readable Google News search query (its
-# own Yahoo ticker spelling, e.g. "^GSPC"/"CL=F", searches poorly there)
-# used as the fallback source when Yahoo returns nothing for it.
-_MACRO_PROXY_TICKERS = {"^GSPC": "S&P 500", "CL=F": "crude oil", "GC=F": "gold price"}
+# Moved to data/symbol_news.py 2026-09-20 (get_macro_news_items) —
+# kept as aliases here purely in case anything still imports these
+# names from this module.
+_MACRO_PROXY_TICKERS = symbol_news._MACRO_PROXY_TICKERS
+_CNBC_TOP_NEWS_URL = symbol_news._CNBC_TOP_NEWS_URL
 
-# CNBC's own real, free, no-key top-news RSS feed — added as a 4th
-# shared macro/geopolitical source alongside the proxy tickers above
-# (fetched once per run, same as them). Confirmed live to carry genuine
-# geopolitical/macro stories a single instrument's own per-symbol news
-# search doesn't surface (a real Iran/Strait-of-Hormuz story was live on
-# this feed during Phase 1 verification).
-_CNBC_TOP_NEWS_URL = "https://www.cnbc.com/id/100003114/device/rss/rss.html"
-
-# Real, free, no-key RSS feeds genuinely dedicated to one asset class —
-# added as EXTRA per-symbol grounding alongside the per-symbol Yahoo/
-# Google News search above, for deeper analyst-grade coverage a generic
-# per-symbol headline search doesn't surface (e.g. FXStreet's own
-# cross-pair analyst commentary, which mentions a given pair by name far
-# less often than it discusses the broader driver behind it). Live-
-# verified content quality: FXStreet/CoinDesk carry a real, distinct
-# <description> summary per item; Investing.com's commodities feed only
-# a title (left "" honestly rather than duplicated — see fetch_rss_
-# feed's own docstring). No equities-specific feed here: no free,
-# no-key, genuinely equities-only real feed was found working live (the
-# obvious candidate, MarketWatch's top-stories feed, turned out to be
-# general/lifestyle content on inspection, not market news) — Yahoo/
-# Google News' own per-symbol search already covers equities directly.
-_CATEGORY_RSS_FEEDS = {
-    "Forex": "https://www.fxstreet.com/rss/news",
-    "Exotics": "https://www.fxstreet.com/rss/news",
-    "Crypto": "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "Metals": "https://www.investing.com/rss/commodities.rss",
-}
+# Moved to data/symbol_news.py 2026-09-20 — see this file's own
+# _resolve_ftmo_yahoo_ticker comment for the full "why shared" reasoning.
+_CATEGORY_RSS_FEEDS = symbol_news._CATEGORY_RSS_FEEDS
 
 # Defined here (not duplicated as a private constant in researcher_job.py)
 # so both callers acquire the literal same lock file, and can never drift
@@ -176,115 +147,28 @@ RESEARCHER_LOCK_STALE_AFTER_SECONDS = 40 * 60
 _SENTIMENT_TAGS = ("BULLISH", "BEARISH", "NEUTRAL")
 
 
+#  --- Per-symbol news: ticker resolution, relevance filtering, and the
+#  keyword table these use — MOVED to data/symbol_news.py 2026-09-20
+#  (direct user request: Clerk/Mega Session/the webapp's News section all
+#  need this SAME logic, not a second private copy of it — see that
+#  module's own top-of-file docstring for the real bug this fix closes).
+#  Every function below is now a thin delegating wrapper, same name/
+#  signature as before, so none of this module's own ~85 existing news
+#  tests needed to change; the canonical implementation lives in
+#  data/symbol_news.py.
+_CURRENCY_KEYWORDS = symbol_news._CURRENCY_KEYWORDS
+
+
 def _resolve_ftmo_yahoo_ticker(symbol: str, category: str) -> str | None:
-    """Real, well-known Yahoo Finance ticker conventions for THIS
-    account's own symbol naming — deliberately NOT data.underlying's
-    resolve_yahoo_ticker, whose own docstring says it matches "a PMEX
-    symbol/description" via a commodity-keyword map (GOLD/SILVER/CRUDE/
-    WHEAT/...). Checked directly against this account's real symbol
-    descriptions during planning: that map only actually matches XAUUSD/
-    XAGUSD (their own descriptions literally say "Gold"/"Silver") — every
-    forex pair, all four equities (NVDA/INTC/AMD/MSFT), and both crypto
-    symbols would silently return None from it. This function covers the
-    real, documented ~17-symbol FTMO universe instead, keyed off the one
-    existing deterministic classifier, data.mt5_source.get_symbol_
-    category, using Yahoo's own real, publicly documented ticker
-    conventions (never invented):
-      - Forex/Exotics/Metals CFD -> "<SYMBOL>=X" (Yahoo's real FX/spot-
-        metal suffix, e.g. "EURUSD=X", "XAUUSD=X").
-      - Crypto (symbol ending "USD") -> "<BASE>-USD" (e.g. "BTC-USD").
-      - Equities -> the bare symbol (NVDA/INTC/AMD/MSFT already ARE
-        their own real Yahoo ticker).
-    Everything else (Commodities, Agriculture, Cash CFD/indices,
-    Uncategorized) has no reliable convention known — returns None
-    rather than guessing."""
-    if category in ("Forex", "Exotics") or category.startswith("Metals"):
-        return f"{symbol}=X"
-    if category.startswith("Crypto") and symbol.endswith("USD"):
-        return f"{symbol[:-3]}-USD"
-    if category.startswith("Equities"):
-        return symbol
-    return None
-
-
-# Real, well-known keyword sets per major currency/metal — added for the
-# per-symbol news relevance filter below, direct user request 2026-09-
-# 15/16 ("strategic, targeted... make the scenario more deterministic")
-# after a real, root-caused defect: Yahoo's own ticker-news search for
-# "GBPUSD=X" returned two genuinely irrelevant cocoa/Ghana commodity
-# articles among its top 5 results (confirmed live 2026-09-16 by
-# inspecting the raw fetched payload) — NOT a model hallucination, the
-# model correctly cited real data it was handed and told was "real news
-# for GBPUSD"; the actual defect was upstream, in what got fetched. A
-# prompt instruction can't fix a data-quality problem — only filtering
-# the bad data out before it ever reaches the prompt can, which is what
-# this does. Deliberately conservative and literal (currency
-# name/abbreviation/central-bank keywords only) rather than a fuzzy
-# relevance model of its own — the goal is catching an obviously
-# unrelated item like "cocoa", not making a subjective editorial call.
-_CURRENCY_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "USD": ("usd", "dollar", "fed", "u.s.", "greenback", "dxy"),
-    "EUR": ("eur", "euro", "ecb", "eurozone"),
-    "GBP": ("gbp", "pound", "sterling", "boe", "uk", "britain", "british"),
-    "JPY": ("jpy", "yen", "boj", "japan"),
-    "CHF": ("chf", "franc", "snb", "swiss", "switzerland"),
-    "CAD": ("cad", "loonie", "canada", "boc"),
-    "AUD": ("aud", "aussie", "australia", "rba"),
-    "NZD": ("nzd", "kiwi", "zealand", "rbnz"),
-    "CNH": ("cnh", "cny", "yuan", "renminbi", "china", "pboc"),
-    "SEK": ("sek", "krona", "sweden", "riksbank"),
-    "XAU": ("gold", "xau"),
-    "XAG": ("silver", "xag"),
-    "BTC": ("btc", "bitcoin"),
-    "ETH": ("eth", "ethereum"),
-}
+    return symbol_news.resolve_ftmo_yahoo_ticker(symbol, category)
 
 
 def _symbol_relevance_keywords(symbol: str, category: str) -> list[str]:
-    """Real, literal keywords a genuinely relevant news item about
-    `symbol` should contain — used by _filter_relevant_news below to
-    deterministically drop an obviously off-topic item (see that
-    function's own docstring for the real defect this fixes). Forex/
-    Exotics/Metals: both halves of the pair (e.g. "GBPUSD" -> GBP + USD
-    keywords). Crypto ending "USD": the coin's own keywords + USD.
-    Equities: just the bare symbol/ticker itself — a Yahoo equity-ticker
-    search is already precise in practice (this defect was only ever
-    observed on a currency-pair-style ticker), so no currency-style
-    keyword set applies. Anything not covered falls back to [symbol]
-    alone, never an empty list (an empty keyword list would make the
-    filter below vacuously drop everything)."""
-    if category in ("Forex", "Exotics") or category.startswith("Metals"):
-        base, quote = symbol[:3], symbol[3:]
-        keywords = list(_CURRENCY_KEYWORDS.get(base, ())) + list(_CURRENCY_KEYWORDS.get(quote, ()))
-        return keywords or [symbol]
-    if category.startswith("Crypto") and symbol.endswith("USD"):
-        base = symbol[:-3]
-        keywords = list(_CURRENCY_KEYWORDS.get(base, ())) + list(_CURRENCY_KEYWORDS.get("USD", ()))
-        return keywords or [symbol]
-    return [symbol]
+    return symbol_news.symbol_relevance_keywords(symbol, category)
 
 
 def _filter_relevant_news(news_items: list[dict], keywords: list[str]) -> list[dict]:
-    """Deterministically drops a fetched news item whose title+summary
-    contains NONE of the real, literal `keywords` for this symbol — see
-    _symbol_relevance_keywords's own docstring for the real defect this
-    fixes (a genuinely irrelevant cocoa/Ghana item that Yahoo's own
-    ticker-news search returned for GBPUSD). Deliberately falls back to
-    the ORIGINAL, unfiltered list if filtering would remove every single
-    item — an empty result here almost certainly means the keyword set
-    is incomplete for this symbol, not that every real fetched item is
-    genuinely irrelevant; degrading to "some possibly-noisy items" is
-    safer than degrading to "no news at all" for a symbol that DID have
-    real news fetched."""
-    if not keywords:
-        return news_items
-    lowered_keywords = [k.lower() for k in keywords]
-    filtered = [
-        item
-        for item in news_items
-        if any(k in f"{item.get('title', '')} {item.get('summary', '')}".lower() for k in lowered_keywords)
-    ]
-    return filtered if filtered else news_items
+    return symbol_news.filter_relevant_news(news_items, keywords)
 
 
 def parse_researcher_sentiment(text: str) -> str | None:
@@ -326,155 +210,66 @@ def _fmt(value: float | None, digits: int = 1) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
 
-def _parse_published(published: str) -> datetime | None:
-    """Real published-date parsing across the three genuinely different
-    formats this project's own news sources actually return (confirmed
-    live 2026-09-15): Yahoo's own ISO 8601 with a trailing "Z"
-    ("2026-09-14T00:00:00Z"), and RFC 822 from both Google News and every
-    plain RSS feed ("Fri, 11 Sep 2026 07:00:00 GMT", "Mon, 14 Sep 2026
-    08:07:16 +0000", and Investing.com's own slightly different but
-    still RFC-822-parseable "Sep 11, 2026 19:01 GMT"). None (never a
-    guessed/fabricated date) on an empty string or a shape neither parser
-    recognizes."""
-    if not published:
-        return None
-    try:
-        return datetime.fromisoformat(published.replace("Z", "+00:00"))
-    except ValueError:
-        pass
-    try:
-        from email.utils import parsedate_to_datetime
+#  --- Also moved to data/symbol_news.py 2026-09-20 (see _resolve_ftmo_
+#  yahoo_ticker's own comment above) — thin delegating wrappers below,
+#  same names/signatures, so this module's own existing tests/call sites
+#  are unaffected. _fetch_news_with_fallback gains a NEW optional
+#  `symbol` kwarg (defaults to None, so its own 2 existing direct-call
+#  tests that don't pass it are unaffected) — when given, the shared
+#  module's own cache + vault-persistence kick in.
 
-        return parsedate_to_datetime(published)
-    except (ValueError, TypeError):
-        return None
+
+def _parse_published(published: str) -> datetime | None:
+    return symbol_news._parse_published(published)
 
 
 def _relative_age(published: str, now_utc: datetime) -> str:
-    """A short, human-readable age ("5m ago", "3h ago", "2d ago") for one
-    real news item — added so the model can actually tell a just-
-    published headline apart from a stale one instead of treating every
-    item in the prompt as equally current (direct user request 2026-09-
-    15/16, "look for more dimensions which can further improve quality").
-    "" (never a fabricated age) when the published string is missing or
-    doesn't parse, or is somehow in the future (a real, if rare,
-    possibility — clock skew between this machine and a feed's own
-    server — safer to omit than print a nonsensical negative age)."""
-    dt = _parse_published(published)
-    if dt is None:
-        return ""
-    seconds = (now_utc - dt).total_seconds()
-    if seconds < 0:
-        return ""
-    if seconds < 3600:
-        return f"{max(1, int(seconds // 60))}m ago"
-    if seconds < 86400:
-        return f"{int(seconds // 3600)}h ago"
-    return f"{int(seconds // 86400)}d ago"
+    return symbol_news._relative_age(published, now_utc)
 
 
 def _format_news_block(news_items: list[dict], now_utc: datetime | None = None) -> str:
-    """Real title + summary + source + age, one item per 1-2 lines — the
-    richer shape data.news_source.fetch_recent_news returns, in place of
-    the bare titles the original (pre-enrichment) version of this module
-    handed the model. "(none)" when there's genuinely nothing, never a
-    fabricated placeholder headline. `now_utc` is injectable (same
-    reasoning as save_research_report's own records_dir parameter) so
-    tests get a fixed, reproducible "now" instead of depending on the
-    real clock; defaults to the real current time for every actual
-    caller."""
-    if not news_items:
-        return "(none)"
-    now_utc = datetime.now(timezone.utc) if now_utc is None else now_utc
-    lines = []
-    for item in news_items:
-        age = _relative_age(item.get("published", ""), now_utc)
-        bits = [b for b in (item.get("source"), age) if b]
-        suffix = f" — {', '.join(bits)}" if bits else ""
-        lines.append(f"- {item['title']}{suffix}")
-        if item.get("summary"):
-            lines.append(f"  {item['summary']}")
-    return "\n".join(lines)
+    return symbol_news.format_news_block(news_items, now_utc)
 
 
 def _google_news_query(symbol: str, category: str) -> str:
-    """A plain, human-readable Google News search query for `symbol` —
-    deliberately NOT its own Yahoo ticker spelling (e.g. "EURUSD=X"),
-    which searches poorly there; a real instrument name/symbol phrase
-    returns real, relevant coverage instead."""
-    if category in ("Forex", "Exotics"):
-        return f"{symbol} forex"
-    if category.startswith("Metals"):
-        return f"{symbol} price"
-    if category.startswith("Crypto") and symbol.endswith("USD"):
-        return f"{symbol[:-3]} crypto"
-    if category.startswith("Equities"):
-        return f"{symbol} stock"
-    return symbol
+    return symbol_news.google_news_query(symbol, category)
 
 
-def _fetch_news_with_fallback(yahoo_ticker: str, google_query: str, limit: int) -> list[dict]:
-    """Yahoo Finance first (real title+summary+source+date); Google
-    News' own public RSS search feed as a second, free, no-API-key
-    source when Yahoo genuinely has nothing — a real, observed gap this
-    closes: USDCHF/USDCAD/USDSEK/USDCNH all came back with zero Yahoo
-    items on the same live run, even though real forex commentary for
-    every one of them genuinely exists elsewhere. Both fetch functions
-    already degrade to [] on any real failure (never raise — see their
-    own docstrings), so nothing here needs its own try/except."""
-    items = fetch_recent_news(yahoo_ticker, limit=limit)
-    if items:
-        return items
-    return fetch_google_news(google_query, limit=limit)
+def _fetch_news_with_fallback(
+    yahoo_ticker: str, google_query: str, limit: int, symbol: str | None = None
+) -> list[dict]:
+    return symbol_news.fetch_news_with_fallback(yahoo_ticker, google_query, limit, symbol=symbol)
 
 
 def _category_rss_feed_url(category: str) -> str | None:
-    """The real, free, no-key specialty RSS feed for `category` (see
-    _CATEGORY_RSS_FEEDS's own comment) — None (an honest "no extra
-    per-category feed exists for this one") for anything not covered,
-    same "never guess" posture as _resolve_ftmo_yahoo_ticker."""
-    if category in _CATEGORY_RSS_FEEDS:
-        return _CATEGORY_RSS_FEEDS[category]
-    if category.startswith("Crypto"):
-        return _CATEGORY_RSS_FEEDS["Crypto"]
-    if category.startswith("Metals"):
-        return _CATEGORY_RSS_FEEDS["Metals"]
-    return None
+    return symbol_news.category_rss_feed_url(category)
 
 
+# Also moved to data/symbol_news.py 2026-09-20 (get_category_news_items/
+# get_macro_news_items), now cached there — same thin-wrapper pattern as
+# the rest of this file's own news functions, same names/signatures.
 def _fetch_category_news_block(category: str, limit: int) -> str:
-    """Real, additional analyst-grade coverage from a feed genuinely
-    dedicated to `category` (FXStreet/CoinDesk/Investing.com — see
-    _CATEGORY_RSS_FEEDS), on top of the per-symbol news search above.
-    "(no category-specialty feed for ...)" — an honest, visible note,
+    """"(no category-specialty feed for ...)" — an honest, visible note,
     not silence — when no such feed exists for this category (equities,
-    or anything else _category_rss_feed_url doesn't cover)."""
-    url = _category_rss_feed_url(category)
-    if url is None:
+    or anything else category_rss_feed_url doesn't cover)."""
+    if symbol_news.category_rss_feed_url(category) is None:
         return f"(no category-specialty feed for {category!r})"
-    return _format_news_block(fetch_rss_feed(url, limit=limit))
+    return symbol_news.format_news_block(symbol_news.get_category_news_items(category, limit))
 
 
 def _fetch_macro_headlines_block() -> str:
-    """Real, market-wide/geopolitical-proxy headlines (see
-    _MACRO_PROXY_TICKERS's own comment for why these three) plus CNBC's
-    own real top-news RSS feed (_CNBC_TOP_NEWS_URL), fetched ONCE per run
-    and shared across every symbol's report — this is genuinely the same
-    real news feed every symbol's own report would otherwise miss
-    entirely, since a single instrument's own headline feed rarely
-    surfaces e.g. a Fed rate decision or an OPEC+ supply cut by itself.
-    Yahoo first, Google News RSS as a fallback per proxy ticker — same
-    _fetch_news_with_fallback both per-symbol fetches use below; CNBC's
-    own feed needs no such fallback, it's already a direct, reliable
-    RSS pull with no ticker/query to resolve."""
+    """Real, market-wide/geopolitical-proxy headlines plus CNBC's own
+    top-news feed, fetched ONCE per run (now cached — see data.symbol_
+    news.get_macro_news_items's own docstring) and shared across every
+    symbol's report."""
+    items = symbol_news.get_macro_news_items()
+    if not items:
+        return "(none found this run)"
     lines = []
-    for ticker, google_query in _MACRO_PROXY_TICKERS.items():
-        for item in _fetch_news_with_fallback(ticker, google_query, limit=3):
-            suffix = f" — {item['source']}" if item.get("source") else ""
-            lines.append(f"- [{ticker}] {item['title']}{suffix}")
-    for item in fetch_rss_feed(_CNBC_TOP_NEWS_URL, limit=5):
-        lines.append(f"- [CNBC] {item['title']}")
-    return "\n".join(lines) if lines else "(none found this run)"
+    for item in items:
+        suffix = f" — {item['source']}" if item.get("source") and not item["title"].startswith("[CNBC]") else ""
+        lines.append(f"- {item['title']}{suffix}")
+    return "\n".join(lines)
 
 
 def _format_fiscal_snapshot(indicators: list) -> str:
@@ -537,6 +332,13 @@ def _build_macro_snapshot_block() -> str:
     return snapshot
 
 
+def _nearest_level(levels) -> object | None:
+    """The S/R level closest to price (the M5 lists are ordered strongest-first, not nearest-first), or
+    None when there are none."""
+    levels = list(levels or [])
+    return min(levels, key=lambda level: abs(level.distance_pct)) if levels else None
+
+
 def _build_technical_snapshot(analysis: FtmoAssetAnalysis) -> str:
     """A condensed, deterministic technical/backtest read for one
     symbol — real fields pulled directly from analyze_ftmo_asset_live's
@@ -550,23 +352,48 @@ def _build_technical_snapshot(analysis: FtmoAssetAnalysis) -> str:
     120s primary-model timeout was observed live during Phase 1
     verification on a plain bare-headline prompt)."""
     lines = []
-    for label, stats in (("D1", analysis.base.stats), ("H4", analysis.h4_stats), ("H1", analysis.h1_stats)):
+    # M5 is the decision timeframe (2026-09-24); D1/H4/H1 are labeled context so the local model does not
+    # read a higher-timeframe level as the trade's own price anchor.
+    for label, stats in (
+        ("D1 (context)", analysis.base.stats),
+        ("H4 (context)", analysis.h4_stats),
+        ("H1 (context)", analysis.h1_stats),
+        ("M5 (decision)", analysis.m5_stats),
+    ):
         if stats.trend is None:
             continue
+        if label.startswith("D1"):
+            tail = f"ATR%={_fmt(stats.atr_pct)}, 1-month change={_fmt(stats.change_1m_pct)}%"
+        else:
+            # change_1m_pct is a 21-BAR change: a real month only on D1 (on M5 it is ~105 minutes), so it is
+            # not shown for the intraday reads; their ATR% (per bar, 0.03 on a calm FX M5) needs 3 decimals.
+            tail = f"ATR%={_fmt(stats.atr_pct, 3)} per bar"
         lines.append(
-            f"- {label}: trend={stats.trend}, regime={stats.market_regime}, RSI={_fmt(stats.rsi)}, "
-            f"ATR%={_fmt(stats.atr_pct)}, 1-month change={_fmt(stats.change_1m_pct)}%"
+            f"- {label}: trend={stats.trend}, regime={stats.market_regime}, RSI={_fmt(stats.rsi)}, {tail}"
         )
 
-    sr = analysis.h1_structure.sr_levels
+    def _sr_snapshot_text(lvl) -> str:
+        # Real band, not a single point — added 2026-09-20, direct user
+        # challenge. Kept compact (no recency-weighted score shown here,
+        # unlike ai.ftmo_suggest.format_chart_structure's fuller
+        # rendering) since this snapshot deliberately stays short for a
+        # small local model with real read-timeout risk on long prompts
+        # (see this function's own docstring).
+        if lvl.low is not None and lvl.high is not None:
+            return f"{lvl.low:.5g}-{lvl.high:.5g}"
+        return f"{lvl.price:.5g}"
+
+    sr = analysis.m5_structure.sr_levels
     if sr is not None:
-        if sr.support_levels:
-            lvl = sr.support_levels[0]
-            lines.append(f"- Nearest H1 support: {lvl.price:.5g} ({lvl.distance_pct:+.2f}%, {lvl.touches} touches)")
-        if sr.resistance_levels:
-            lvl = sr.resistance_levels[0]
+        lvl = _nearest_level(sr.support_levels)
+        if lvl is not None:
             lines.append(
-                f"- Nearest H1 resistance: {lvl.price:.5g} ({lvl.distance_pct:+.2f}%, {lvl.touches} touches)"
+                f"- Nearest M5 support: {_sr_snapshot_text(lvl)} ({lvl.distance_pct:+.2f}%, {lvl.touches} touches)"
+            )
+        lvl = _nearest_level(sr.resistance_levels)
+        if lvl is not None:
+            lines.append(
+                f"- Nearest M5 resistance: {_sr_snapshot_text(lvl)} ({lvl.distance_pct:+.2f}%, {lvl.touches} touches)"
             )
 
     for label, bt in (
@@ -698,17 +525,17 @@ def _build_track_record_block(symbol: str, current_price: float, now_utc: dateti
 def _extract_price_anchors(analysis: FtmoAssetAnalysis, current_price: float) -> list[float]:
     """Real, deterministically-computed price levels this symbol's own
     report should be checked against — the current price plus the
-    nearest real H1 support/resistance from analyze_ftmo_asset_live's
+    nearest real M5 support/resistance (the decision timeframe) from analyze_ftmo_asset_live's
     own output. NEVER anything the model itself proposes — this is the
     real "ideal reference state" a fabricated price level gets checked
     against by _check_price_grounding below."""
     anchors = [current_price]
-    sr = analysis.h1_structure.sr_levels
+    sr = analysis.m5_structure.sr_levels
     if sr is not None:
-        if sr.support_levels:
-            anchors.append(sr.support_levels[0].price)
-        if sr.resistance_levels:
-            anchors.append(sr.resistance_levels[0].price)
+        for levels in (sr.support_levels, sr.resistance_levels):
+            lvl = _nearest_level(levels)
+            if lvl is not None:
+                anchors.append(lvl.price)
     return anchors
 
 
@@ -740,7 +567,7 @@ def _check_price_grounding(report_text: str, price_anchors: list[float]) -> str 
     it with extra caution rather than trusting it silently. None (no
     disclosure needed) when at least one real number in the Price Action
     Hypothesis is within 1% of a real anchor (current price, or the
-    nearest real H1 support/resistance) — a tolerance generous enough
+    nearest real M5 support/resistance) — a tolerance generous enough
     for genuine rounding, tight enough to still catch a fabricated
     level."""
     if not price_anchors:
@@ -931,7 +758,18 @@ def _strip_sentiment_line(report_text: str) -> str:
     ).strip()
 
 
-def _export_research_note(symbol: str, report_text: str, vault_path: Path | None = None) -> None:
+def _export_research_note(
+    symbol: str,
+    report_text: str,
+    news_block: str = "",
+    category_news_block: str = "",
+    macro_headlines_block: str = "",
+    macro_snapshot_block: str = "",
+    technical_block: str = "",
+    equity_fundamentals_block: str = "",
+    track_record_block: str = "",
+    vault_path: Path | None = None,
+) -> None:
     """Best-effort side effect: writes this run's research synthesis into
     the SAME Obsidian vault ai.clerk_execution's own _export_closed_
     trade_notes already writes closed-trade journal entries into
@@ -955,7 +793,19 @@ def _export_research_note(symbol: str, report_text: str, vault_path: Path | None
     `vault_path` is injectable (same reasoning as save_research_report's
     own records_dir parameter) so tests never write into the user's own
     real, live Obsidian vault — a real leak caught live during this
-    feature's own first test run, cleaned up immediately, fixed here."""
+    feature's own first test run, cleaned up immediately, fixed here.
+
+    Real gap found 2026-09-20, direct user report after comparing the
+    two: this note used to include ONLY the model's own prose synthesis,
+    while the webapp's own Researcher panel (`latest_research_report`)
+    reads records/researcher/'s full .md file, which ALSO includes every
+    real input (news_block, category_news_block, macro_headlines_block,
+    the technical/equity/track-record blocks) via save_research_report's
+    own "## Real inputs used" section — so the vault note was silently
+    thinner than what the webpage already showed. All 7 blocks are now
+    optional keyword args (default "", so this function's existing two-
+    arg call shape still works) included in the SAME "Real inputs used"
+    section, mirroring save_research_report's own content exactly."""
     try:
         vault_root = Path(config.OBSIDIAN_VAULT_PATH) if vault_path is None else vault_path
         vault_dir = vault_root / "Research"
@@ -970,12 +820,56 @@ def _export_research_note(symbol: str, report_text: str, vault_path: Path | None
             f"# {symbol} — Research ({sentiment})\n\n"
             f"*Last updated {timestamp:%Y-%m-%d %H:%M} UTC by Researcher.*\n\n"
             f"{synthesis_only}\n\n"
+            "## Real inputs used\n\n"
+            f"### News — {symbol}\n\n{news_block}\n\n"
+            f"### Analyst-grade asset-class news — {symbol}\n\n{category_news_block}\n\n"
+            f"### Market-wide macro/geopolitical headlines\n\n{macro_headlines_block}\n\n"
+            f"### Macro/economic snapshot\n\n{macro_snapshot_block}\n\n"
+            f"### Technical/backtest read — {symbol}\n\n{technical_block}\n\n"
+            f"### Equity fundamentals — {symbol}\n\n{equity_fundamentals_block}\n\n"
+            f"### Self-calibration track record — {symbol}\n\n{track_record_block}\n\n"
             f"[[{symbol}]]\n"
             "[[Research]]\n"
         )
         (vault_dir / f"{symbol}.md").write_text(content, encoding="utf-8")
     except OSError as e:
         logger.warning("Could not export Obsidian research note for %s: %s", symbol, e)
+
+
+def _prune_stale_research_notes(vault_path: Path | None = None) -> None:
+    """Deletes any Research/{symbol}.md vault note whose symbol is no
+    longer in the current ftmo_symbol_mix.json allowlist — real gap
+    found 2026-09-20, direct user report: a symbol removed from the mix
+    keeps its old research note in the vault forever, with no natural
+    mechanism to ever remove it (_export_research_note only ever WRITES
+    a note for a symbol it currently processes, never deletes one for a
+    symbol it doesn't). Deliberately compared against the configured
+    allowlist (read_ftmo_symbol_mix), NOT this run's own live get_
+    market_watch() result — Market Watch's own visibility is known to be
+    non-durable (a symbol genuinely still in the mix can transiently be
+    missing from MT5's own terminal this cycle), so pruning against a
+    live snapshot could delete a perfectly legitimate note for a symbol
+    that just wasn't visible THIS particular run.
+
+    None from read_ftmo_symbol_mix() means "no explicit allowlist
+    configured" (see its own docstring) — there is no "current mix" to
+    prune against in that case, so this does nothing rather than delete
+    every note. Called once per full Researcher run (not per-symbol),
+    since it needs the complete current allowlist to compare against."""
+    allowlist = read_ftmo_symbol_mix()
+    if allowlist is None:
+        return
+    try:
+        vault_root = Path(config.OBSIDIAN_VAULT_PATH) if vault_path is None else vault_path
+        vault_dir = vault_root / "Research"
+        if not vault_dir.exists():
+            return
+        allowed = set(allowlist)
+        for note_path in vault_dir.glob("*.md"):
+            if note_path.stem not in allowed:
+                note_path.unlink()
+    except OSError as e:
+        logger.warning("Could not prune stale Obsidian research notes: %s", e)
 
 
 def save_research_report(
@@ -1070,6 +964,8 @@ def run_researcher_check(on_stage: Callable[[str], None] | None = None) -> None:
     _notify("Connecting to the FTMO MT5 account...")
     connect(login=config.FTMO_MT5_LOGIN, password=config.FTMO_MT5_PASSWORD, server=config.FTMO_MT5_SERVER)
 
+    _prune_stale_research_notes()
+
     _notify("Fetching the live Market Watch symbol list...")
     assets = get_market_watch()
     if not assets:
@@ -1086,20 +982,23 @@ def run_researcher_check(on_stage: Callable[[str], None] | None = None) -> None:
         _notify(f"Researching {i}/{len(assets)} — {asset.symbol}...")
         try:
             category = get_symbol_category(asset.symbol)
-            yahoo_ticker = _resolve_ftmo_yahoo_ticker(asset.symbol, category)
-            if yahoo_ticker is None:
-                logger.info(
-                    "%s: no known Yahoo ticker convention for category %r — skipped.", asset.symbol, category,
-                )
-                continue
-            google_query = _google_news_query(asset.symbol, category)
-            news_items = _fetch_news_with_fallback(
-                yahoo_ticker, google_query, limit=config.RESEARCHER_HEADLINES_PER_SYMBOL
+            # Delegates entirely to the shared data.symbol_news.get_
+            # symbol_news_block (resolve -> cached fetch-with-fallback ->
+            # relevance filter) rather than reimplementing those same 3
+            # steps locally, so this automatically gets its "intelligent
+            # search" fallback too: a symbol whose category matches no
+            # known ticker convention still gets a real Google News
+            # search built from MT5's own real description (e.g.
+            # "Coffee vs US Dollar, Spot CFD" -> "Coffee"), instead of
+            # being silently skipped forever — real gap found 2026-09-20,
+            # direct user challenge after Agriculture/Cash CFD symbols
+            # were found to have zero news coverage.
+            news_items = symbol_news.get_symbol_news_block(
+                asset.symbol, category, limit=config.RESEARCHER_HEADLINES_PER_SYMBOL, description=asset.description
             )
             if not news_items:
-                logger.info("%s: no real news found on Yahoo or Google News — skipped.", asset.symbol)
+                logger.info("%s: no real news found for this symbol — skipped.", asset.symbol)
                 continue
-            news_items = _filter_relevant_news(news_items, _symbol_relevance_keywords(asset.symbol, category))
             news_block = _format_news_block(news_items)
             category_news_block = _fetch_category_news_block(category, limit=config.RESEARCHER_HEADLINES_PER_SYMBOL)
 
@@ -1117,9 +1016,13 @@ def run_researcher_check(on_stage: Callable[[str], None] | None = None) -> None:
             # real failure (never raises — see its own docstring), so
             # this needs no try/except of its own, unlike the technical
             # snapshot above (analyze_ftmo_asset_live can genuinely
-            # raise on a real MT5 hiccup).
+            # raise on a real MT5 hiccup). asset.symbol directly, not a
+            # separately-resolved yahoo_ticker (removed above when this
+            # loop started delegating to symbol_news.get_symbol_news_
+            # block) — resolve_ftmo_yahoo_ticker's own Equities rule is
+            # just "the bare symbol", so they were always identical here.
             if category.startswith("Equities"):
-                equity_fundamentals_block = _format_equity_fundamentals(fetch_equity_fundamentals(yahoo_ticker))
+                equity_fundamentals_block = _format_equity_fundamentals(fetch_equity_fundamentals(asset.symbol))
             else:
                 equity_fundamentals_block = "(not applicable — not an equity)"
 
@@ -1142,7 +1045,10 @@ def run_researcher_check(on_stage: Callable[[str], None] | None = None) -> None:
                 asset.symbol, report_text, news_block, category_news_block, macro_headlines_block,
                 macro_snapshot_block, technical_block, equity_fundamentals_block, track_record_block,
             )
-            _export_research_note(asset.symbol, report_text)
+            _export_research_note(
+                asset.symbol, report_text, news_block, category_news_block, macro_headlines_block,
+                macro_snapshot_block, technical_block, equity_fundamentals_block, track_record_block,
+            )
 
             sentiment_tag = parse_researcher_sentiment(report_text)
             if sentiment_tag is not None:

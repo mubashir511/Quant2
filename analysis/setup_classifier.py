@@ -38,7 +38,20 @@ trend/regime badges right next to it agreeing on a clean uptrend."""
 from dataclasses import dataclass
 
 from analysis.chart_structure import ChartStructureSnapshot
-from analysis.technical import TechnicalStats
+from analysis.timeframe_profiles import TimeframeProfile, near_level_tolerance_pct
+from analysis.technical import DivergenceSignal, TechnicalStats
+
+# How recent a CHOCH (change of character — analysis.chart_structure.
+# detect_structure_breaks) against the prevailing trend needs to be to
+# gate OFF pullback_continuation below — added 2026-09-20, direct user
+# challenge: a deep, trend-ending retracement that happened to land
+# inside the 38.2-61.8% Fibonacci zone used to still get called "just a
+# pullback" even after real structure had already broken against the
+# trend. A principled first cut, not yet recalibrated against real MT5
+# history — same disclosed-placeholder status as this file's own
+# STRONG_TOUCH_COUNT/NEAR_LEVEL_TOLERANCE_PCT were before real trades
+# validated them.
+CHOCH_GATE_LOOKBACK_BARS = 10
 
 # A support/resistance level needs at least this many real touches to
 # count as "well-tested" for setup-classification purposes — a level
@@ -65,6 +78,16 @@ _BEARISH_CANDLES = ("bearish_engulfing", "hanging_man", "shooting_star", "evenin
 class SetupSignal:
     name: str
     detail: str
+    # Added 2026-09-20, direct user challenge — the FIRST real confidence
+    # signal in this classification layer (previously nothing beyond the
+    # plain existence of a signal). A named tier, not an invented numeric
+    # score — matches this codebase's existing classify_rsi_tier/
+    # classify_velocity_tier convention for a read built from several
+    # boolean/categorical signals rather than one clean measurement.
+    # Default "moderate" so every existing signal (rules 3-10 below,
+    # which don't yet have their own confirmation/contradiction logic)
+    # keeps its old, unqualified meaning unchanged.
+    confidence: str = "moderate"
 
 
 def _true_retracement_ratio(fib) -> float | None:
@@ -102,16 +125,32 @@ def _strongest_nearby_sr_level(structure: ChartStructureSnapshot):
     return min(candidates, key=lambda lvl: abs(lvl.distance_pct))
 
 
-def classify_setups(stats: TechnicalStats, structure: ChartStructureSnapshot) -> list[SetupSignal]:
+def classify_setups(
+    stats: TechnicalStats,
+    structure: ChartStructureSnapshot,
+    divergence: DivergenceSignal | None = None,
+    profile: TimeframeProfile | None = None,
+) -> list[SetupSignal]:
     """Real, rule-based classification — every rule below cites the exact
     computed signal(s) it fired on in the returned `detail`, so a
     downstream reader (human or model) can verify the call rather than
     trust it blindly. More than one signal can legitimately fire at once
     (e.g. a pullback INTO a converging triangle) — this returns all that
-    genuinely apply, not a forced single verdict."""
+    genuinely apply, not a forced single verdict.
+
+    `divergence` (added 2026-09-20, direct user challenge, optional —
+    every existing caller that doesn't pass it keeps working unchanged)
+    is analysis.technical.detect_rsi_divergence's own output for this
+    same timeframe — used, alongside structure.structure_breaks (BOS/
+    CHOCH) and structure.liquidity_sweeps, to arbitrate the real
+    simultaneous-fire gap between rules 1 and 2 below: a reversal
+    candidate with independent confirmation is genuinely stronger
+    evidence than pattern geometry alone, and a pullback that structure
+    has already broken against isn't really "just a pullback" anymore."""
     signals: list[SetupSignal] = []
     if stats.last_price is None:
         return signals
+    near_level_pct = near_level_tolerance_pct(profile, stats.atr_pct, NEAR_LEVEL_TOLERANCE_PCT)
 
     trend_pattern = _find_pattern(structure, "uptrend_structure", "downtrend_structure")
     reversal_pattern = _find_pattern(structure, "double_top", "double_bottom")
@@ -120,15 +159,44 @@ def classify_setups(stats: TechnicalStats, structure: ChartStructureSnapshot) ->
     )
     nearest_sr = _strongest_nearby_sr_level(structure)
 
-    # 1. Reversal candidate — a real double top/bottom fired.
+    # 1. Reversal candidate — a real double top/bottom fired. Confidence
+    # (added 2026-09-20, direct user challenge) upgrades to "strong" when
+    # at least one INDEPENDENT signal confirms the same reversal
+    # direction: a CHOCH (real structure has already broken against the
+    # prior trend), a liquidity sweep consistent with a false breakout
+    # just before the reversal, or an RSI divergence — geometry alone
+    # (the pattern by itself) stays "weak," explicitly disclosed as such
+    # in the detail, rather than silently treated the same as a
+    # confirmed one.
     if reversal_pattern is not None:
+        implies_bearish = reversal_pattern.name == "double_top"
+        reversal_direction = "bearish" if implies_bearish else "bullish"
+        choch_confirms = any(
+            b.kind == "CHOCH" and b.direction == reversal_direction for b in structure.structure_breaks
+        )
+        sweep_confirms = any(
+            (s.direction == "swept_above") == implies_bearish for s in structure.liquidity_sweeps
+        )
+        divergence_confirms = divergence is not None and divergence.kind == reversal_direction
+        confirmations = [name for name, hit in (
+            ("a real CHOCH", choch_confirms),
+            ("a liquidity sweep", sweep_confirms),
+            ("RSI divergence", divergence_confirms),
+        ) if hit]
+        if confirmations:
+            confidence = "strong"
+            confirmation_text = f"Confirmed by {', '.join(confirmations)} — genuinely stronger evidence than pattern geometry alone."
+        else:
+            confidence = "weak"
+            confirmation_text = "No CHOCH/liquidity-sweep/divergence confirmation yet — geometry alone."
         signals.append(
             SetupSignal(
                 name="reversal_candidate",
+                confidence=confidence,
                 detail=(
                     f"{reversal_pattern.detail} Treat a break of the neckline as "
                     "confirmation, a failure to break as invalidation — the pattern "
-                    "alone isn't a trigger."
+                    f"alone isn't a trigger. {confirmation_text}"
                 ),
             )
         )
@@ -146,7 +214,21 @@ def classify_setups(stats: TechnicalStats, structure: ChartStructureSnapshot) ->
         pullback_direction_ok = (trend_is_up and fib.high_is_more_recent) or (
             not trend_is_up and not fib.high_is_more_recent
         )
-        if in_golden_zone and pullback_direction_ok:
+        # Real arbitration fix, added 2026-09-20, direct user challenge:
+        # a deep, trend-ending retracement that happens to land inside
+        # the golden zone used to still get called "just a pullback"
+        # even after real structure had already broken AGAINST the
+        # trend. A recent CHOCH (see CHOCH_GATE_LOOKBACK_BARS's own
+        # comment) against this trend's own direction means structure
+        # itself now disagrees this is still a healthy pullback — gate
+        # this signal off entirely rather than let it silently coexist
+        # with reversal_candidate with no tiebreak.
+        against_trend_direction = "bearish" if trend_is_up else "bullish"
+        recent_choch_against_trend = any(
+            b.kind == "CHOCH" and b.direction == against_trend_direction and b.bars_ago <= CHOCH_GATE_LOOKBACK_BARS
+            for b in structure.structure_breaks
+        )
+        if in_golden_zone and pullback_direction_ok and not recent_choch_against_trend:
             signals.append(
                 SetupSignal(
                     name="pullback_continuation",
@@ -161,7 +243,7 @@ def classify_setups(stats: TechnicalStats, structure: ChartStructureSnapshot) ->
 
     # 3. Range-fade candidate — sideways regime, price sitting right at a
     # well-tested level, nothing suggesting an imminent breakout.
-    if stats.market_regime == "sideways" and nearest_sr is not None and abs(nearest_sr.distance_pct) <= NEAR_LEVEL_TOLERANCE_PCT:
+    if stats.market_regime == "sideways" and nearest_sr is not None and abs(nearest_sr.distance_pct) <= near_level_pct:
         signals.append(
             SetupSignal(
                 name="range_fade_candidate",
@@ -195,7 +277,7 @@ def classify_setups(stats: TechnicalStats, structure: ChartStructureSnapshot) ->
         relevant_line = (
             structure.trendlines.support_trendline if trend_is_up else structure.trendlines.resistance_trendline
         )
-        if relevant_line is not None and abs(relevant_line.distance_pct) <= NEAR_LEVEL_TOLERANCE_PCT:
+        if relevant_line is not None and abs(relevant_line.distance_pct) <= near_level_pct:
             signals.append(
                 SetupSignal(
                     name="trend_following",

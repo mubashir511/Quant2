@@ -10,7 +10,9 @@ FAILED_MESSAGE = (
 )
 
 
-def run_ollama(prompt: str, model: str, timeout: int = 120, think: bool = False, keep_alive: str | None = None) -> str:
+def run_ollama(
+    prompt: str, model: str, timeout: int = 120, think: bool = False, keep_alive: str | None = None, max_tokens: int | None = None
+) -> str:
     """Plain chat call against a locally-running Ollama server — no API
     key, no cost, no shared rate limit, but also no built-in web search
     (unlike ai/claude_cli.py's CLI). Same "never raises, degrades to a
@@ -54,6 +56,9 @@ def run_ollama(prompt: str, model: str, timeout: int = 120, think: bool = False,
     }
     if keep_alive is not None:
         payload["keep_alive"] = keep_alive
+    if max_tokens is not None:
+        # A cap on what the model may WRITE (~8 tokens/s on the Clerk's machine): a rambling answer is the slowest thing it can do.
+        payload["options"] = {"num_predict": int(max_tokens)}
 
     try:
         response = requests.post(API_URL, json=payload, timeout=timeout)

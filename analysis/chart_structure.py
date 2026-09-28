@@ -1,9 +1,10 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 
-from analysis.technical import compute_atr
+from analysis.technical import VOLUME_TREND_BASELINE_WINDOW, compute_atr
+from analysis.timeframe_profiles import TimeframeProfile, resolve_thresholds
 
 # Fractal swing-point definition: a bar is a swing high/low if its own
 # High/Low is the STRICT, UNIQUE extreme among itself and `window` bars on
@@ -65,6 +66,22 @@ SR_TOLERANCE_ATR_MULTIPLE = 0.5
 # file just fixed for the broader tolerance.
 SR_LIQUIDITY_POOL_TOLERANCE_FRACTION = 0.35
 SR_LIQUIDITY_POOL_MIN_TOUCHES = 2
+
+# Recency-weighted touch strength — added 2026-09-20, direct user
+# challenge after reviewing real trades: raw `touches` treats a touch
+# from 90 bars ago identically to one from the last bar, so a level that
+# hasn't mattered in weeks can still outrank one price is actively
+# respecting right now. Exponential decay: weight = 0.5**(bars_ago /
+# SR_RECENCY_HALF_LIFE_BARS) — a touch this many bars old counts for
+# half the weight of a fresh one. 30 bars = 1/3 of STRUCTURE_LOOKBACK
+# (90): a touch at the very edge of the lookback window contributes
+# ~1/8 the weight of one on the latest bar, while a touch from 10 bars
+# ago still counts close to full. A principled first cut, not yet
+# validated across many more days/instruments — same "ship a value,
+# then recalibrate against real data" process SR_TOLERANCE_ATR_MULTIPLE
+# and analysis.technical.VELOCITY_FAST_THRESHOLD_PCT already went
+# through before being fully trusted at the boundary.
+SR_RECENCY_HALF_LIFE_BARS = 30.0
 
 TRENDLINE_MIN_POINTS = 3
 # A trendline's slope, projected across the whole lookback window, that
@@ -248,6 +265,68 @@ def _cluster_prices(prices: list[float], tolerance_pct: float) -> list[tuple[flo
     return [(sum(c) / len(c), len(c)) for c in clusters]
 
 
+@dataclass
+class _LevelCluster:
+    """Internal result of _cluster_swing_points — one real S/R band, not
+    yet turned into the public SRLevel (that still needs distance_pct/
+    is_liquidity_pool computed against the current price, which this
+    function has no reason to know about)."""
+
+    mean_price: float
+    low: float
+    high: float
+    touches: int
+    weighted_score: float
+
+
+def _cluster_swing_points(
+    points: list[SwingPoint],
+    tolerance_pct: float,
+    last_index: int,
+    half_life_bars: float = SR_RECENCY_HALF_LIFE_BARS,
+) -> list[_LevelCluster]:
+    """Same greedy, anchor-to-first-point clustering discipline as
+    _cluster_prices (see its own docstring for why a running mean isn't
+    used) — duplicated here rather than extending that function in place
+    because _cluster_prices has its own, separate, directly-tested
+    `list[float] -> (mean, count)` contract (used as-is for the tight
+    liquidity-pool sub-pass) that this function's own return shape would
+    break. Same "duplicate a small, tested control-flow block rather
+    than touch its tested return shape" precedent analysis.backtest.py's
+    own _compute_favorable_excursion already sets for _simulate_trades's
+    entry/ATR/stop-distance setup.
+
+    Walks real SwingPoint objects (not bare floats) so each resulting
+    cluster can report its own real low/high band and a recency-
+    weighted strength score, not just a mean and a raw count."""
+    if not points:
+        return []
+    sorted_points = sorted(points, key=lambda p: p.price)
+    clusters: list[list[SwingPoint]] = [[sorted_points[0]]]
+    for point in sorted_points[1:]:
+        anchor = clusters[-1][0].price
+        within_tolerance = anchor != 0 and (point.price - anchor) / anchor * 100 <= tolerance_pct
+        if within_tolerance:
+            clusters[-1].append(point)
+        else:
+            clusters.append([point])
+
+    result = []
+    for cluster in clusters:
+        prices = [p.price for p in cluster]
+        weighted_score = sum(0.5 ** ((last_index - p.index) / half_life_bars) for p in cluster)
+        result.append(
+            _LevelCluster(
+                mean_price=sum(prices) / len(prices),
+                low=min(prices),
+                high=max(prices),
+                touches=len(cluster),
+                weighted_score=weighted_score,
+            )
+        )
+    return result
+
+
 def atr_scaled_sr_tolerance(window: pd.DataFrame, floor_pct: float = SR_CLUSTER_TOLERANCE_PCT) -> float:
     """The real S/R clustering tolerance to use for THIS window — see
     SR_TOLERANCE_ATR_MULTIPLE's own module-level comment for the full
@@ -283,6 +362,23 @@ class SRLevel:
     # elsewhere (including this project's own tests) keeps working
     # unchanged.
     is_liquidity_pool: bool = False
+    # Real cluster band (min/max of the actual swing prices clustered
+    # into this level), not just the mean — added 2026-09-20, direct
+    # user challenge: a level was always a single point even though the
+    # clustering tolerance that produces it already implies a real band
+    # width. None for any SRLevel not built via the new _cluster_swing_
+    # points path (including this project's own pre-existing direct
+    # constructions and tests) — never a fabricated band around a bare
+    # price.
+    low: float | None = None
+    high: float | None = None
+    # Recency-weighted touch strength — see SR_RECENCY_HALF_LIFE_BARS'
+    # own module-level comment. A SEPARATE number from `touches` (not a
+    # replacement — `touches` stays the raw, honest count it always
+    # was), on its own scale, so a caller can compare "how many times"
+    # vs "how strongly, weighted by when." None for any SRLevel not
+    # built via the new clustering path, same "never fabricate" rule.
+    weighted_score: float | None = None
 
 
 @dataclass
@@ -311,6 +407,8 @@ def compute_sr_levels(
     max_levels: int = SR_MAX_LEVELS_PER_SIDE,
     swing_points: tuple[list[SwingPoint], list[SwingPoint]] | None = None,
     liquidity_pool_tolerance_pct: float | None = None,
+    half_life_bars: float = SR_RECENCY_HALF_LIFE_BARS,
+    rank_by: str = "weighted_score",
 ) -> SRLevelsResult | None:
     """Multi-level support/resistance from real swing-point clustering —
     a genuinely different, richer read than analysis/technical.py's own
@@ -329,19 +427,38 @@ def compute_sr_levels(
     tighter clustering pass over the same swing prices to flag each
     resulting level's own `is_liquidity_pool` — see SRLevel's own field
     comment and SR_LIQUIDITY_POOL_TOLERANCE_FRACTION's module-level
-    comment for the reasoning."""
+    comment for the reasoning.
+
+    `rank_by` (added 2026-09-20, direct user challenge, default
+    "weighted_score") decides which of the two SRLevel strength fields
+    ranking/truncation to `max_levels` uses — "weighted_score" lets a
+    level with fewer but MORE RECENT touches legitimately outrank a
+    stale multi-touch one (see SR_RECENCY_HALF_LIFE_BARS' own comment
+    for why this matters); "touches" reproduces the original raw-count
+    ranking for any caller that explicitly wants it."""
+    if rank_by not in ("weighted_score", "touches"):
+        raise ValueError(f"rank_by must be 'weighted_score' or 'touches', got {rank_by!r}")
+    # Found on self-review — no real caller ever overrides this (always
+    # the SR_RECENCY_HALF_LIFE_BARS default), but a zero half-life
+    # crashes on division by zero, and a negative one silently INVERTS
+    # the decay direction (older touches would outscore recent ones) with
+    # no error at all — a real, if latent, footgun for any future caller.
+    if half_life_bars <= 0:
+        raise ValueError(f"half_life_bars must be positive, got {half_life_bars!r}")
     window = _tail_reset(history, lookback)
     if window.empty or "Close" not in window.columns:
         return None
     current_price = float(window["Close"].iloc[-1])
+    last_index = len(window) - 1
 
     swing_highs, swing_lows = swing_points if swing_points is not None else find_swing_points(window)
-    all_prices = [p.price for p in swing_highs] + [p.price for p in swing_lows]
-    if not all_prices:
+    all_points = swing_highs + swing_lows
+    if not all_points:
         return None
 
     if liquidity_pool_tolerance_pct is None:
         liquidity_pool_tolerance_pct = tolerance_pct * SR_LIQUIDITY_POOL_TOLERANCE_FRACTION
+    all_prices = [p.price for p in all_points]
     tight_clusters = _cluster_prices(all_prices, liquidity_pool_tolerance_pct)
     liquidity_pool_prices = [price for price, touches in tight_clusters if touches >= SR_LIQUIDITY_POOL_MIN_TOUCHES]
 
@@ -352,27 +469,242 @@ def compute_sr_levels(
             for pool_price in liquidity_pool_prices
         )
 
-    clusters = _cluster_prices(all_prices, tolerance_pct)
+    clusters = _cluster_swing_points(all_points, tolerance_pct, last_index=last_index, half_life_bars=half_life_bars)
     levels = [
         SRLevel(
-            price=price,
-            touches=touches,
-            distance_pct=(price - current_price) / current_price * 100 if current_price else 0.0,
-            is_liquidity_pool=_is_liquidity_pool(price),
+            price=cluster.mean_price,
+            touches=cluster.touches,
+            distance_pct=(cluster.mean_price - current_price) / current_price * 100 if current_price else 0.0,
+            is_liquidity_pool=_is_liquidity_pool(cluster.mean_price),
+            low=cluster.low,
+            high=cluster.high,
+            weighted_score=cluster.weighted_score,
         )
-        for price, touches in clusters
+        for cluster in clusters
     ]
 
+    rank_key = (lambda level: level.weighted_score) if rank_by == "weighted_score" else (lambda level: level.touches)
     resistance = sorted(
         (level for level in levels if level.price > current_price),
-        key=lambda level: (-level.touches, level.distance_pct),
+        key=lambda level: (-rank_key(level), level.distance_pct),
     )[:max_levels]
     support = sorted(
         (level for level in levels if level.price < current_price),
-        key=lambda level: (-level.touches, -level.distance_pct),
+        key=lambda level: (-rank_key(level), -level.distance_pct),
     )[:max_levels]
 
     return SRLevelsResult(resistance_levels=resistance, support_levels=support, tolerance_pct=tolerance_pct)
+
+
+# --- Volume-confirmed breakouts + liquidity sweeps (real vs. fake) ------
+# Added 2026-09-20, direct user challenge after reviewing real trades:
+# zero volume confirmation existed anywhere in this file's pattern/S/R
+# detection — a close beyond a level fired identically whether it came
+# on real conviction or on thin, directionless noise. Reuses
+# VOLUME_TREND_BASELINE_WINDOW from analysis.technical (the SAME 20-bar
+# baseline _compute_volume_trend_pct already uses) rather than a second,
+# silently-different "above average volume" definition.
+#
+# MT5's own `Volume` column for FX/CFDs is real tick-count (quote
+# frequency), NOT genuine traded volume — already an accepted limitation
+# analysis.technical._compute_volume_trend_pct itself inherits. A real,
+# useful proxy for participation, but every field/detail text below says
+# "tick-volume-confirmed," never bare "volume-confirmed," to avoid
+# overclaiming what this account's own data actually is.
+
+# A breakout bar's own volume must be at least this many times the
+# recent 20-bar baseline to count as CONFIRMED — Bulkowski/Murphy's own
+# qualitative "above-average volume" breakout requirement (already cited
+# in data/book_wisdom.py), turned into one concrete number. A principled
+# first cut, not yet recalibrated against real MT5 history — same
+# disclosed-placeholder status as SR_TOLERANCE_ATR_MULTIPLE above.
+BREAKOUT_VOLUME_CONFIRM_RATIO = 1.3
+
+# Minimum real close-through distance past a level's own band edge to
+# count as a breakout AT ALL, not noise sitting almost exactly on the
+# line.
+BREAKOUT_MIN_CLOSE_THROUGH_PCT = 0.1
+
+# A wick through a level's band that closes back inside within this many
+# bars counts as a genuine liquidity sweep/stop-hunt — a real breakout
+# that fails much later is a different, slower phenomenon this codebase
+# already covers via setup_classifier.py's own busted_pattern_reversal.
+SWEEP_MAX_BARS_TO_CLOSE_BACK = 3
+
+
+@dataclass
+class BreakoutEvent:
+    level_price: float
+    direction: str  # "up" (broke resistance) / "down" (broke support)
+    close_through_pct: float  # signed % the close sits beyond the level's own band edge, in the breakout direction
+    volume_ratio: float | None  # this bar's volume / recent 20-bar baseline average; None if no real Volume column
+    volume_confirmed: bool  # True only when volume_ratio is real AND >= BREAKOUT_VOLUME_CONFIRM_RATIO
+    bars_ago: int
+
+
+@dataclass
+class LiquiditySweepEvent:
+    level_price: float
+    direction: str  # "swept_above" (wicked above resistance, closed back below) / "swept_below" (mirror, support)
+    wick_penetration_pct: float  # how far the wick went past the level's own band edge, %
+    bars_ago: int  # how many bars ago the sweep's own wick bar occurred
+    volume_ratio: float | None  # informational — a sweep on above-average tick-volume is a stronger stop-hunt signature
+
+
+def _volume_ratio_at(volume: pd.Series | None, bar_pos: int) -> float | None:
+    """This bar's real volume divided by the mean of the
+    VOLUME_TREND_BASELINE_WINDOW bars strictly BEFORE it — never
+    including the bar itself, so a genuinely huge breakout bar can't
+    dilute its own baseline. None (never fabricated) when there's no
+    real Volume column, or not enough prior history to form a baseline."""
+    if volume is None or bar_pos < VOLUME_TREND_BASELINE_WINDOW:
+        return None
+    baseline = volume.iloc[bar_pos - VOLUME_TREND_BASELINE_WINDOW : bar_pos].mean()
+    if not baseline:
+        return None
+    return float(volume.iloc[bar_pos]) / float(baseline)
+
+
+def detect_breakouts(
+    history: pd.DataFrame,
+    sr_levels: SRLevelsResult | None,
+    lookback_bars: int = 5,
+    min_close_through_pct: float = BREAKOUT_MIN_CLOSE_THROUGH_PCT,
+) -> list[BreakoutEvent]:
+    """Real closes beyond an S/R level's own band edge (Phase 1's
+    SRLevel.low/.high — not the bare mean price) within the last
+    `lookback_bars` bars, each tagged with real tick-volume confirmation.
+    Reports the geometric fact (a real close-through happened) even when
+    volume_confirmed is False — never silently drops a real breakout
+    just because it lacked volume support; the caller decides how much
+    weight to give an unconfirmed one. [] (never fabricated) when there's
+    no real S/R structure to test against, or High/Low/Close is missing."""
+    if sr_levels is None or not {"High", "Low", "Close"}.issubset(history.columns) or history.empty:
+        return []
+    closes = history["Close"].reset_index(drop=True)
+    volume = history["Volume"].reset_index(drop=True) if "Volume" in history.columns else None
+    last_pos = len(closes) - 1
+    events: list[BreakoutEvent] = []
+
+    sided_levels = [(level, True) for level in sr_levels.resistance_levels] + [
+        (level, False) for level in sr_levels.support_levels
+    ]
+    for level, is_resistance in sided_levels:
+        if is_resistance:
+            band_edge = level.high if level.high is not None else level.price
+        else:
+            band_edge = level.low if level.low is not None else level.price
+        if band_edge == 0:
+            continue
+
+        def _close_through_pct(bar_pos: int) -> float:
+            close = float(closes.iloc[bar_pos])
+            return (close - band_edge) / band_edge * 100 if is_resistance else (band_edge - close) / band_edge * 100
+
+        # Real bug found on self-review, 2026-09-21: walking backward and
+        # stopping at the FIRST (i.e. today's) qualifying bar meant a
+        # SUSTAINED breakout — price has closed beyond the level for
+        # several bars running — always reported bars_ago=0 using
+        # TODAY's volume, silently discarding the ORIGINAL breakout bar's
+        # own real volume signature (e.g. a genuine 5x-volume breakout 3
+        # bars ago would be reported as "not volume-confirmed" just
+        # because today's own volume happens to be ordinary). Require
+        # today's close to still clear the threshold, then walk backward
+        # to find where this streak actually began, and report THAT
+        # bar's own close-through/volume — the real breakout bar.
+        if _close_through_pct(last_pos) < min_close_through_pct:
+            continue
+        breakout_bar_pos = last_pos
+        min_bar_pos = max(0, last_pos - min(lookback_bars, len(closes)) + 1)
+        for bar_pos in range(last_pos - 1, min_bar_pos - 1, -1):
+            if _close_through_pct(bar_pos) < min_close_through_pct:
+                break
+            breakout_bar_pos = bar_pos
+
+        volume_ratio = _volume_ratio_at(volume, breakout_bar_pos)
+        events.append(
+            BreakoutEvent(
+                level_price=level.price,
+                direction="up" if is_resistance else "down",
+                close_through_pct=_close_through_pct(breakout_bar_pos),
+                volume_ratio=volume_ratio,
+                volume_confirmed=volume_ratio is not None and volume_ratio >= BREAKOUT_VOLUME_CONFIRM_RATIO,
+                bars_ago=last_pos - breakout_bar_pos,
+            )
+        )
+
+    return events
+
+
+def detect_liquidity_sweeps(
+    history: pd.DataFrame,
+    sr_levels: SRLevelsResult | None,
+    lookback_bars: int = SWEEP_MAX_BARS_TO_CLOSE_BACK + 2,
+) -> list[LiquiditySweepEvent]:
+    """A real wick through an S/R level's own band edge that CLOSES BACK
+    INSIDE within SWEEP_MAX_BARS_TO_CLOSE_BACK bars — the classic
+    liquidity-sweep/stop-hunt signature price-action traders watch for:
+    a level gets taken out just far enough to trigger resting stops/
+    orders, then reverses. Deliberately distinct from a real breakout
+    that later fails much slower (already covered by setup_classifier.
+    py's own busted_pattern_reversal) — this only fires on a FAST,
+    few-bar round trip. [] (never fabricated) when there's no real S/R
+    structure to test against, or High/Low/Close is missing."""
+    if sr_levels is None or not {"High", "Low", "Close"}.issubset(history.columns):
+        return []
+    highs = history["High"].reset_index(drop=True)
+    lows = history["Low"].reset_index(drop=True)
+    closes = history["Close"].reset_index(drop=True)
+    volume = history["Volume"].reset_index(drop=True) if "Volume" in history.columns else None
+    last_pos = len(closes) - 1
+    events: list[LiquiditySweepEvent] = []
+
+    sided_levels = [(level, True) for level in sr_levels.resistance_levels] + [
+        (level, False) for level in sr_levels.support_levels
+    ]
+    for level, is_resistance in sided_levels:
+        band_edge = (level.high if level.high is not None else level.price) if is_resistance else (
+            level.low if level.low is not None else level.price
+        )
+        if band_edge == 0:
+            continue
+        for offset in range(min(lookback_bars, len(closes))):
+            wick_pos = last_pos - offset
+            if wick_pos < 0:
+                break
+            wicked_through = (
+                float(highs.iloc[wick_pos]) > band_edge if is_resistance else float(lows.iloc[wick_pos]) < band_edge
+            )
+            if not wicked_through:
+                continue
+            # Closed back inside on the SAME bar (k=0, a single-bar spike
+            # wick — the most common real sweep shape) or on any of the
+            # next SWEEP_MAX_BARS_TO_CLOSE_BACK bars — only need ONE real
+            # close back inside within the window, not every bar in it
+            # (a later, UNRELATED wick breaking back out again a few bars
+            # on shouldn't retroactively disqualify an earlier, already-
+            # genuine reversal).
+            closed_back_inside_within_window = any(
+                (float(closes.iloc[wick_pos + k]) < band_edge if is_resistance else float(closes.iloc[wick_pos + k]) > band_edge)
+                for k in range(0, SWEEP_MAX_BARS_TO_CLOSE_BACK + 1)
+                if wick_pos + k <= last_pos
+            )
+            if not closed_back_inside_within_window:
+                continue
+            extreme = float(highs.iloc[wick_pos]) if is_resistance else float(lows.iloc[wick_pos])
+            wick_penetration_pct = abs(extreme - band_edge) / band_edge * 100
+            events.append(
+                LiquiditySweepEvent(
+                    level_price=level.price,
+                    direction="swept_above" if is_resistance else "swept_below",
+                    wick_penetration_pct=wick_penetration_pct,
+                    bars_ago=offset,
+                    volume_ratio=_volume_ratio_at(volume, wick_pos),
+                )
+            )
+            break  # only the most recent qualifying sweep per level
+
+    return events
 
 
 @dataclass
@@ -385,7 +717,12 @@ class Trendline:
     bars_since_last_point: int  # how far the line's own rightmost fitted point sits from the latest bar
 
 
-def _fit_trendline(points: list[SwingPoint], last_index: int, current_close: float) -> Trendline | None:
+def _fit_trendline(
+    points: list[SwingPoint],
+    last_index: int,
+    current_close: float,
+    flat_threshold_pct: float = TRENDLINE_FLAT_THRESHOLD_PCT,
+) -> Trendline | None:
     if len(points) < TRENDLINE_MIN_POINTS or current_close == 0:
         return None
 
@@ -409,9 +746,9 @@ def _fit_trendline(points: list[SwingPoint], last_index: int, current_close: flo
     implied_pct_move = (
         (slope * span_bars) / current_price_on_line * 100 if current_price_on_line else 0.0
     )
-    if implied_pct_move > TRENDLINE_FLAT_THRESHOLD_PCT:
+    if implied_pct_move > flat_threshold_pct:
         direction = "rising"
-    elif implied_pct_move < -TRENDLINE_FLAT_THRESHOLD_PCT:
+    elif implied_pct_move < -flat_threshold_pct:
         direction = "falling"
     else:
         direction = "flat"
@@ -442,6 +779,7 @@ def compute_trendlines(
     history: pd.DataFrame,
     lookback: int = STRUCTURE_LOOKBACK,
     swing_points: tuple[list[SwingPoint], list[SwingPoint]] | None = None,
+    flat_threshold_pct: float = TRENDLINE_FLAT_THRESHOLD_PCT,
 ) -> TrendlineAnalysis | None:
     """Real trendlines fit through actual swing points (least-squares,
     not just connecting the two most recent points, which is overly
@@ -459,8 +797,8 @@ def compute_trendlines(
     last_index = len(window) - 1
 
     swing_highs, swing_lows = swing_points if swing_points is not None else find_swing_points(window)
-    resistance = _fit_trendline(swing_highs, last_index, current_close)
-    support = _fit_trendline(swing_lows, last_index, current_close)
+    resistance = _fit_trendline(swing_highs, last_index, current_close, flat_threshold_pct)
+    support = _fit_trendline(swing_lows, last_index, current_close, flat_threshold_pct)
     if resistance is None and support is None:
         return None
     return TrendlineAnalysis(resistance_trendline=resistance, support_trendline=support)
@@ -481,6 +819,7 @@ def _detect_double_pattern(
     opposing_points: list[SwingPoint],
     is_top: bool,
     tolerance_pct: float,
+    min_pullback_pct: float = DOUBLE_PATTERN_MIN_PULLBACK_PCT,
 ) -> ChartPattern | None:
     """Shared logic for double-top (extreme_points=highs, opposing=lows)
     and double-bottom (extreme_points=lows, opposing=highs): the two
@@ -503,7 +842,7 @@ def _detect_double_pattern(
     neckline = min(between, key=lambda p: p.price) if is_top else max(between, key=lambda p: p.price)
 
     pullback_pct = abs(avg_price - neckline.price) / avg_price * 100
-    if pullback_pct < DOUBLE_PATTERN_MIN_PULLBACK_PCT:
+    if pullback_pct < min_pullback_pct:
         return None
 
     kind = "double_top" if is_top else "double_bottom"
@@ -591,6 +930,9 @@ def detect_chart_patterns(
     history: pd.DataFrame,
     lookback: int = STRUCTURE_LOOKBACK,
     swing_points: tuple[list[SwingPoint], list[SwingPoint]] | None = None,
+    tolerance_pct: float = SR_CLUSTER_TOLERANCE_PCT,
+    min_pullback_pct: float = DOUBLE_PATTERN_MIN_PULLBACK_PCT,
+    trendline_flat_pct: float = TRENDLINE_FLAT_THRESHOLD_PCT,
 ) -> list[ChartPattern]:
     """Conservative, deterministic pattern detection — deliberately
     limited to patterns with an unambiguous, testable definition (double
@@ -614,11 +956,13 @@ def detect_chart_patterns(
     swing_highs, swing_lows = swing_points if swing_points is not None else find_swing_points(window)
     patterns: list[ChartPattern] = []
 
-    double_top = _detect_double_pattern(swing_highs, swing_lows, is_top=True, tolerance_pct=SR_CLUSTER_TOLERANCE_PCT)
+    double_top = _detect_double_pattern(
+        swing_highs, swing_lows, is_top=True, tolerance_pct=tolerance_pct, min_pullback_pct=min_pullback_pct
+    )
     if double_top:
         patterns.append(double_top)
     double_bottom = _detect_double_pattern(
-        swing_lows, swing_highs, is_top=False, tolerance_pct=SR_CLUSTER_TOLERANCE_PCT
+        swing_lows, swing_highs, is_top=False, tolerance_pct=tolerance_pct, min_pullback_pct=min_pullback_pct
     )
     if double_bottom:
         patterns.append(double_bottom)
@@ -627,13 +971,125 @@ def detect_chart_patterns(
     if trend_structure:
         patterns.append(trend_structure)
 
-    trendlines = compute_trendlines(window, lookback=len(window), swing_points=(swing_highs, swing_lows))
+    trendlines = compute_trendlines(
+        window, lookback=len(window), swing_points=(swing_highs, swing_lows), flat_threshold_pct=trendline_flat_pct
+    )
     if trendlines is not None:
         triangle = _detect_triangle(trendlines)
         if triangle:
             patterns.append(triangle)
 
     return patterns
+
+
+# --- Break of structure (BOS) / change of character (CHOCH) -------------
+# Added 2026-09-20, direct user challenge after reviewing real trades:
+# telling a genuine trend from an early reversal was left entirely to
+# the model, with no mechanical help beyond the lagging regime/momentum
+# reads in analysis/technical.py. This is real Dow-theory structure-
+# break logic (Murphy's own reversal criteria: a trend isn't confirmed
+# broken until price actually takes out a real prior swing point against
+# it) — a pure SEQUENCING/COMPARISON pass over data find_swing_points and
+# _detect_trend_structure already compute, not a new detection method.
+STRUCTURE_BREAK_LOOKBACK_BARS = 10
+
+
+@dataclass
+class StructureBreak:
+    kind: str  # "BOS" (break of structure, WITH the prevailing trend) or "CHOCH" (change of character, first break AGAINST it)
+    direction: str  # "bullish" (closed above a prior swing high) / "bearish" (closed below a prior swing low)
+    broken_level: float  # the real prior swing high/low price that was broken
+    break_price: float  # the real close that confirmed the break
+    bars_ago: int
+
+
+def detect_structure_breaks(
+    history: pd.DataFrame,
+    swing_points: tuple[list[SwingPoint], list[SwingPoint]] | None = None,
+    lookback_bars: int = STRUCTURE_BREAK_LOOKBACK_BARS,
+) -> list[StructureBreak]:
+    """Real breaks of the most recent CONFIRMED swing high/low, each
+    labeled BOS or CHOCH using the SAME trend-structure read
+    _detect_trend_structure already computes (reused, not re-derived a
+    second, possibly-inconsistent way) — a break in the prevailing
+    trend's own direction is a BOS (continuation); a break AGAINST an
+    established trend is a CHOCH (the first real structural evidence a
+    reversal may be starting, not just a lagging regime/momentum read
+    catching up later). At most one bullish and one bearish break is
+    reported (the most recent qualifying one each) — a real close beyond
+    the SAME swing point on multiple later bars is still one structural
+    fact, not a new one each bar. [] (never fabricated) without at least
+    2 confirmed swing highs AND 2 confirmed swing lows (the same
+    precondition _detect_trend_structure itself already requires to
+    judge trend direction at all).
+
+    Unlike compute_sr_levels/compute_trendlines/detect_chart_patterns,
+    this takes `history` AS THE WINDOW already (no separate `lookback`
+    slicing param) — every caller here already has a `window` in hand
+    (compute_chart_structure) with `swing_points` computed against that
+    SAME window, and re-slicing here independently would desynchronize
+    swing_points' own 0-based indices from a freshly re-sliced frame."""
+    window = history.reset_index(drop=True)
+    if window.empty or "Close" not in window.columns:
+        return []
+    swing_highs, swing_lows = swing_points if swing_points is not None else find_swing_points(window)
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return []
+
+    trend = _detect_trend_structure(swing_highs, swing_lows)
+    trend_name = trend.name if trend is not None else None  # "uptrend_structure" / "downtrend_structure" / None
+
+    closes = window["Close"].reset_index(drop=True)
+    last_pos = len(closes) - 1
+    last_high = max(swing_highs, key=lambda p: p.index)
+    last_low = max(swing_lows, key=lambda p: p.index)
+
+    events: list[StructureBreak] = []
+    for level, direction in ((last_high, "bullish"), (last_low, "bearish")):
+        min_bar_pos = max(level.index + 1, last_pos - min(lookback_bars, len(closes)) + 1)
+        if min_bar_pos > last_pos:
+            continue  # no real bar exists after this swing point's own formation, within the window
+
+        def _broke(bar_pos: int) -> bool:
+            close = float(closes.iloc[bar_pos])
+            return close > level.price if direction == "bullish" else close < level.price
+
+        if not _broke(last_pos):
+            continue  # not currently broken -- a since-reverted wick-through isn't a lasting structure break (see detect_liquidity_sweeps for that case)
+
+        # Real bug found on self-review, 2026-09-21: reporting bars_ago
+        # from wherever the scan first found ANY broken bar (starting
+        # from today) meant a SUSTAINED break — price closes beyond the
+        # level today, and has for many bars running — always reported
+        # bars_ago=0, since today's own close always satisfies "broke".
+        # That silently misrepresented an old, already-known structural
+        # fact as brand new every single time this was recomputed (e.g.
+        # every Clerk tactical poll). Walk backward from today instead to
+        # find the actual TRANSITION bar — the most recent point price
+        # crossed INTO its current broken state — and report bars_ago
+        # relative to that, bounded by the same lookback window.
+        transition_pos = last_pos
+        for bar_pos in range(last_pos - 1, min_bar_pos - 1, -1):
+            if not _broke(bar_pos):
+                break
+            transition_pos = bar_pos
+
+        # No established trend at all (trend_name is None) defaults
+        # to BOS, not CHOCH — CHOCH specifically means a break AGAINST
+        # an established trend; there's nothing to "change" from yet
+        # if no trend structure was confirmed in the first place.
+        against_trend = (direction == "bullish" and trend_name == "downtrend_structure") or (
+            direction == "bearish" and trend_name == "uptrend_structure"
+        )
+        kind = "CHOCH" if against_trend else "BOS"
+        events.append(
+            StructureBreak(
+                kind=kind, direction=direction, broken_level=level.price,
+                break_price=float(closes.iloc[transition_pos]), bars_ago=last_pos - transition_pos,
+            )
+        )
+
+    return events
 
 
 @dataclass
@@ -650,9 +1106,21 @@ class ChartStructureSnapshot:
     sr_levels: SRLevelsResult | None
     trendlines: TrendlineAnalysis | None
     patterns: list[ChartPattern]
+    # Real vs. fake — added 2026-09-20, direct user challenge. Defaulted
+    # to empty lists (never None) so any existing direct
+    # ChartStructureSnapshot(...) construction (including this project's
+    # own pre-Phase-2 tests) keeps working unchanged.
+    breakouts: list[BreakoutEvent] = field(default_factory=list)
+    liquidity_sweeps: list[LiquiditySweepEvent] = field(default_factory=list)
+    # Trend vs. reversal — added 2026-09-20, direct user challenge. Same
+    # additive/defaulted-empty convention as breakouts/liquidity_sweeps
+    # above.
+    structure_breaks: list[StructureBreak] = field(default_factory=list)
 
 
-def compute_chart_structure(history: pd.DataFrame, lookback: int = STRUCTURE_LOOKBACK) -> ChartStructureSnapshot:
+def compute_chart_structure(
+    history: pd.DataFrame, lookback: int = STRUCTURE_LOOKBACK, profile: TimeframeProfile | None = None
+) -> ChartStructureSnapshot:
     """The four reads above, all sharing ONE fractal swing-point scan —
     confirmed live that calling each function separately (as this used
     to) reran find_swing_points on the identical window five separate
@@ -670,24 +1138,72 @@ def compute_chart_structure(history: pd.DataFrame, lookback: int = STRUCTURE_LOO
     own top level (before `ChartPattern` is even defined) would fail."""
     from analysis.candlestick_patterns import detect_candlestick_patterns
 
+    # `profile` (intraday decision-tier upgrade, 2026-09-24): None keeps
+    # every pre-existing flat threshold exactly; an M5/M15 profile swaps
+    # the lookback and expresses the flat-percent thresholds as multiples
+    # of this window's own ATR% (see analysis/timeframe_profiles.py).
+    if profile is not None:
+        lookback = profile.structure_lookback
     window = _tail_reset(history, lookback)
     swing_points = find_swing_points(window)
+    atr_for_profile = compute_atr(window)
+    window_close = float(window["Close"].iloc[-1]) if not window.empty and "Close" in window.columns else 0.0
+    window_atr_pct = (atr_for_profile / window_close * 100) if atr_for_profile is not None and window_close else None
+    if profile is not None:
+        thresholds = resolve_thresholds(
+            profile,
+            window_atr_pct,
+            default_trendline_flat_pct=TRENDLINE_FLAT_THRESHOLD_PCT,
+            default_double_pullback_pct=DOUBLE_PATTERN_MIN_PULLBACK_PCT,
+            default_breakout_close_through_pct=BREAKOUT_MIN_CLOSE_THROUGH_PCT,
+        )
+        sr_floor_pct = profile.sr_tolerance_floor_pct
+        half_life_bars = profile.sr_half_life_bars
+    else:
+        thresholds = None
+        sr_floor_pct = SR_CLUSTER_TOLERANCE_PCT
+        half_life_bars = SR_RECENCY_HALF_LIFE_BARS
     # ATR-scaled, not the flat SR_CLUSTER_TOLERANCE_PCT default — see
     # SR_TOLERANCE_ATR_MULTIPLE's own module-level comment. Computed once
     # here and threaded into compute_sr_levels below, same "share one
     # real computation across this bundling function" discipline this
     # function already applies to the swing-point scan itself.
-    sr_tolerance_pct = atr_scaled_sr_tolerance(window)
+    sr_tolerance_pct = atr_scaled_sr_tolerance(window, floor_pct=sr_floor_pct)
+    sr_levels = compute_sr_levels(
+        window, lookback=lookback, swing_points=swing_points, tolerance_pct=sr_tolerance_pct, half_life_bars=half_life_bars
+    )
     return ChartStructureSnapshot(
         fibonacci=compute_fibonacci_levels(window, lookback=lookback, swing_points=swing_points),
-        sr_levels=compute_sr_levels(
-            window, lookback=lookback, swing_points=swing_points, tolerance_pct=sr_tolerance_pct
+        sr_levels=sr_levels,
+        trendlines=compute_trendlines(
+            window, lookback=lookback, swing_points=swing_points,
+            **({"flat_threshold_pct": thresholds.trendline_flat_pct} if thresholds else {}),
         ),
-        trendlines=compute_trendlines(window, lookback=lookback, swing_points=swing_points),
         patterns=(
-            detect_chart_patterns(window, lookback=lookback, swing_points=swing_points)
+            detect_chart_patterns(
+                window, lookback=lookback, swing_points=swing_points,
+                **(
+                    {
+                        "tolerance_pct": sr_tolerance_pct,
+                        "min_pullback_pct": thresholds.double_pullback_pct,
+                        "trendline_flat_pct": thresholds.trendline_flat_pct,
+                    }
+                    if thresholds
+                    else {}
+                ),
+            )
             + detect_candlestick_patterns(window)
         ),
+        # Real vs. fake — reuses the SAME sr_levels just computed above,
+        # not a second recomputation.
+        breakouts=detect_breakouts(
+            window, sr_levels,
+            **({"min_close_through_pct": thresholds.breakout_close_through_pct} if thresholds else {}),
+        ),
+        liquidity_sweeps=detect_liquidity_sweeps(window, sr_levels),
+        # Trend vs. reversal — reuses the SAME swing_points just computed
+        # above, not a second fractal rescan.
+        structure_breaks=detect_structure_breaks(window, swing_points=swing_points),
     )
 
 

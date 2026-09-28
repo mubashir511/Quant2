@@ -13,7 +13,15 @@ from ai.ftmo_suggest import (
     read_latest_suggestion,
     suggest_ftmo_portfolio,
 )
-from data.mt5_source import connect, get_account_summary, get_market_watch, get_open_positions, get_pending_orders
+from data.mt5_source import (
+    connect,
+    get_account_summary,
+    get_last_tick_epochs,
+    get_market_watch,
+    get_open_positions,
+    get_pending_orders,
+    is_symbol_tradable_now,
+)
 from utils import run_with_timeout
 
 # Re-exported so existing callers (ai/clerk_execution.py, app.py) that
@@ -332,6 +340,51 @@ def is_due(now_utc: datetime, state: dict | None = None) -> bool:
     return today_trigger <= now_utc <= grace_end
 
 
+def select_tradable_assets(
+    assets: list,
+    keep_symbols: set[str],
+    now_utc: datetime,
+    tick_epochs: dict[str, int | None],
+    calendar_fn: Callable[[str, datetime], bool] | None = None,
+    max_tick_age_minutes: float | None = None,
+) -> tuple[list, list[tuple[str, str]]]:
+    """(tradable assets, [(symbol, why skipped)]) - the FIRST thing a Mega session does, so no data fetch, chart read,
+    backtest or model token is spent on an instrument whose market is closed right now.
+
+    An instrument is skipped when (a) the weekly market calendar says it is closed, (b) it has no live tick at all, or (c) its
+    last tick is more than `max_tick_age_minutes` older than the FRESHEST tick in the pool (a session that ended for the day: US
+    stocks after the close, an exchange lunch break, a paused feed). Comparing against the pool's freshest tick instead of the
+    wall clock keeps this independent of the broker's UTC offset. A symbol with an open position or a resting order is always
+    kept (the session must still manage it). Never raises: an unreadable tick falls back to the calendar alone.
+    """
+    calendar_fn = calendar_fn or is_symbol_tradable_now  # resolved at call time (so tests/patches of the module name apply)
+    max_age = (config.MEGA_TRADABLE_MAX_TICK_AGE_MINUTES if max_tick_age_minutes is None else max_tick_age_minutes) * 60
+    known = [t for t in tick_epochs.values() if t]
+    freshest = max(known) if known else None
+    tradable, skipped = [], []
+    for asset in assets:
+        symbol = asset.symbol
+        if symbol in keep_symbols:
+            tradable.append(asset)
+            continue
+        try:
+            calendar_open = calendar_fn(symbol, now_utc)
+        except Exception:  # noqa: BLE001
+            calendar_open = True
+        if not calendar_open:
+            skipped.append((symbol, "market closed (weekly calendar)"))
+            continue
+        tick = tick_epochs.get(symbol)
+        if tick is None and freshest is not None:
+            skipped.append((symbol, "no live tick"))
+            continue
+        if tick is not None and freshest is not None and freshest - tick > max_age:
+            skipped.append((symbol, f"no fresh tick (last tick {(freshest - tick) / 60:.0f} min behind the freshest market)"))
+            continue
+        tradable.append(asset)
+    return tradable, skipped
+
+
 def run_mega_analysis(
     on_stage: Callable[[str], None] | None = None,
     on_audit_progress: Callable[[str], None] | None = None,
@@ -429,6 +482,37 @@ def run_mega_analysis(
     pending_orders = get_pending_orders()
     status = fetch_ftmo_status(account)
 
+    # Before ANY per-instrument work: which of the Market Watch symbols can actually trade right now? Everything else is dropped
+    # here, saving the MT5 fetches, chart/backtest reads and (mostly) the model tokens. Held / resting-order symbols always stay.
+    closed_note = ""
+    if config.MEGA_TRADABLE_FILTER_ENABLED:
+        _notify(f"Checking which of the {len(assets)} instruments are tradable right now...")
+        keep = {p.symbol for p in positions} | {o.symbol for o in pending_orders}
+        try:
+            tick_epochs = get_last_tick_epochs([a.symbol for a in assets])
+        except Exception:  # noqa: BLE001 - fall back to the calendar alone rather than block the session
+            logger.warning("Could not read last-tick times; filtering by the market calendar only.", exc_info=True)
+            tick_epochs = {}
+        tradable, skipped = select_tradable_assets(assets, keep, datetime.now(timezone.utc), tick_epochs)
+        if not tradable:
+            raise RuntimeError(
+                "No instrument is tradable right now (every market is closed"
+                + (": " + "; ".join(f"{s} - {why}" for s, why in skipped) if skipped else "")
+                + "). Nothing was analysed and no model tokens were spent; try again when a market is open."
+            )
+        if skipped:
+            _notify(
+                f"{len(tradable)} of {len(assets)} instruments are tradable now; skipping {len(skipped)} closed: "
+                + ", ".join(s for s, _ in skipped)
+            )
+            closed_note = (
+                "MARKETS CLOSED RIGHT NOW - NOT ANALYSED THIS RUN (no data is printed for them; do not propose new entries "
+                "for them): " + "; ".join(f"{s} ({why})" for s, why in skipped) + ".\n\n"
+            )
+            assets = tradable
+        else:
+            _notify(f"All {len(assets)} instruments are tradable now.")
+
     def _notify_instrument_progress(message: str) -> None:
         # Deliberately writes to current_activity, NOT a new step — one
         # instrument finishing isn't independently worth a permanent
@@ -452,7 +536,7 @@ def run_mega_analysis(
     _notify(f"Analyzed all {len(assets)} instruments.")
     if on_analyses:
         on_analyses(analyses)
-    summary = build_ftmo_summary(
+    summary = closed_note + build_ftmo_summary(
         account, assets, status, positions=positions, analyses=analyses, pending_orders=pending_orders
     )
 

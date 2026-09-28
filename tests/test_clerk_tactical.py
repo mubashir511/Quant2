@@ -27,10 +27,16 @@ from ai.clerk_execution import (
 from ai.ftmo_suggest import FtmoAssetAnalysis
 from ai.portfolio_suggest import AllocationEntry, AssetAnalysis, PendingSetup
 from analysis.backtest import FavorableExcursionStats, RSIReactionBacktest
-from analysis.chart_structure import ChartStructureSnapshot, SRLevel, SRLevelsResult
+from analysis.chart_structure import (
+    ChartStructureSnapshot,
+    LiquiditySweepEvent,
+    SRLevel,
+    SRLevelsResult,
+    StructureBreak,
+)
 from analysis.technical import TechnicalStats
 from data.mt5_execution import OrderResult
-from data.mt5_source import ContractSpec, Position
+from data.mt5_source import ContractSpec, Position, TradeCost
 
 
 def _fake_technical_stats(atr=None, **overrides) -> TechnicalStats:
@@ -76,7 +82,6 @@ def _fixed_files(tmp_path):
         patch.object(config, "MEGA_ANALYSIS_STATE_FILE", str(tmp_path / "mega_analysis_state.json")),
         patch.object(config, "MEGA_ANALYSIS_PROGRESS_FILE", str(tmp_path / "mega_analysis_progress.json")),
         patch.object(config, "CLERK_EXECUTION_CHECK_INTERVAL_MINUTES", 15),
-        patch.object(config, "CLERK_EXECUTION_GRACE_MINUTES", 10),
         patch.object(config, "CLERK_EXECUTION_MAX_PENDING_SETUPS", 10),
         patch.object(config, "CLERK_EXECUTION_MAX_WATCHED_POSITIONS", 10),
         patch.object(config, "CLERK_EXECUTION_MAX_TACTICAL_CANDIDATES", 10),
@@ -104,6 +109,14 @@ def _spec(volume_min=0.01, volume_step=0.01, trade_contract_size=100.0):
         volume_min=volume_min, volume_step=volume_step, volume_max=100.0,
         trade_contract_size=trade_contract_size, currency_margin="USD", margin_initial=1000.0,
     )
+
+
+def _fake_trade_cost(spread_pct_of_price=0.01, **overrides):
+    defaults = dict(
+        category="Equities I CFD", spread_pct_of_price=spread_pct_of_price,
+        swap_long_pct_per_day=None, swap_short_pct_per_day=None, min_stop_distance_pct=0.0,
+    )
+    return TradeCost(**{**defaults, **overrides})
 
 
 def _get_spec_for(specs: dict):
@@ -551,7 +564,7 @@ def test_validate_defend_partial_close_resizes_pct_for_remaining_lots():
     # price_current -- see the "sizing_price"/"sizing_entry_price"
     # comments this round-trip must match.
     verdict = TacticalVerdict(tier="defend", partial_close_fraction=0.4, rule_citation="Schwager", numbers_citation="x")
-    position = _position(side="buy", volume=1.0, sl=1950.0, price_open=2000.0)
+    position = _position(side="buy", volume=1.0, sl=1950.0, price_open=2000.0, price_current=2020.0)  # in profit: a partial close takes profit
     existing = AllocationEntry(pct=10.0, price=2000.0, stop_loss=1950.0, side="buy")
     spec = _spec(trade_contract_size=100.0)
     new_entry, _, _reason = _validate_and_apply_tactical_verdict(
@@ -1347,6 +1360,42 @@ def test_compute_tactical_signals_sr_fields_none_without_structure():
     assert signals_empty.nearest_support is None
 
 
+def test_compute_tactical_signals_picks_the_most_recent_structure_break_and_sweep():
+    # Added 2026-09-21, Phase 5c of the charting-expert upgrade — must
+    # pick the MOST RECENT (smallest bars_ago) event on each list, not
+    # just the first one, same "nearest, not strongest/first" discipline
+    # as nearest_resistance/nearest_support above.
+    position = _position(side="buy")
+    structure = ChartStructureSnapshot(
+        fibonacci=None, sr_levels=None, trendlines=None, patterns=[],
+        structure_breaks=[
+            StructureBreak(kind="BOS", direction="bullish", broken_level=1.10, break_price=1.11, bars_ago=8),
+            StructureBreak(kind="CHOCH", direction="bearish", broken_level=1.05, break_price=1.04, bars_ago=2),
+        ],
+        liquidity_sweeps=[
+            LiquiditySweepEvent(level_price=1.09, direction="swept_below", wick_penetration_pct=0.3, bars_ago=5, volume_ratio=1.8),
+            LiquiditySweepEvent(level_price=1.12, direction="swept_above", wick_penetration_pct=0.1, bars_ago=1, volume_ratio=None),
+        ],
+    )
+    signals = _compute_tactical_signals(position, _NO_OP_ENTRY, None, None, structure)
+    assert signals.nearest_structure_break.kind == "CHOCH"
+    assert signals.nearest_structure_break.bars_ago == 2
+    assert signals.nearest_liquidity_sweep.direction == "swept_above"
+    assert signals.nearest_liquidity_sweep.bars_ago == 1
+
+
+def test_compute_tactical_signals_structure_break_fields_none_without_structure():
+    position = _position(side="buy")
+    signals = _compute_tactical_signals(position, _NO_OP_ENTRY, None)
+    assert signals.nearest_structure_break is None
+    assert signals.nearest_liquidity_sweep is None
+
+    empty_structure = _empty_chart_structure()
+    signals_empty = _compute_tactical_signals(position, _NO_OP_ENTRY, None, None, empty_structure)
+    assert signals_empty.nearest_structure_break is None
+    assert signals_empty.nearest_liquidity_sweep is None
+
+
 def test_tactical_prompt_shows_the_liquidity_pool_tag_and_real_level_numbers():
     position = _position(side="buy")
     structure = ChartStructureSnapshot(
@@ -1365,6 +1414,27 @@ def test_tactical_prompt_shows_the_liquidity_pool_tag_and_real_level_numbers():
     assert "LIQUIDITY POOL" in prompt
     assert "3x real confirmed touches" in prompt
     assert "1.20000" in prompt
+
+
+def test_tactical_prompt_shows_the_most_recent_structure_break_and_sweep():
+    position = _position(side="buy")
+    structure = ChartStructureSnapshot(
+        fibonacci=None, sr_levels=None, trendlines=None, patterns=[],
+        structure_breaks=[
+            StructureBreak(kind="CHOCH", direction="bearish", broken_level=1.05000, break_price=1.04000, bars_ago=2),
+        ],
+        liquidity_sweeps=[
+            LiquiditySweepEvent(level_price=1.12, direction="swept_above", wick_penetration_pct=0.15, bars_ago=1, volume_ratio=None),
+        ],
+    )
+    signals = _compute_tactical_signals(position, _NO_OP_ENTRY, None, None, structure)
+    prompt = _build_tactical_prompt(
+        "EURUSD", _NO_OP_ENTRY, position, "fake technical context", 10000.0, None, signals,
+    )
+    assert "CHOCH 2 bars ago" in prompt
+    assert "1.05000" in prompt
+    assert "liquidity sweep 1 bars ago" in prompt
+    assert "swept_above" in prompt
 
 
 def test_tactical_prompt_states_the_valid_stop_range_for_a_buy():
@@ -1700,3 +1770,611 @@ def test_hard_exit_required_takes_priority_over_trend_flip_escalation(mock_run_o
     assert verdict.tier == "exit"
     assert "O'Neil" in verdict.rule_citation
     assert raw
+
+
+# --- _run_clerk_tactical_check: deterministic quick profit-lock (2026-09-18, direct user request) ---
+
+
+@patch("ai.clerk_execution.run_ollama")
+def test_quick_profit_lock_fires_once_cost_multiple_is_covered(mock_run_ollama):
+    # spread 0.02% -> threshold 3x = 0.06%; +0.25% favorable move clears it.
+    position = _position(side="buy", price_open=2000.0, price_current=2005.0)
+    h1_stats = _fake_technical_stats(trend="flat")
+    signals = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, h1_stats, trade_cost=_fake_trade_cost(spread_pct_of_price=0.02),
+    )
+    assert signals.quick_profit_lock_due is True
+
+    symbol, verdict, raw = _run_clerk_tactical_check(
+        "XAUUSD", _NO_OP_ENTRY, position, "fake technical context", 100_000.0, None, signals,
+    )
+
+    mock_run_ollama.assert_not_called()
+    assert verdict.tier == "defend"
+    assert verdict.hard_exit is True
+    assert verdict.new_stop_loss is None
+    assert verdict.partial_close_fraction == pytest.approx(config.CLERK_QUICK_PROFIT_LOCK_REDUCE_PCT / 100.0)
+    assert verdict.rule_citation
+    assert verdict.numbers_citation
+
+
+@patch("ai.clerk_execution.run_ollama")
+def test_quick_profit_lock_does_not_fire_below_the_cost_multiple(mock_run_ollama):
+    mock_run_ollama.return_value = "FINAL_VERDICT: HOLD"
+    # +0.025% favorable move, well under the 0.06% (3x 0.02%) threshold.
+    position = _position(side="buy", price_open=2000.0, price_current=2000.5)
+    h1_stats = _fake_technical_stats(trend="flat")
+    signals = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, h1_stats, trade_cost=_fake_trade_cost(spread_pct_of_price=0.02),
+    )
+    assert signals.quick_profit_lock_due is False
+
+    symbol, verdict, raw = _run_clerk_tactical_check(
+        "XAUUSD", _NO_OP_ENTRY, position, "fake technical context", 100_000.0, None, signals,
+    )
+
+    mock_run_ollama.assert_called_once()
+    assert verdict.tier == "hold"
+
+
+@patch("ai.clerk_execution.run_ollama")
+def test_quick_profit_lock_does_not_re_fire_once_already_done(mock_run_ollama):
+    mock_run_ollama.return_value = "FINAL_VERDICT: HOLD"
+    position = _position(side="buy", price_open=2000.0, price_current=2005.0)
+    h1_stats = _fake_technical_stats(trend="flat")
+    signals = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, h1_stats, trade_cost=_fake_trade_cost(spread_pct_of_price=0.02),
+        prior_tactical={"quick_profit_lock_done": True},
+    )
+    assert signals.quick_profit_lock_due is False
+
+    symbol, verdict, raw = _run_clerk_tactical_check(
+        "XAUUSD", _NO_OP_ENTRY, position, "fake technical context", 100_000.0, None, signals,
+    )
+
+    mock_run_ollama.assert_called_once()
+    assert verdict.tier == "hold"
+
+
+def test_quick_profit_lock_skipped_when_trade_cost_unavailable():
+    position = _position(side="buy", price_open=2000.0, price_current=2005.0)
+    h1_stats = _fake_technical_stats(trend="flat")
+    signals = _compute_tactical_signals(position, _NO_OP_ENTRY, h1_stats, trade_cost=None)
+    assert signals.quick_profit_lock_due is False
+
+
+@patch("ai.clerk_execution.run_ollama")
+def test_hard_exit_required_takes_priority_over_quick_profit_lock(mock_run_ollama):
+    # A real, large adverse move (short side, price ran up) must still win
+    # over a same-poll favorable-move reading elsewhere in the check —
+    # constructed via a sell position deep in loss.
+    position = _position(side="sell", price_open=2000.0, price_current=2150.0, sl=2100.0)  # -7.5% for a sell
+    h1_stats = _fake_technical_stats(trend="flat")
+    signals = _compute_tactical_signals(position, _NO_OP_ENTRY, h1_stats, trade_cost=_fake_trade_cost())
+    assert signals.hard_exit_required is True
+    assert signals.quick_profit_lock_due is False  # adverse move, not favorable -- can't both be true
+
+    symbol, verdict, raw = _run_clerk_tactical_check(
+        "XAUUSD", _NO_OP_ENTRY, position, "fake technical context", 100_000.0, None, signals,
+    )
+
+    mock_run_ollama.assert_not_called()
+    assert verdict.tier == "exit"
+    assert "O'Neil" in verdict.rule_citation
+
+
+@patch("ai.clerk_execution.run_ollama")
+def test_quick_profit_lock_flag_survives_a_hold_verdict(mock_run_ollama):
+    mock_run_ollama.return_value = "FINAL_VERDICT: HOLD"
+    # Fire the lock once (DEFEND).
+    position = _position(side="buy", price_open=2000.0, price_current=2005.0)
+    h1_stats = _fake_technical_stats(trend="flat")
+    signals = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, h1_stats, trade_cost=_fake_trade_cost(spread_pct_of_price=0.02),
+    )
+    _, verdict, _ = _run_clerk_tactical_check(
+        "XAUUSD", _NO_OP_ENTRY, position, "fake technical context", 100_000.0, None, signals,
+    )
+    _, tactical_state, _ = _validate_and_apply_tactical_verdict(
+        "XAUUSD", verdict, position, None, None, 100_000.0, _get_spec_for({"XAUUSD": _spec()}), signals=signals,
+    )
+    assert tactical_state["quick_profit_lock_done"] is True
+
+    # A later poll that HOLDs but also changes trend_flip_against_count
+    # (forcing the spread-based persistence path, not the early no-op
+    # return) must still carry the flag forward.
+    h4_stats = _fake_technical_stats(trend="downtrend")
+    h1_stats_2 = _fake_technical_stats(trend="downtrend")
+    signals_2 = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, h1_stats_2, h4_stats, prior_tactical=tactical_state,
+    )
+    assert signals_2.trend_flip_against_count == 1  # changed from 0 -> triggers HOLD's own persistence path
+    _, verdict_2, _ = _run_clerk_tactical_check(
+        "XAUUSD", _NO_OP_ENTRY, position, "fake technical context", 100_000.0, None, signals_2,
+    )
+    assert verdict_2.tier == "hold"
+    _, tactical_state_2, _ = _validate_and_apply_tactical_verdict(
+        "XAUUSD", verdict_2, position, None, tactical_state, 100_000.0, _get_spec_for({"XAUUSD": _spec()}), signals=signals_2,
+    )
+    assert tactical_state_2["quick_profit_lock_done"] is True
+
+
+@patch("ai.clerk_execution.run_ollama")
+def test_quick_profit_lock_flag_survives_an_exit_verdict(mock_run_ollama):
+    # Fire the lock once (DEFEND), then a later hard-exit (EXIT, which
+    # spreads prior_tactical) must still carry the flag forward.
+    position = _position(side="buy", price_open=2000.0, price_current=2005.0)
+    h1_stats = _fake_technical_stats(trend="flat")
+    signals = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, h1_stats, trade_cost=_fake_trade_cost(spread_pct_of_price=0.02),
+    )
+    _, verdict, _ = _run_clerk_tactical_check(
+        "XAUUSD", _NO_OP_ENTRY, position, "fake technical context", 100_000.0, None, signals,
+    )
+    _, tactical_state, _ = _validate_and_apply_tactical_verdict(
+        "XAUUSD", verdict, position, None, None, 100_000.0, _get_spec_for({"XAUUSD": _spec()}), signals=signals,
+    )
+    assert tactical_state["quick_profit_lock_done"] is True
+
+    losing_position = _position(side="buy", price_open=2000.0, price_current=1850.0)  # -7.5%, past hard-exit
+    signals_2 = _compute_tactical_signals(
+        losing_position, _NO_OP_ENTRY, h1_stats, prior_tactical=tactical_state,
+    )
+    assert signals_2.hard_exit_required is True
+    _, verdict_2, _ = _run_clerk_tactical_check(
+        "XAUUSD", _NO_OP_ENTRY, losing_position, "fake technical context", 100_000.0, None, signals_2,
+    )
+    assert verdict_2.tier == "exit"
+    _, tactical_state_2, _ = _validate_and_apply_tactical_verdict(
+        "XAUUSD", verdict_2, losing_position, None, tactical_state, 100_000.0, _get_spec_for({"XAUUSD": _spec()}), signals=signals_2,
+    )
+    assert tactical_state_2["quick_profit_lock_done"] is True
+
+
+# --- Decision-tier (M15/M5) tactical signals, intraday decision-tier upgrade 2026-09-24 ---
+
+
+@pytest.fixture(autouse=True)
+def _no_real_economic_calendar():
+    with (
+        patch("ai.clerk_execution.economic_calendar.fetch_calendar_events", return_value=[]),
+        patch("ai.clerk_execution.get_server_time_offset", return_value=None),
+    ):
+        yield
+
+
+def _m15_structure(support=None, resistance=None):
+    return ChartStructureSnapshot(
+        fibonacci=None,
+        sr_levels=SRLevelsResult(
+            resistance_levels=[resistance] if resistance else [], support_levels=[support] if support else []
+        ),
+        trendlines=None, patterns=[],
+    )
+
+
+def test_atr_stop_candidate_uses_the_m5_atr_multiple_when_an_m5_read_exists():
+    position = _position(side="buy", sl=1950.0, price_current=1980.0)
+    h1 = _fake_technical_stats(atr=10.0)    # H1-era 1.5x would give 1980 - 15 = 1965
+    m5 = _fake_technical_stats(atr=4.0, rsi=25.0)  # 2.0 x 4 = 8 -> 1972
+    signals = _compute_tactical_signals(position, _NO_OP_ENTRY, h1, m5_stats=m5)
+    assert signals.atr_timeframe == "M5" and signals.m5_atr == 4.0
+    assert signals.atr_stop_candidate == pytest.approx(1972.0)
+    assert signals.atr_stop_multiple_used == config.CLERK_TACTICAL_M5_ATR_STOP_MULTIPLE
+    assert signals.h1_atr == 10.0  # H1 stays available as the anchor/regime read
+    assert signals.m5_rsi_tier == "oversold"
+
+
+def test_fast_tier_uses_the_wider_m5_multiple():
+    position = _position(side="buy", sl=1950.0, price_current=1980.0)
+    h1 = _fake_technical_stats(atr=10.0, atr_pct=0.5)  # 0.5%/h -> "fast" tier
+    m5 = _fake_technical_stats(atr=4.0)
+    signals = _compute_tactical_signals(position, _NO_OP_ENTRY, h1, m5_stats=m5)
+    assert signals.velocity_tier == "fast"
+    assert signals.atr_stop_multiple_used == config.CLERK_TACTICAL_M5_ATR_STOP_MULTIPLE_FAST
+    assert signals.atr_stop_candidate == pytest.approx(1980.0 - 3.0 * 4.0)
+
+
+def test_atr_stop_candidate_falls_back_to_h1_without_an_m5_read():
+    position = _position(side="buy", sl=1950.0, price_current=1980.0)
+    signals = _compute_tactical_signals(position, _NO_OP_ENTRY, _fake_technical_stats(atr=10.0))
+    assert signals.atr_timeframe == "H1"
+    assert signals.atr_stop_candidate == pytest.approx(1965.0)
+
+
+def test_structure_trail_candidate_sits_just_beyond_the_nearest_m5_support_for_a_buy():
+    position = _position(side="buy", sl=1950.0, price_current=1980.0)
+    support = SRLevel(price=1972.0, touches=3, distance_pct=-0.4, low=1971.0, high=1973.0)
+    signals = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, None, m5_stats=_fake_technical_stats(atr=4.0), m5_structure=_m15_structure(support=support)
+    )
+    assert signals.nearest_m5_support == support
+    assert signals.structure_trail_candidate == pytest.approx(1971.0 - 0.4 * 4.0)  # band low minus 0.4 M5 ATR
+    assert signals.structure_trail_is_tighter is True  # above the 1950 stop
+
+
+def test_structure_trail_candidate_mirrors_for_a_sell_and_is_dropped_on_the_wrong_side_of_price():
+    position = _position(side="sell", sl=2000.0, price_current=1980.0)
+    resistance = SRLevel(price=1988.0, touches=2, distance_pct=0.4, low=1987.0, high=1989.0)
+    signals = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, None, m5_stats=_fake_technical_stats(atr=4.0), m5_structure=_m15_structure(resistance=resistance)
+    )
+    assert signals.structure_trail_candidate == pytest.approx(1989.0 + 0.4 * 4.0)
+    assert signals.structure_trail_is_tighter is True  # below the 2000 stop
+    # A buy whose only M5 support is ABOVE live price has no valid trail candidate.
+    buy = _position(side="buy", sl=1950.0, price_current=1980.0)
+    above = SRLevel(price=1990.0, touches=2, distance_pct=0.5, low=1989.0, high=1991.0)
+    none = _compute_tactical_signals(
+        buy, _NO_OP_ENTRY, None, m5_stats=_fake_technical_stats(atr=4.0), m5_structure=_m15_structure(support=above)
+    )
+    assert none.structure_trail_candidate is None
+
+
+def test_tactical_prompt_shows_decision_tier_lines_roles_note_and_event_risk():
+    position = _position(side="buy", sl=1950.0, price_current=1980.0)
+    support = SRLevel(price=1972.0, touches=3, distance_pct=-0.4, low=1971.0, high=1973.0)
+    signals = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, _fake_technical_stats(atr=10.0),
+        m5_stats=_fake_technical_stats(atr=4.0, rsi=62.0),
+        m5_structure=_m15_structure(support=support), event_note="High-impact event(s): USD CPI in 20 min",
+    )
+    prompt = _build_tactical_prompt("XAUUSD", _NO_OP_ENTRY, position, "ctx", 10000.0, None, signals)
+    assert "TIMEFRAME ROLES" in prompt and "DECISION TIER" in prompt
+    assert "M5 RSI: 62" in prompt and "M15" not in prompt
+    assert "Nearest M5 structural support" in prompt and "1971.00000-1973.00000" in prompt
+    assert "M5 structure-trail stop candidate" in prompt
+    assert "Event risk: High-impact event(s): USD CPI in 20 min" in prompt
+    assert "M5 ATR-based stop candidate (2.0x M5 ATR" in prompt
+
+
+def test_tactical_prompt_without_m5_data_renders_h1_lines_only():
+    position = _position(side="buy", sl=1950.0, price_current=1980.0)
+    signals = _compute_tactical_signals(position, _NO_OP_ENTRY, _fake_technical_stats(atr=10.0))
+    prompt = _build_tactical_prompt("XAUUSD", _NO_OP_ENTRY, position, "ctx", 10000.0, None, signals)
+    assert "H1 ATR-based stop candidate (1.5x H1 ATR" in prompt
+    assert "M5 structure-trail" not in prompt and "Event risk" not in prompt
+
+
+def test_roles_note_lets_the_clerk_judge_older_conditions_written_on_a_higher_timeframe():
+    from ai.clerk_execution import _TIMEFRAME_ROLES_NOTE
+
+    flat = " ".join(_TIMEFRAME_ROLES_NOTE.split())
+    assert "explicitly wrote on H1, H4 or D1" in flat and "judged against that named timeframe's read" in flat
+
+
+def test_verdict_and_invalidation_prompts_carry_the_timeframe_roles_note():
+    from ai.clerk_execution import _build_invalidation_prompt, _build_verdict_prompt
+
+    setup = PendingSetup(symbol="EURUSD", side="buy", pct=1.0, trigger_condition="M15 closes above 1.1",
+                         price=1.1, stop_loss=1.09, take_profit=1.12, reason="r")
+    verdict = _build_verdict_prompt(setup, "ctx", 10000.0, "10 minutes", "")
+    invalidation = _build_invalidation_prompt("EURUSD", {"side": "buy"}, "M15 closes below 1.09", "ctx", 10000.0, "10 minutes", "filled")
+    for prompt in (verdict, invalidation):
+        assert "TIMEFRAME ROLES" in prompt and "CONTEXT TIER" in prompt
+
+
+# --- M5-ONLY risk management (2026-09-24): velocity, structure and the trend-flip breaker read M5 ---
+
+
+def test_velocity_tier_is_classified_from_the_median_m5_atr_pct_not_the_h1_one():
+    position = _position(side="buy", sl=1950.0, price_current=1980.0)
+    h1_slow = _fake_technical_stats(atr=10.0, atr_pct=0.1)    # would classify "slow" on H1
+    fast = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, h1_slow, m5_stats=_fake_technical_stats(atr=4.0), m5_atr_pct_median=0.10
+    )
+    assert fast.velocity_tier == "fast" and fast.velocity_timeframe == "M5"
+    assert fast.atr_stop_multiple_used == config.CLERK_TACTICAL_M5_ATR_STOP_MULTIPLE_FAST
+    h1_fast = _fake_technical_stats(atr=10.0, atr_pct=0.6)    # would classify "fast" on H1
+    slow = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, h1_fast, m5_stats=_fake_technical_stats(atr=4.0), m5_atr_pct_median=0.03
+    )
+    assert slow.velocity_tier == "slow"
+    assert slow.atr_stop_multiple_used == config.CLERK_TACTICAL_M5_ATR_STOP_MULTIPLE
+
+
+def test_velocity_tier_ignores_a_quiet_hour_dip_of_the_instantaneous_m5_atr_pct():
+    # Gold-shaped: typical M5 ATR% 0.10 (fast), but the CURRENT window is quiet (0.05, below the cut).
+    # The audit found the instantaneous value flips fast<->slow on 18-28% of bars; only the median counts.
+    position = _position(side="buy", sl=1950.0, price_current=1980.0)
+    quiet = _fake_technical_stats(atr=1.5, atr_pct=0.05)
+    signals = _compute_tactical_signals(position, _NO_OP_ENTRY, None, m5_stats=quiet, m5_atr_pct_median=0.10)
+    assert signals.velocity_tier == "fast"
+
+
+def test_velocity_falls_back_to_the_h1_tier_when_there_is_no_m5_baseline():
+    position = _position(side="buy", sl=1950.0, price_current=1980.0)
+    signals = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, _fake_technical_stats(atr=10.0, atr_pct=0.5), m5_stats=_fake_technical_stats(atr=4.0, atr_pct=0.02)
+    )
+    assert signals.velocity_tier == "fast" and signals.velocity_timeframe == "H1"
+
+
+def test_nearest_levels_and_structure_events_come_from_the_m5_structure_with_h1_only_as_fallback():
+    position = _position(side="buy", sl=1950.0, price_current=1980.0)
+    m5_res = SRLevel(price=1985.0, touches=2, distance_pct=0.3, low=1984.0, high=1986.0)
+    h1_res = SRLevel(price=2010.0, touches=5, distance_pct=1.5, low=2009.0, high=2011.0)
+    signals = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, _fake_technical_stats(atr=10.0), h1_structure=_m15_structure(resistance=h1_res),
+        m5_stats=_fake_technical_stats(atr=4.0), m5_structure=_m15_structure(resistance=m5_res),
+    )
+    assert signals.structure_timeframe == "M5" and signals.nearest_resistance == m5_res
+    fallback = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, _fake_technical_stats(atr=10.0), h1_structure=_m15_structure(resistance=h1_res)
+    )
+    assert fallback.structure_timeframe == "H1" and fallback.nearest_resistance == h1_res
+
+
+def test_trend_flip_counter_reads_the_m5_trend_and_regime_and_needs_both_to_agree():
+    buy = _position(side="buy", sl=1950.0, price_current=1980.0)
+    down = _fake_technical_stats(atr=4.0, trend="downtrend", market_regime="trending_down")
+    signals = _compute_tactical_signals(buy, _NO_OP_ENTRY, None, m5_stats=down, prior_tactical={"trend_flip_against_count": 2})
+    assert signals.trend_flip_basis == "M5" and signals.trend_flip_against_count == 3
+    # M5 trend down but the 60-bar regime still up -> not a confirmed flip: the streak resets.
+    mixed = _fake_technical_stats(atr=4.0, trend="downtrend", market_regime="trending_up")
+    reset = _compute_tactical_signals(buy, _NO_OP_ENTRY, None, m5_stats=mixed, prior_tactical={"trend_flip_against_count": 2})
+    assert reset.trend_flip_against_count == 0
+    # A sell is only contradicted by an aligned M5 UP read.
+    sell = _position(side="sell", sl=2000.0, price_current=1980.0)
+    assert _compute_tactical_signals(sell, _NO_OP_ENTRY, None, m5_stats=down).trend_flip_against_count == 0
+
+
+def test_trend_flip_counter_falls_back_to_h1_h4_only_when_there_is_no_m5_read():
+    buy = _position(side="buy", sl=1950.0, price_current=1980.0)
+    h1 = _fake_technical_stats(atr=10.0, trend="downtrend")
+    h4 = _fake_technical_stats(trend="downtrend")
+    signals = _compute_tactical_signals(buy, _NO_OP_ENTRY, h1, h4)
+    assert signals.trend_flip_basis == "H1+H4" and signals.trend_flip_against_count == 1
+    # With an M5 read present the H1+H4 agreement is context and does NOT drive the breaker.
+    with_m5 = _compute_tactical_signals(
+        buy, _NO_OP_ENTRY, h1, h4, m5_stats=_fake_technical_stats(atr=4.0, trend="uptrend", market_regime="trending_up")
+    )
+    assert with_m5.trend_flip_basis == "M5" and with_m5.trend_flip_against_count == 0
+
+
+def test_m5_trend_flip_breaker_message_names_the_m5_basis():
+    position = _position(side="buy", sl=1950.0, price_current=1980.0)
+    signals = _signals(
+        trend_flip_against_count=config.CLERK_TREND_FLIP_EXIT_AFTER_POLLS, trend_flip_basis="M5",
+    )
+    _sym, verdict, raw = _run_clerk_tactical_check("XAUUSD", _NO_OP_ENTRY, position, "ctx", 10000.0, None, signals)
+    assert verdict.tier == "exit" and verdict.hard_exit
+    assert "confirmed M5 trend" in raw and "M5 trend has read opposite" in verdict.numbers_citation
+
+
+def test_tactical_prompt_labels_the_nearest_levels_with_their_timeframe_and_h1_h4_rsi_as_context():
+    position = _position(side="buy", sl=1950.0, price_current=1980.0)
+    support = SRLevel(price=1972.0, touches=3, distance_pct=-0.4, low=1971.0, high=1973.0)
+    signals = _compute_tactical_signals(
+        position, _NO_OP_ENTRY, _fake_technical_stats(atr=10.0, rsi=55.0), m5_stats=_fake_technical_stats(atr=4.0),
+        m5_structure=_m15_structure(support=support), m5_atr_pct_median=0.12,
+    )
+    prompt = _build_tactical_prompt("XAUUSD", _NO_OP_ENTRY, position, "ctx", 10000.0, None, signals)
+    assert "Nearest M5 structural support: 1971.00000-1973.00000" in prompt
+    assert "Nearest H1 structural" not in prompt
+    assert "(context only)" in prompt
+    assert "typical M5 ATR classifies it as a FAST-tier mover" in prompt
+
+
+# --- A discretionary partial close is a PROFIT-taking action (real MSFT incident, 2026-09-22) ---
+
+
+def test_partial_close_on_a_position_not_in_profit_is_dropped_but_the_stop_change_is_kept():
+    verdict = TacticalVerdict(tier="defend", new_stop_loss=1975.0, partial_close_fraction=0.25, rule_citation="O'Neil",
+                              numbers_citation="A 15% gain was already achieved")
+    position = _position(side="buy", volume=1.0, sl=1950.0, price_open=2000.0, price_current=1980.0)   # 1% underwater
+    existing = AllocationEntry(pct=10.0, price=2000.0, stop_loss=1950.0, side="buy")
+    new_entry, state, reason = _validate_and_apply_tactical_verdict(
+        "XAUUSD", verdict, position, existing, None, 100_000.0, _get_spec_for({"XAUUSD": _spec(trade_contract_size=100.0)}),
+    )
+    assert reason == "" and new_entry is not None and state is not None
+    assert new_entry.stop_loss == 1975.0
+    # the FULL 1.0 lot is kept (no 25% cut): 1.0 lot x 25-point stop x 100 = $2,500 = 2.5% of 100k
+    assert new_entry.pct == pytest.approx(2.5)
+
+
+def test_a_partial_close_only_defend_on_a_losing_position_is_rejected():
+    verdict = TacticalVerdict(tier="defend", partial_close_fraction=0.25, rule_citation="O'Neil", numbers_citation="x")
+    position = _position(side="buy", volume=1.0, sl=1950.0, price_open=2000.0, price_current=1980.0)
+    new_entry, state, reason = _validate_and_apply_tactical_verdict(
+        "XAUUSD", verdict, position, None, None, 100_000.0, _get_spec_for({"XAUUSD": _spec()}),
+    )
+    assert new_entry is None and state is None and "not in profit" in reason
+
+
+def test_a_partial_close_in_profit_still_works_and_a_hard_exit_cut_is_exempt():
+    profitable = _position(side="buy", volume=1.0, sl=1950.0, price_open=2000.0, price_current=2030.0)
+    ok = TacticalVerdict(tier="defend", partial_close_fraction=0.25, rule_citation="Schwager", numbers_citation="x")
+    entry, _, reason = _validate_and_apply_tactical_verdict(
+        "XAUUSD", ok, profitable, None, None, 100_000.0, _get_spec_for({"XAUUSD": _spec()}),
+    )
+    assert reason == "" and entry is not None
+    # the deterministic trend-flip cut reduces a LOSING position on purpose
+    losing = _position(side="buy", volume=1.0, sl=1950.0, price_open=2000.0, price_current=1980.0)
+    cut = TacticalVerdict(tier="defend", partial_close_fraction=0.5, rule_citation="trend flip", numbers_citation="x", hard_exit=True)
+    entry2, _, reason2 = _validate_and_apply_tactical_verdict(
+        "XAUUSD", cut, losing, None, None, 100_000.0, _get_spec_for({"XAUUSD": _spec()}),
+    )
+    assert reason2 == "" and entry2 is not None
+    # a SELL is in profit when price fell below its open
+    sell_profit = _position(side="sell", volume=1.0, sl=2050.0, price_open=2000.0, price_current=1970.0)
+    entry3, _, reason3 = _validate_and_apply_tactical_verdict(
+        "XAUUSD", ok, sell_profit, None, None, 100_000.0, _get_spec_for({"XAUUSD": _spec()}),
+    )
+    assert reason3 == "" and entry3 is not None
+
+
+def test_the_profit_requirement_can_be_switched_off(monkeypatch):
+    monkeypatch.setattr(config, "CLERK_PARTIAL_CLOSE_REQUIRES_PROFIT", False)
+    verdict = TacticalVerdict(tier="defend", partial_close_fraction=0.25, rule_citation="x", numbers_citation="x")
+    losing = _position(side="buy", volume=1.0, sl=1950.0, price_open=2000.0, price_current=1980.0)
+    entry, _, reason = _validate_and_apply_tactical_verdict(
+        "XAUUSD", verdict, losing, None, None, 100_000.0, _get_spec_for({"XAUUSD": _spec()}),
+    )
+    assert reason == "" and entry is not None
+
+
+# --- Deterministic profit trail (2026-09-25) ---------------------------------------------------------------
+
+def _trail_signals(position, entry=None, prior=None, atr=2.0, trade_cost=None):
+    entry = entry or AllocationEntry(pct=1.0, price=position.price_open, stop_loss=position.sl, side=position.side)
+    return _compute_tactical_signals(
+        position, entry, None, m5_stats=_fake_technical_stats(atr=atr), prior_tactical=prior, trade_cost=trade_cost,
+    )
+
+
+def test_trail_waits_for_plus_one_r_then_sits_one_and_a_half_m5_atr_behind_the_price():
+    # entry 2000, original stop 1996 (R0 = 4 = 2 ATR), ATR 2.0.
+    below = _trail_signals(_position(price_open=2000.0, price_current=2003.9, sl=1996.0))
+    assert below.profit_trail_r == pytest.approx(0.975) and below.profit_trail_stop is None
+    at = _trail_signals(_position(price_open=2000.0, price_current=2004.0, sl=1996.0))
+    assert at.profit_trail_r == pytest.approx(1.0)
+    assert at.profit_trail_stop == pytest.approx(2004.0 - 1.5 * 2.0)  # 2001.0: already past breakeven
+    assert at.profit_trail_r0 == pytest.approx(4.0)
+
+
+def test_trail_for_a_sell_mirrors_the_buy():
+    signals = _trail_signals(_position(side="sell", price_open=2000.0, price_current=1995.0, sl=2004.0))
+    assert signals.profit_trail_r == pytest.approx(1.25)
+    assert signals.profit_trail_stop == pytest.approx(1995.0 + 3.0)
+
+
+def test_trail_only_ratchets_and_ignores_micro_improvements():
+    already_tight = _trail_signals(_position(price_open=2000.0, price_current=2006.0, sl=2002.9))
+    assert already_tight.profit_trail_stop is None  # candidate 2003.0: only 0.1 above the stop, step is 0.5
+    improved = _trail_signals(_position(price_open=2000.0, price_current=2006.0, sl=2002.0))
+    assert improved.profit_trail_stop == pytest.approx(2003.0)
+    looser = _trail_signals(_position(price_open=2000.0, price_current=2006.0, sl=2004.0))
+    assert looser.profit_trail_stop is None  # the existing stop is already tighter: never widen
+
+
+def test_trail_uses_the_persisted_original_risk_not_a_later_tightened_stop():
+    # The stop has since been tightened to 2001 (1 unit from entry); measuring "R" against THAT would say +3R.
+    position = _position(price_open=2000.0, price_current=2003.0, sl=2001.0)
+    naive = _trail_signals(position, entry=AllocationEntry(pct=1.0, price=2000.0, stop_loss=2001.0, side="buy"))
+    assert naive.profit_trail_r == pytest.approx(3.0)
+    persisted = _trail_signals(position, entry=AllocationEntry(pct=1.0, price=2000.0, stop_loss=2001.0, side="buy"),
+                               prior={"profit_trail_r0": 4.0})
+    assert persisted.profit_trail_r == pytest.approx(0.75) and persisted.profit_trail_stop is None
+
+
+def test_trail_respects_the_brokers_minimum_stop_distance():
+    cost = _fake_trade_cost(min_stop_distance_pct=0.3)  # 0.3% of ~2006 = 6.0 > 1.5 ATR (3.0)
+    signals = _trail_signals(_position(price_open=2000.0, price_current=2006.0, sl=1996.0), trade_cost=cost)
+    assert signals.profit_trail_stop == pytest.approx(2006.0 - 2006.0 * 0.003 * 1.02)
+
+
+def test_trail_needs_an_m5_atr_a_stop_and_the_switch(monkeypatch):
+    position = _position(price_open=2000.0, price_current=2006.0, sl=1996.0)
+    assert _compute_tactical_signals(position, _NO_OP_ENTRY, None).profit_trail_stop is None  # no M5 read
+    assert _trail_signals(_position(price_open=2000.0, price_current=2006.0, sl=None)).profit_trail_stop is None
+    monkeypatch.setattr(config, "CLERK_PROFIT_TRAIL_ENABLED", False)
+    assert _trail_signals(position).profit_trail_stop is None
+
+
+@patch("ai.clerk_execution.run_ollama")
+def test_trail_verdict_is_a_stop_only_deterministic_defend_that_never_calls_the_model(mock_run_ollama):
+    position = _position(price_open=2000.0, price_current=2006.0, sl=1996.0)
+    signals = _trail_signals(position)
+    symbol, verdict, raw = _run_clerk_tactical_check(
+        "XAUUSD", _NO_OP_ENTRY, position, "ctx", 100_000.0, None, signals,
+    )
+    mock_run_ollama.assert_not_called()
+    assert verdict.tier == "defend" and verdict.hard_exit is True and verdict.partial_close_fraction is None
+    assert verdict.new_stop_loss == pytest.approx(2003.0) and "1.50R" in verdict.numbers_citation
+    assert raw.startswith("[deterministic circuit-breaker")
+
+
+def test_trail_defend_validates_persists_the_original_risk_and_sizes_the_same_lots():
+    position = _position(price_open=2000.0, price_current=2006.0, sl=1996.0, volume=2.0)
+    signals = _trail_signals(position)
+    verdict = TacticalVerdict(tier="defend", new_stop_loss=signals.profit_trail_stop, rule_citation="r", numbers_citation="n", hard_exit=True)
+    entry = AllocationEntry(pct=2.0, price=2000.0, stop_loss=1996.0, side="buy")
+    new_entry, state, rejected = _validate_and_apply_tactical_verdict(
+        "XAUUSD", verdict, position, entry, None, 100_000.0, _get_spec_for({"XAUUSD": _spec()}), signals,
+    )
+    assert rejected == "" and new_entry.stop_loss == pytest.approx(2003.0)
+    assert state["profit_trail_r0"] == pytest.approx(4.0) and state["persisted_stop_loss"] == pytest.approx(2003.0)
+
+
+@patch("ai.clerk_execution.run_ollama")
+def test_a_position_not_yet_at_plus_one_r_still_goes_to_the_model(mock_run_ollama):
+    mock_run_ollama.return_value = "FINAL_VERDICT: HOLD"
+    position = _position(price_open=2000.0, price_current=2002.0, sl=1996.0)
+    _run_clerk_tactical_check("XAUUSD", _NO_OP_ENTRY, position, "ctx", 100_000.0, None, _trail_signals(position))
+    mock_run_ollama.assert_called()
+
+
+# --- thinking pass: do not re-ask the model about a HOLD when nothing moved (2026-09-26) -------------------------------------------
+
+def _fingerprint(position=None, **signal_overrides):
+    from ai.clerk_execution import _tactical_fingerprint
+    return _tactical_fingerprint(position or _position(price_current=1980.0), _signals(m5_atr=2.0, **signal_overrides))
+
+
+def _cache_with(symbol, fingerprint, tier="hold", minutes_old=5.0):
+    now = datetime.now(timezone.utc)
+    return {"items": {f"tactical:{symbol}": {
+        "verdict": {"tier": tier}, "fingerprint": fingerprint, "checked_utc": (now - timedelta(minutes=minutes_old)).isoformat(),
+    }}}, now
+
+
+def test_fingerprint_ignores_tiny_price_moves_but_sees_real_ones():
+    base = _fingerprint()
+    assert _fingerprint(_position(price_current=1980.3)) == base  # inside the same half-ATR bucket
+    assert _fingerprint(_position(price_current=1976.0)) != base  # a real move
+    assert _fingerprint(_position(sl=1960.0)) != base  # the position's own terms changed
+    assert _fingerprint(trend_flip_against_count=1) != base
+    assert _fingerprint(profit_lock_due=True) != base
+    assert _fingerprint(m5_rsi_tier="overbought") != base
+
+
+def test_an_unchanged_hold_is_reused_but_never_a_defend_an_old_or_a_moved_one():
+    from ai.clerk_execution import _tactical_unchanged
+    fp = _fingerprint()
+    cache, now = _cache_with("XAUUSD", fp)
+    assert _tactical_unchanged(cache, "XAUUSD", fp, now)
+    assert not _tactical_unchanged(cache, "XAUUSD", _fingerprint(trend_flip_against_count=2), now)
+    assert not _tactical_unchanged(cache, "EURUSD", fp, now)
+    defend, now = _cache_with("XAUUSD", fp, tier="defend")
+    assert not _tactical_unchanged(defend, "XAUUSD", fp, now)
+    old, now = _cache_with("XAUUSD", fp, minutes_old=config.CLERK_THINK_REUSE_MAX_MINUTES + 1)
+    assert not _tactical_unchanged(old, "XAUUSD", fp, now)
+    legacy, now = _cache_with("XAUUSD", None)  # an item stored before fingerprints existed
+    assert not _tactical_unchanged(legacy, "XAUUSD", fp, now)
+
+
+# --- a partial close is impossible on a minimum-lot position (XAGUSD 2026-09-26: "infeasible" every poll, stop change lost) ---
+
+def test_a_partial_close_below_the_minimum_lot_is_dropped_but_the_stop_change_is_kept():
+    verdict = TacticalVerdict(tier="defend", new_stop_loss=2010.0, partial_close_fraction=0.5, rule_citation="Schwager", numbers_citation="x")
+    position = _position(side="buy", volume=0.01, sl=1950.0, price_open=2000.0, price_current=2030.0)  # 0.01 lot = the minimum
+    new_entry, state, reason = _validate_and_apply_tactical_verdict(
+        "XAUUSD", verdict, position, None, None, 100_000.0, _get_spec_for({"XAUUSD": _spec(trade_contract_size=100.0)}),
+    )
+    assert reason == "" and new_entry is not None and state is not None
+    assert new_entry.stop_loss == 2010.0
+    assert state["partial_pending_from_volume"] is None  # no partial to insist on / retry
+    # the whole 0.01 lot is kept: 0.01 x 10-point stop x 100 = $10 = 0.01% of 100k
+    assert new_entry.pct == pytest.approx(0.01)
+
+
+def test_a_partial_only_defend_on_a_minimum_lot_position_does_nothing_and_a_quick_lock_is_marked_done():
+    verdict = TacticalVerdict(tier="defend", partial_close_fraction=0.2, rule_citation="quick lock", numbers_citation="x")
+    position = _position(side="buy", volume=0.01, sl=1950.0, price_open=2000.0, price_current=2030.0)
+    spec = _get_spec_for({"XAUUSD": _spec(trade_contract_size=100.0)})
+    new_entry, state, reason = _validate_and_apply_tactical_verdict("XAUUSD", verdict, position, None, None, 100_000.0, spec)
+    assert new_entry is None and state is None and reason == ""
+    signals = _signals(quick_profit_lock_due=True)
+    new_entry, state, reason = _validate_and_apply_tactical_verdict(
+        "XAUUSD", verdict, position, None, {"defend_count": 1}, 100_000.0, spec, signals,
+    )
+    assert new_entry is None and reason == "" and state["quick_profit_lock_done"] is True and state["defend_count"] == 1
+
+
+def test_a_partial_close_that_leaves_at_least_the_minimum_lot_still_works():
+    verdict = TacticalVerdict(tier="defend", partial_close_fraction=0.5, rule_citation="Schwager", numbers_citation="x")
+    position = _position(side="buy", volume=0.04, sl=1950.0, price_open=2000.0, price_current=2030.0)
+    new_entry, state, reason = _validate_and_apply_tactical_verdict(
+        "XAUUSD", verdict, position, None, None, 100_000.0, _get_spec_for({"XAUUSD": _spec(trade_contract_size=100.0)}),
+    )
+    assert reason == "" and new_entry is not None and state["partial_pending_from_volume"] == 0.04

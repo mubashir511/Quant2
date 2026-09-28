@@ -26,7 +26,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from analysis.chart_structure import STRUCTURE_LOOKBACK, detect_chart_patterns
-from analysis.technical import ATR_WINDOW
+from analysis.technical import ATR_WINDOW, RSI_WINDOW, compute_rolling_rsi
 
 _MIN_BETA_OBSERVATIONS = 60  # ~3 months of trading days — a shorter window is too noisy to trust
 
@@ -438,29 +438,6 @@ class RSIReactionBacktest:
     excursion: FavorableExcursionStats | None = None
 
 
-_RSI_WINDOW = 14
-
-
-def _rolling_rsi(prices: pd.Series) -> pd.Series:
-    """Classic 14-day RSI computed at every point in the series (not
-    just the latest, unlike analysis.technical._compute_rsi) — needed
-    here to find every historical day the series crossed an extreme
-    level, not just today's reading."""
-    delta = prices.diff()
-    gains = delta.clip(lower=0)
-    losses = -delta.clip(upper=0)
-    avg_gain = gains.rolling(_RSI_WINDOW).mean()
-    avg_loss = losses.rolling(_RSI_WINDOW).mean()
-    # float("nan") rather than pd.NA — keeps the series plain float64
-    # instead of upcasting to a nullable/object dtype for the division.
-    rs = avg_gain / avg_loss.replace(0, float("nan"))
-    rsi = 100 - (100 / (1 + rs))
-    # Where avg_loss is exactly 0, the formula above is NaN by
-    # construction (division guarded above) — fill with the correct
-    # boundary value: 100 if there were real gains in the window, 50 if
-    # the window was genuinely flat (both averages zero).
-    zero_loss = avg_loss == 0
-    return rsi.mask(zero_loss, (avg_gain > 0).astype(float) * 50.0 + 50.0)
 
 
 def backtest_rsi_reaction(
@@ -511,14 +488,14 @@ def backtest_rsi_reaction(
     all, isn't trustworthy evidence either way."""
     ohlc = ohlc.dropna(subset=[c for c in ("High", "Low", "Close") if c in ohlc.columns])
     prices = ohlc["Close"] if "Close" in ohlc.columns else pd.Series(dtype=float)
-    if len(prices) < _RSI_WINDOW + max_holding_bars + 1:
+    if len(prices) < RSI_WINDOW + max_holding_bars + 1:
         return None, None
 
     atr = _rolling_atr(ohlc)
     if atr is None:
         return None, None
 
-    rsi = _rolling_rsi(prices)
+    rsi = compute_rolling_rsi(prices)
 
     def _episode_result(mask: pd.Series, side: str, swap_pct_per_day: float) -> RSIReactionBacktest | None:
         positions = _episode_start_positions(prices, mask)
@@ -878,6 +855,169 @@ def backtest_support_resistance_reaction(
     )
 
 
+# --- Per-level adaptive reliability — added 2026-09-20, direct user -----
+# challenge: every backtest above pools ALL historical S/R touches on an
+# instrument into one aggregate stat — there was no way to ask "has THIS
+# exact zone specifically been tested N times and held M?" -------------
+
+# Deliberately LOWER than _MIN_SR_TESTS=5 above — a single specific zone
+# naturally gets fewer historical touches than "any S/R level anywhere in
+# a rolling window ever", the same floor analysis.setup_classifier's own
+# STRONG_TOUCH_COUNT already uses for "well-tested enough to reason about".
+_MIN_LEVEL_TESTS = 2
+
+
+@dataclass
+class LevelReliabilityBacktest:
+    """Real historical react-rate for ONE SPECIFIC price zone (not a
+    pooled "all rolling-window S/R tests ever" stat like
+    SupportResistanceBacktest above) — the same _simulate_trades engine,
+    re-scoped to only the historical bars that fell within THIS level's
+    own real band (analysis.chart_structure.SRLevel.low/.high, Phase 1)
+    rather than a fresh rolling-window proximity check every time.
+
+    `holds`/`breaks` is a SEPARATE measurement from the win/loss/timeout
+    trade simulation below (same "decoupled measurement" precedent
+    _compute_favorable_excursion itself already established for
+    excursion) — it asks a different question: did price actually
+    revert away from the band's OWN far edge within max_holding_bars, or
+    close through it, independent of whether the FIXED ATR stop/target
+    happened to be touched first. `hold_rate_pct` is None (not 0.0) when
+    zero tests resolved either way within the holding window."""
+
+    level_price: float
+    level_low: float
+    level_high: float
+    side: str  # "support" (bets long) or "resistance" (bets short)
+    tests: int
+    holds: int
+    breaks: int
+    hold_rate_pct: float | None
+    trades: int
+    wins: int
+    losses: int
+    timeouts: int
+    win_rate_pct: float | None
+    avg_r_multiple: float
+    stop_atr_multiple: float
+    target_atr_multiple: float
+    max_holding_bars: int
+    min_stop_distance_pct: float = 0.0
+    round_trip_cost_pct: float = 0.0
+    swap_pct_per_day_used: float = 0.0
+    excursion: FavorableExcursionStats | None = None
+
+
+def backtest_level_reliability(
+    ohlc: pd.DataFrame,
+    level_price: float,
+    level_low: float,
+    level_high: float,
+    side: str,
+    max_holding_bars: int = TRADE_SIM_MAX_HOLDING_BARS,
+    min_tests: int = _MIN_LEVEL_TESTS,
+    stop_atr_multiple: float = TRADE_SIM_STOP_ATR_MULTIPLE,
+    target_atr_multiple: float = TRADE_SIM_TARGET_ATR_MULTIPLE,
+    min_stop_distance_pct: float = 0.0,
+    round_trip_cost_pct: float = 0.0,
+    swap_pct_per_day: float = 0.0,
+    excursion_horizon_bars: int = TRADE_SIM_EXCURSION_HORIZON_BARS,
+) -> LevelReliabilityBacktest | None:
+    """Every historical bar whose real Close fell within [level_low,
+    level_high] counts as one real test of THIS specific zone (episodes
+    collapsed via _episode_start_positions, same "a condition holding for
+    many consecutive bars is one episode, not one per bar" rule every
+    other backtest here already follows) — support bets long (the zone
+    holds), resistance bets short (it rejects), same directional
+    convention as backtest_support_resistance_reaction. None if there
+    aren't at least `min_tests` real historical touches of this exact
+    band, or if `ohlc` has no High/Low at all (ATR needs it)."""
+    if side not in ("support", "resistance"):
+        raise ValueError(f"side must be 'support' or 'resistance', got {side!r}")
+    ohlc = ohlc.dropna(subset=[c for c in ("High", "Low", "Close") if c in ohlc.columns])
+    prices = ohlc["Close"] if "Close" in ohlc.columns else pd.Series(dtype=float)
+    if len(prices) < max_holding_bars + 2:
+        return None
+
+    atr = _rolling_atr(ohlc)
+    if atr is None:
+        return None
+
+    within_band = (prices >= level_low) & (prices <= level_high)
+    test_positions = _episode_start_positions(prices, within_band)
+    if len(test_positions) < min_tests:
+        return None
+
+    trade_side = "buy" if side == "support" else "sell"
+    results = _simulate_trades(
+        ohlc, test_positions, trade_side, atr, stop_atr_multiple, target_atr_multiple, max_holding_bars,
+        min_stop_distance_pct=min_stop_distance_pct, round_trip_cost_pct=round_trip_cost_pct,
+        swap_pct_per_day=swap_pct_per_day,
+    )
+    if len(results) < min_tests:
+        return None
+    summary = _summarize_trade_results(results)
+
+    close = ohlc["Close"]
+    holds = 0
+    breaks = 0
+    for pos in test_positions:
+        # Real bug found on self-review, 2026-09-21: a touch sitting on
+        # (or one bar before) the very end of the series has ZERO real
+        # forward data to confirm either verdict — without this guard it
+        # fell through to "holds" by construction (broke stays False when
+        # the inner loop never runs), silently fabricating support for
+        # the hold rate from the one touch with the least evidence behind
+        # it: the CURRENT, most decision-relevant one. Mirrors _simulate_
+        # trades' own identical `pos + 1 >= len(ohlc): continue` skip.
+        if pos + 1 >= len(ohlc):
+            continue
+        broke = False
+        for fwd in range(1, max_holding_bars + 1):
+            idx = pos + fwd
+            if idx >= len(ohlc):
+                break
+            bar_close = close.iloc[idx]
+            if (side == "support" and bar_close < level_low) or (side == "resistance" and bar_close > level_high):
+                broke = True
+                break
+        if broke:
+            breaks += 1
+        else:
+            holds += 1
+    resolved = holds + breaks
+    hold_rate_pct = (holds / resolved * 100) if resolved > 0 else None
+
+    excursion = _compute_favorable_excursion(
+        ohlc, test_positions, trade_side, atr, stop_atr_multiple,
+        horizon_bars=excursion_horizon_bars, min_stop_distance_pct=min_stop_distance_pct,
+    )
+
+    return LevelReliabilityBacktest(
+        level_price=level_price,
+        level_low=level_low,
+        level_high=level_high,
+        side=side,
+        tests=len(test_positions),
+        holds=holds,
+        breaks=breaks,
+        hold_rate_pct=hold_rate_pct,
+        trades=summary.trades,
+        wins=summary.wins,
+        losses=summary.losses,
+        timeouts=summary.timeouts,
+        win_rate_pct=summary.win_rate_pct,
+        avg_r_multiple=summary.avg_r_multiple,
+        stop_atr_multiple=stop_atr_multiple,
+        target_atr_multiple=target_atr_multiple,
+        max_holding_bars=max_holding_bars,
+        min_stop_distance_pct=min_stop_distance_pct,
+        round_trip_cost_pct=round_trip_cost_pct,
+        swap_pct_per_day_used=swap_pct_per_day,
+        excursion=excursion,
+    )
+
+
 @dataclass
 class ChartPatternBacktest:
     """Real trade-simulation result for one chart-pattern archetype (see
@@ -1048,6 +1188,7 @@ def classify_backtest_favorability(
     support_resistance_backtest: SupportResistanceBacktest | None,
     double_bottom_backtest: ChartPatternBacktest | None,
     double_top_backtest: ChartPatternBacktest | None,
+    edge_verdicts: dict[str, str] | None = None,
 ) -> tuple[str | None, float | None]:
     """Deterministic SUPPORTED/CONTRADICTED/MIXED read of whether a
     position's own real historical backtest evidence, on ITS side, backs
@@ -1119,6 +1260,39 @@ def classify_backtest_favorability(
         return None, None
 
     if not candidates:
+        return None, None
+
+    if edge_verdicts is not None:
+        # Significance-aware mode (analysis.edge_stats, 2026-09-25): each backtest is judged by its verdict
+        # against a random-entry baseline (keys "rsi" / "sr" / "pattern") instead of the sign of its raw
+        # avg R — a sample near the null result is NO-INFORMATION, not "unfavorable". A backtest with no
+        # verdict, or NO-INFORMATION, is silent, exactly like missing data.
+        supported: list[tuple[float, FavorableExcursionStats | None]] = []
+        contradicted = 0
+        for key, backtest in (
+            ("rsi", rsi_oversold_backtest if side == "buy" else rsi_overbought_backtest),
+            ("sr", support_resistance_backtest),
+            ("pattern", double_bottom_backtest if side == "buy" else double_top_backtest),
+        ):
+            verdict = edge_verdicts.get(key)
+            if backtest is None or verdict not in ("supported", "contradicted"):
+                continue
+            if verdict == "contradicted":
+                contradicted += 1
+                continue
+            if key == "sr" and side == "buy":
+                supported.append((backtest.support_avg_r_multiple, backtest.support_excursion))
+            elif key == "sr":
+                supported.append((backtest.resistance_avg_r_multiple, backtest.resistance_excursion))
+            else:
+                supported.append((backtest.avg_r_multiple, backtest.excursion))
+        if supported and contradicted:
+            return "mixed", None
+        if supported:
+            _best_avg_r, best_excursion = max(supported, key=lambda c: c[0])
+            return "supported", (best_excursion.median_r if best_excursion is not None else None)
+        if contradicted:
+            return "contradicted", None
         return None, None
 
     rounded = [(round(avg_r, 2), excursion) for avg_r, excursion in candidates]

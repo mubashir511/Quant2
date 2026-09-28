@@ -34,7 +34,7 @@ def pid_is_alive(pid: int) -> bool | None:
     return str(pid) in result.stdout
 
 
-def acquire_lock(lock_path: Path, stale_after_seconds: float) -> bool:
+def acquire_lock(lock_path: Path, stale_after_seconds: float, quiet: bool = False) -> bool:
     """True if this invocation now holds the lock (this process's own PID
     written to `lock_path`). False — and logs exactly why — if an
     existing lock's own recorded PID is confirmed still alive; the
@@ -57,7 +57,7 @@ def acquire_lock(lock_path: Path, stale_after_seconds: float) -> bool:
         if held_pid is not None:
             alive = pid_is_alive(held_pid)
             if alive is True:
-                logger.warning(
+                (logger.debug if quiet else logger.warning)(
                     "Lock file %s is held by PID %d, which is still running — skipping this "
                     "poll rather than restarting the guarded work from scratch.",
                     lock_path, held_pid,
@@ -76,7 +76,7 @@ def acquire_lock(lock_path: Path, stale_after_seconds: float) -> bool:
 
         age_seconds = time.time() - lock_path.stat().st_mtime
         if age_seconds < stale_after_seconds:
-            logger.warning(
+            (logger.debug if quiet else logger.warning)(
                 "Lock file %s is only %.1f minutes old (stale threshold %.0f minutes) and its "
                 "PID's liveness couldn't be confirmed either way — treating it as still held; "
                 "skipping this poll rather than restarting the guarded work from scratch.",
@@ -90,6 +90,21 @@ def acquire_lock(lock_path: Path, stale_after_seconds: float) -> bool:
         )
     lock_path.write_text(str(os.getpid()))
     return True
+
+
+def acquire_lock_wait(lock_path: Path, stale_after_seconds: float, wait_seconds: float, poll_seconds: float = 1.0) -> bool:
+    """acquire_lock, but for a job whose work is TIME-CRITICAL (a stop ratchet, a failed Mega entry, a trigger that just fired): rather
+    than give up at once because another short pass holds the lock right now (all the Clerk's minute timers fire in the same second,
+    so they used to skip each other and a skipped job waited a whole minute), keep trying for up to `wait_seconds`. A dead or stale
+    holder is still taken over immediately, exactly as in acquire_lock. False if the lock never came free in time."""
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    while True:
+        if acquire_lock(lock_path, stale_after_seconds, quiet=True):
+            return True
+        if time.monotonic() >= deadline:
+            logger.warning("Lock file %s still held after waiting %.0f s - skipping this run.", lock_path, wait_seconds)
+            return False
+        time.sleep(poll_seconds)
 
 
 def release_lock(lock_path: Path) -> None:

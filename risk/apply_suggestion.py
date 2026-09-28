@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from ai.portfolio_suggest import AllocationEntry
+from analysis.entry_mode import normalise_entry_mode
 from data.mt5_source import AccountSummary, ContractSpec, MarketAsset, PendingOrder, Position
 
 
@@ -33,6 +34,11 @@ def _pending_order_side(order: PendingOrder) -> str:
     return "buy" if order.order_type.startswith("buy") else "sell"
 
 
+def _pending_order_kind(order: PendingOrder) -> str:
+    """'stop' for a buy/sell stop, else 'limit' (this account's only other resting order type)."""
+    return "stop" if "stop" in order.order_type.lower() else "limit"
+
+
 def _within_tolerance(a: float | None, b: float | None, tolerance_pct: float) -> bool:
     if a is None and b is None:
         return True
@@ -57,6 +63,8 @@ def compute_rebalance_plan(
     held_position_size_tolerance_pct: float = 25.0,
     is_pre_weekend: bool = False,
     weekend_tradable_symbols: set[str] | None = None,
+    max_position_margin_pct_of_equity: float = 0.0,
+    deliberate_resize_symbols: set[str] | None = None,
 ) -> list[PlannedOrder]:
     """Pure, deterministic diff between what's currently held and the
     AI's target allocation — no network calls, no AI reasoning here, only
@@ -333,6 +341,7 @@ def compute_rebalance_plan(
             stop_loss = None
             take_profit = None
             price_note = ""
+            entry_mode = "limit"
         else:
             # Resolve price/stop up front — sizing needs them, and reusing
             # the exact same clamped values for the order itself (below)
@@ -341,6 +350,13 @@ def compute_rebalance_plan(
             proposed_price = entry.price if entry is not None else None
             clamped_price = None
             price_note = ""
+            # analysis/entry_mode.py: a fresh entry may be a "stop" (breakout trigger) or a "market" deal. By
+            # the time it reaches here the Clerk guard (or the final live re-check) has already re-verified it
+            # from a live quote; the clamps below are the mechanical last line. A mode that cannot be honoured
+            # (no live quote / no proposed price) is a plain limit.
+            entry_mode = normalise_entry_mode(entry.entry_mode) if entry is not None else "limit"
+            if asset is None or proposed_price is None:
+                entry_mode = "limit"
             if asset is not None and proposed_price is not None:
                 ref_price = asset.bid if target_side == "sell" else asset.ask
                 band = price_sanity_band_pct / 100
@@ -368,6 +384,16 @@ def compute_rebalance_plan(
                 else:
                     lo, hi = ref_price, ref_price * (1 + band)
                 clamped_price = min(max(proposed_price, lo), hi)
+                if entry_mode == "market":
+                    clamped_price = ref_price  # the deal executes at the live ask/bid
+                elif entry_mode == "stop":
+                    # A stop order sits BEYOND the market: above the ask for a buy, below the bid for a sell,
+                    # at least the minimum sane distance away and within the same sanity band.
+                    minimum = min_stop_distance_pct / 100
+                    if target_side == "buy":
+                        clamped_price = min(max(proposed_price, ref_price * (1 + minimum)), ref_price * (1 + band))
+                    else:
+                        clamped_price = min(max(proposed_price, ref_price * (1 - band)), ref_price * (1 - minimum))
                 if clamped_price != proposed_price:
                     ref_label = "bid" if target_side == "sell" else "ask"
                     if clamped_price == ref_price:
@@ -439,6 +465,7 @@ def compute_rebalance_plan(
                 and stop_loss is not None
                 and proposed_price is not None
                 and sizing_price != proposed_price
+                and entry_mode == "limit"  # a stop/market entry deliberately keeps Claude's structural stop
             ):
                 original_distance = abs(proposed_price - stop_loss)
                 rederived_stop = (
@@ -459,15 +486,24 @@ def compute_rebalance_plan(
                 # entry. Order matters — this must run before stop_distance
                 # is ever computed below, since sizing trusts the sign is
                 # already correct for target_side by that point.
+                # For an ALREADY-HELD same-side position the stop is judged against the LIVE price, not the entry: a
+                # trailing stop that has locked in profit legitimately sits past the entry (2026-09-25, SOLUSD: every profit
+                # ratchet was dropped here as "wrong side of entry", the amend never went out, and the trail only took effect
+                # a poll later through the external-drift restore). It must still be on the safe side of where the market is.
+                stop_ref = sizing_price
+                if held_lots > 0 and held_side == target_side and asset is not None:
+                    live_ref = asset.bid if target_side == "buy" else asset.ask
+                    if live_ref:
+                        stop_ref = live_ref
                 wrong_side = (
-                    stop_loss >= sizing_price
+                    stop_loss >= stop_ref
                     if target_side == "buy"
-                    else stop_loss <= sizing_price
+                    else stop_loss <= stop_ref
                 )
                 if wrong_side:
                     stop_loss = None
-                    price_note += " (suggested stop was on the wrong side of entry, dropped)"
-                elif sizing_price != 0 and abs(sizing_price - stop_loss) / sizing_price * 100 < min_stop_distance_pct:
+                    price_note += " (suggested stop was on the wrong side of " + ("the live price" if stop_ref != sizing_price else "entry") + ", dropped)"
+                elif stop_ref != 0 and abs(stop_ref - stop_loss) / stop_ref * 100 < min_stop_distance_pct:
                     # Last-resort safety net, not a substitute for the
                     # re-derivation above (which already fixes the common
                     # case where clamping is WHY the distance shrank) —
@@ -479,9 +515,10 @@ def compute_rebalance_plan(
                     # almost guaranteed to be clipped by ordinary noise
                     # within seconds, not a real, deliberate risk choice.
                     price_note += (
-                        f" (stop distance {abs(sizing_price - stop_loss):.4f} is under the "
-                        f"{min_stop_distance_pct:.2f}% minimum sane distance from entry "
-                        f"{sizing_price:.4f} — dropped rather than risking a near-instant stop-out)"
+                        f" (stop distance {abs(stop_ref - stop_loss):.4f} is under the "
+                        f"{min_stop_distance_pct:.2f}% minimum sane distance from "
+                        f"{'the live price' if stop_ref != sizing_price else 'entry'} "
+                        f"{stop_ref:.4f} — dropped rather than risking a near-instant stop-out)"
                     )
                     stop_loss = None
 
@@ -551,7 +588,7 @@ def compute_rebalance_plan(
                 held_stop_distance = abs(sizing_price - held_positions[0].sl)
                 if held_stop_distance > 0:
                     old_basis_lots = _round_down_to_step(
-                        (pct / 100 * account.equity) / (held_stop_distance * spec.trade_contract_size),
+                        (pct / 100 * account.equity) / (held_stop_distance * spec.risk_per_price_unit),
                         spec.volume_step,
                     )
                     if abs(old_basis_lots - held_lots) < spec.volume_step / 2:
@@ -577,8 +614,39 @@ def compute_rebalance_plan(
             # clamped_price is correct for target_side by this point.
             stop_distance = abs(sizing_price - sizing_stop_loss)
             risk_dollars = pct / 100 * account.equity
-            raw_target_lots = risk_dollars / (stop_distance * spec.trade_contract_size)
+            raw_target_lots = risk_dollars / (stop_distance * spec.risk_per_price_unit)
             target_lots = _round_down_to_step(raw_target_lots, spec.volume_step)
+
+            # Lot ceilings (intraday decision-tier upgrade, 2026-09-24): M15-
+            # scale stops are much tighter than the old H1-scale ones, so the
+            # SAME risk % now buys several times the lots. Never exceed the
+            # broker's own per-order volume_max (an over-limit order is
+            # rejected outright), and — when a margin cap is configured —
+            # never let one position's initial margin exceed that share of
+            # equity. `margin_initial` is per 1.0 lot; a cap that pushes the
+            # size under volume_min falls into the ordinary "can't afford the
+            # minimum lot" infeasible result just below, never a silent
+            # oversize.
+            # NEVER applied to an already-held same-side position: the margin cap moves with equity
+            # and the raw target with pct, so capping there would force-CLOSE part of a live position
+            # (audit finding 2026-09-24: held 20 lots, cap 16 -> a 4-lot "reduce" nobody asked for).
+            # The cap governs what gets OPENED, not what is already open.
+            is_fresh_side = not (held_lots > 0 and held_side == target_side)
+            lot_ceiling = spec.volume_max if spec.volume_max and spec.volume_max > 0 else None
+            ceiling_reason = "the broker's own per-order volume limit"
+            if not is_fresh_side:
+                lot_ceiling = None
+            elif max_position_margin_pct_of_equity > 0 and spec.margin_initial > 0 and account.equity > 0:
+                margin_cap_lots = (max_position_margin_pct_of_equity / 100 * account.equity) / spec.margin_initial
+                if lot_ceiling is None or margin_cap_lots < lot_ceiling:
+                    lot_ceiling = margin_cap_lots
+                    ceiling_reason = f"the {max_position_margin_pct_of_equity:g}%-of-equity per-position margin cap"
+            if lot_ceiling is not None and target_lots > lot_ceiling:
+                capped_lots = _round_down_to_step(lot_ceiling, spec.volume_step)
+                price_note += (
+                    f" (size capped from {target_lots:g} to {capped_lots:g} lots by {ceiling_reason})"
+                )
+                target_lots = capped_lots
 
             # Real incident, 2026-09-11: a held NVDA position's own
             # revised stop was reported at pct=0.02%, a razor-thin 17%
@@ -593,7 +661,13 @@ def compute_rebalance_plan(
             # is a rounding-precision miss, not a deliberate resize —
             # keep the real current volume and let the stop/target
             # change still apply, rather than silently blocking it.
-            if held_lots > 0 and held_side == target_side and raw_target_lots > 0:
+            # EXCEPT a resize somebody DELIBERATELY asked for (a tactical partial close): a 20% "quick profit lock" is inside
+            # the 25% tolerance, so it used to be swallowed here as a rounding miss - 2026-09-25, both SOLUSD trades: the Clerk
+            # logged "DEFEND applied" and "0 order(s) sent", and the lock was marked done anyway.
+            if (
+                held_lots > 0 and held_side == target_side and raw_target_lots > 0
+                and symbol not in (deliberate_resize_symbols or set())
+            ):
                 if abs(raw_target_lots - held_lots) / held_lots * 100 <= held_position_size_tolerance_pct:
                     target_lots = held_lots
 
@@ -691,6 +765,8 @@ def compute_rebalance_plan(
                 single_order is not None
                 and _pending_order_side(single_order) == target_side
                 and abs(single_order.volume - target_lots) < spec.volume_step / 2
+                and _pending_order_kind(single_order) == ("stop" if entry_mode == "stop" else "limit")
+                and entry_mode != "market"
                 and _within_tolerance(single_order.price_open, clamped_price, amend_tolerance_pct)
                 and _within_tolerance(single_order.sl, stop_loss, amend_tolerance_pct)
                 and _within_tolerance(single_order.tp, take_profit, amend_tolerance_pct)
@@ -707,7 +783,7 @@ def compute_rebalance_plan(
                 plans.append(
                     PlannedOrder(
                         symbol=symbol, action="amend_pending", side=target_side, volume=target_lots,
-                        order_type="limit", price=clamped_price, stop_loss=stop_loss, take_profit=take_profit,
+                        order_type=entry_mode, price=clamped_price, stop_loss=stop_loss, take_profit=take_profit,
                         pending_tickets_to_cancel=all_tickets,
                         reason=(
                             f"Mega session updated this pending order's terms — "
@@ -825,7 +901,7 @@ def compute_rebalance_plan(
             plans.append(
                 PlannedOrder(
                     symbol=symbol, action="open", side=target_side, volume=delta,
-                    order_type="limit", price=clamped_price, stop_loss=stop_loss,
+                    order_type=entry_mode, price=clamped_price, stop_loss=stop_loss,
                     take_profit=take_profit,
                     reason=f"Risking {pct:.1f}% of equity to this stop.{price_note}",
                 )
@@ -869,7 +945,7 @@ def pct_for_target_lots(
 ) -> float | None:
     """The exact mathematical inverse of compute_rebalance_plan's own
     risk-based sizing formula above (`target_lots =
-    risk_dollars / (stop_distance * spec.trade_contract_size)`, where
+    risk_dollars / (stop_distance * spec.risk_per_price_unit)`, where
     `risk_dollars = pct / 100 * account.equity`) — solved here for the
     `pct` that reproduces a given `target_lots` at a given stop distance.
 
@@ -902,7 +978,7 @@ def pct_for_target_lots(
     stop_distance = abs(entry_price - stop_loss)
     if stop_distance <= 0:
         return None
-    risk_dollars = target_lots * stop_distance * spec.trade_contract_size
+    risk_dollars = target_lots * stop_distance * spec.risk_per_price_unit
     return risk_dollars / account_equity * 100
 
 

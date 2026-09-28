@@ -119,3 +119,36 @@ def test_release_lock_removes_the_file(tmp_path):
 def test_release_lock_is_a_no_op_when_nothing_to_remove(tmp_path):
     lock = tmp_path / "some.lock"
     job_lock.release_lock(lock)  # must not raise
+
+
+# --- acquire_lock_wait: a time-critical job waits a moment for a short pass instead of skipping ---
+
+def test_acquire_lock_wait_takes_the_lock_as_soon_as_a_short_holder_finishes(tmp_path):
+    lock = tmp_path / "some.lock"
+    lock.write_text(str(os.getpid()))  # held by a live process...
+    calls = {"n": 0}
+
+    def _sleep(_seconds):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            lock.unlink()  # ...that finishes while we wait
+
+    with patch("job_lock.time.sleep", side_effect=_sleep):
+        assert job_lock.acquire_lock_wait(lock, 90 * 60, wait_seconds=30, poll_seconds=1) is True
+    assert calls["n"] == 2 and lock.read_text() == str(os.getpid())
+
+
+def test_acquire_lock_wait_gives_up_after_the_wait_and_never_overwrites_a_live_holder(tmp_path):
+    lock = tmp_path / "some.lock"
+    lock.write_text(str(os.getpid()))
+    with patch("job_lock.time.sleep") as mock_sleep, patch("job_lock.time.monotonic", side_effect=[0.0, 0.0, 10.0, 31.0, 31.0]):
+        assert job_lock.acquire_lock_wait(lock, 90 * 60, wait_seconds=30) is False
+    assert mock_sleep.called and lock.read_text() == str(os.getpid())
+
+
+def test_acquire_lock_wait_takes_over_a_dead_holder_at_once(tmp_path):
+    lock = tmp_path / "some.lock"
+    lock.write_text("999999")
+    with patch("job_lock.pid_is_alive", return_value=False), patch("job_lock.time.sleep") as mock_sleep:
+        assert job_lock.acquire_lock_wait(lock, 90 * 60, wait_seconds=30) is True
+    mock_sleep.assert_not_called()

@@ -43,6 +43,33 @@ researcher_progress.json
 researcher_calibration.json
 researcher_log.txt
 researcher.lock
+ftmo_symbol_mix.json
+trade_audit_enabled.json
+trade_audit_state.json
+trade_audit_log.txt
+trade_audit.lock
 obsidian_vault/
 streamlit_restart_stdout.txt
 streamlit_restart_stderr.txt
+rehunt_ledger.json
+Books/_text/
+Books/*.pdf
+
+# Scratch debug/verification script output, not real project output
+check_mt5_out.txt
+debug_e2e_out.txt
+rr_check_out.txt
+verify_*_out.txt
+
+# The Sentinel (ai/sentinel.py) runtime files
+clerk_sentinel_log.txt
+sentinel_state.json
+clerk_fast_log.txt
+clerk_thinking_cache.json
+clerk_think_log.txt
+mt5_auth_backoff.json
+
+# Continuation Watch (ai/continuation_hunter.py) runtime files
+continuation_watch.lock
+continuation_watch_log.txt
+continuation_watch_state.json

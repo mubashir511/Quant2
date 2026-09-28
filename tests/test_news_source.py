@@ -1,6 +1,12 @@
 from unittest.mock import MagicMock, patch
 
-from data.news_source import fetch_google_news, fetch_recent_headlines, fetch_recent_news, fetch_rss_feed
+from data.news_source import (
+    fetch_article_text,
+    fetch_google_news,
+    fetch_recent_headlines,
+    fetch_recent_news,
+    fetch_rss_feed,
+)
 
 
 def _rss_response(items_xml: str, channel_title: str = "") -> MagicMock:
@@ -79,8 +85,38 @@ def test_fetch_recent_news_keeps_summary_source_and_published(mock_ticker_cls):
             "summary": "A real, genuine article summary.",
             "source": "Reuters",
             "published": "2026-09-14T00:00:00Z",
+            "link": "",
         }
     ]
+
+
+@patch("yfinance.Ticker")
+def test_fetch_recent_news_extracts_the_real_article_link(mock_ticker_cls):
+    mock_ticker = MagicMock()
+    mock_ticker.news = [
+        {
+            "content": {
+                "title": "Gold rallies on rate cut bets",
+                "canonicalUrl": {"url": "https://example.com/gold-rallies"},
+            }
+        }
+    ]
+    mock_ticker_cls.return_value = mock_ticker
+
+    result = fetch_recent_news("GC=F", limit=2)
+    assert result[0]["link"] == "https://example.com/gold-rallies"
+
+
+@patch("yfinance.Ticker")
+def test_fetch_recent_news_falls_back_to_click_through_url(mock_ticker_cls):
+    mock_ticker = MagicMock()
+    mock_ticker.news = [
+        {"content": {"title": "Gold rallies", "clickThroughUrl": {"url": "https://example.com/click"}}}
+    ]
+    mock_ticker_cls.return_value = mock_ticker
+
+    result = fetch_recent_news("GC=F", limit=2)
+    assert result[0]["link"] == "https://example.com/click"
 
 
 @patch("yfinance.Ticker")
@@ -90,7 +126,7 @@ def test_fetch_recent_news_falls_back_to_flat_title_and_empty_fields(mock_ticker
     mock_ticker_cls.return_value = mock_ticker
 
     result = fetch_recent_news("GC=F", limit=2)
-    assert result == [{"title": "Flat-format headline", "summary": "", "source": "", "published": ""}]
+    assert result == [{"title": "Flat-format headline", "summary": "", "source": "", "published": "", "link": ""}]
 
 
 @patch("yfinance.Ticker")
@@ -142,6 +178,7 @@ def test_fetch_google_news_uses_the_real_source_element_when_present(mock_urlope
             "summary": "",
             "source": "DailyForex",
             "published": "Fri, 11 Sep 2026 06:22:51 GMT",
+            "link": "",
         }
     ]
 
@@ -150,7 +187,18 @@ def test_fetch_google_news_uses_the_real_source_element_when_present(mock_urlope
 def test_fetch_google_news_splits_title_dash_source_when_no_source_element(mock_urlopen):
     mock_urlopen.return_value = _rss_response("<item><title>Gold rallies on rate cut bets - Reuters</title></item>")
     result = fetch_google_news("gold price", limit=5)
-    assert result == [{"title": "Gold rallies on rate cut bets", "summary": "", "source": "Reuters", "published": ""}]
+    assert result == [
+        {"title": "Gold rallies on rate cut bets", "summary": "", "source": "Reuters", "published": "", "link": ""}
+    ]
+
+
+@patch("urllib.request.urlopen")
+def test_fetch_google_news_extracts_the_real_article_link(mock_urlopen):
+    mock_urlopen.return_value = _rss_response(
+        "<item><title>USD/CHF Signal</title><link>https://example.com/usdchf</link></item>"
+    )
+    result = fetch_google_news("USDCHF forex", limit=5)
+    assert result[0]["link"] == "https://example.com/usdchf"
 
 
 @patch("urllib.request.urlopen")
@@ -195,8 +243,32 @@ def test_fetch_rss_feed_keeps_the_real_description_as_summary(mock_urlopen):
             "summary": "Bitcoin rose above $77,000 as AI safety concerns weigh on stocks.",
             "source": "CoinDesk",
             "published": "Mon, 14 Sep 2026 08:07:16 +0000",
+            "link": "",
         }
     ]
+
+
+@patch("urllib.request.urlopen")
+def test_fetch_rss_feed_extracts_the_real_article_link(mock_urlopen):
+    mock_urlopen.return_value = _rss_response(
+        "<item><title>Bitcoin bucks tech selloff</title><link>https://coindesk.com/btc</link></item>",
+        channel_title="CoinDesk",
+    )
+    result = fetch_rss_feed("https://www.coindesk.com/arc/outboundfeeds/rss/", limit=5)
+    assert result[0]["link"] == "https://coindesk.com/btc"
+
+
+@patch("urllib.request.urlopen")
+def test_fetch_rss_feed_strips_html_markup_from_the_summary(mock_urlopen):
+    mock_urlopen.return_value = _rss_response(
+        "<item><title>Bitcoin bucks tech selloff</title>"
+        "<description>&lt;p&gt;Bitcoin rose above $77,000&lt;/p&gt;&lt;p&gt;as AI concerns weighed.&lt;/p&gt;</description></item>",
+        channel_title="CoinDesk",
+    )
+    result = fetch_rss_feed("https://www.coindesk.com/arc/outboundfeeds/rss/", limit=5)
+    assert "<p>" not in result[0]["summary"]
+    assert "Bitcoin rose above $77,000" in result[0]["summary"]
+    assert "as AI concerns weighed." in result[0]["summary"]
 
 
 @patch("urllib.request.urlopen")
@@ -212,6 +284,7 @@ def test_fetch_rss_feed_leaves_summary_empty_when_feed_has_no_description(mock_u
             "summary": "",
             "source": "Commodities Analysis & Opinion",
             "published": "",
+            "link": "",
         }
     ]
 
@@ -252,3 +325,48 @@ def test_fetch_rss_feed_returns_empty_list_on_malformed_xml(mock_urlopen):
     response.__enter__.return_value.read.return_value = b"not xml at all"
     mock_urlopen.return_value = response
     assert fetch_rss_feed("https://example.com/rss") == []
+
+
+# --- fetch_article_text: real full-article extraction --------------------
+
+
+def _html_page(*paragraphs: str) -> str:
+    body = "".join(f"<p>{p}</p>" for p in paragraphs)
+    return f"<html><body><nav>Home</nav>{body}<footer>Copyright</footer></body></html>"
+
+
+@patch("requests.get")
+def test_fetch_article_text_extracts_real_paragraphs(mock_get):
+    mock_get.return_value = MagicMock(
+        text=_html_page(
+            "Gold prices rallied sharply on Tuesday as investors priced in a growing chance of a rate cut.",
+            "Analysts at several major banks raised their year-end targets in response to the move.",
+        ),
+        status_code=200,
+    )
+    mock_get.return_value.raise_for_status = lambda: None
+    result = fetch_article_text("https://example.com/article")
+    assert "Gold prices rallied sharply" in result
+    assert "Analysts at several major banks" in result
+
+
+@patch("requests.get")
+def test_fetch_article_text_drops_short_boilerplate_paragraphs(mock_get):
+    mock_get.return_value = MagicMock(text=_html_page("Home", "Ad"), status_code=200)
+    mock_get.return_value.raise_for_status = lambda: None
+    result = fetch_article_text("https://example.com/article")
+    assert result == ""
+
+
+@patch("requests.get", side_effect=RuntimeError("network down"))
+def test_fetch_article_text_returns_empty_string_on_failure(mock_get):
+    assert fetch_article_text("https://example.com/article") == ""
+
+
+def test_fetch_article_text_caps_at_max_chars():
+    long_paragraph = "This is a real sentence about markets. " * 200
+    with patch("requests.get") as mock_get:
+        mock_get.return_value = MagicMock(text=_html_page(long_paragraph), status_code=200)
+        mock_get.return_value.raise_for_status = lambda: None
+        result = fetch_article_text("https://example.com/article", max_chars=100)
+    assert len(result) == 100

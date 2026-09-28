@@ -46,7 +46,7 @@ from ai.clerk_execution import (
     read_execution_state,
     run_clerk_execution_check,
 )
-from job_lock import acquire_lock, release_lock
+from job_lock import acquire_lock_wait, release_lock
 from utils import run_with_timeout
 
 _LOG_PATH = Path(__file__).resolve().parent / "clerk_execution_log.txt"
@@ -78,7 +78,7 @@ def main() -> None:
     if not is_execution_due(now_utc, state=state):
         return
 
-    if not acquire_lock(_LOCK_PATH, _LOCK_STALE_AFTER_SECONDS):
+    if not acquire_lock_wait(_LOCK_PATH, _LOCK_STALE_AFTER_SECONDS, config.CLERK_LOCK_WAIT_SECONDS):
         return
     try:
         logger.info("Due — running the Execution Clerk check (now=%s UTC).", now_utc)

@@ -1,5 +1,7 @@
 from datetime import datetime
 
+import pytest
+
 from ai.chart_overlay import OverlaySymbolInputs, build_overlay_lines, write_chart_overlay
 from analysis.chart_structure import (
     ChartPattern,
@@ -44,6 +46,12 @@ def test_build_overlay_lines_empty_structure_and_no_position_produces_nothing():
     assert build_overlay_lines(inputs) == []
 
 
+def _level_field(line: str, index: int) -> str:
+    """LEVEL wire format (updated 2026-09-20, real band not a tolerance-
+    derived symmetric guess): LEVEL|symbol|low|high|side|label."""
+    return line.split("|")[index]
+
+
 def test_build_overlay_lines_sr_levels_labeled_by_timeframe_and_kind():
     structure = ChartStructureSnapshot(
         fibonacci=None,
@@ -56,11 +64,14 @@ def test_build_overlay_lines_sr_levels_labeled_by_timeframe_and_kind():
     )
     inputs = OverlaySymbolInputs(symbol="XAUUSD", h4_structure=structure)
     lines = build_overlay_lines(inputs)
-    resistance = next(l for l in lines if l.startswith("LEVEL|XAUUSD|2050|resistance"))
-    support = next(l for l in lines if l.startswith("LEVEL|XAUUSD|1980|support"))
-    assert resistance.endswith("|0.3")
+    resistance = next(l for l in lines if l.startswith("LEVEL|XAUUSD|") and "|resistance|" in l)
+    support = next(l for l in lines if l.startswith("LEVEL|XAUUSD|") and "|support|" in l)
+    # No real low/high on these fixtures — falls back to the tolerance-
+    # derived symmetric zone around the bare price (default tolerance
+    # 0.3%), straddling the original single price on both sides.
+    assert float(_level_field(resistance, 2)) < 2050.0 < float(_level_field(resistance, 3))
+    assert float(_level_field(support, 2)) < 1980.0 < float(_level_field(support, 3))
     assert "H4" in resistance and "3x" in resistance
-    assert support.endswith("|0.3")
     assert "H4" in support and "5x" in support
 
 
@@ -72,7 +83,9 @@ def test_build_overlay_lines_uses_the_real_tolerance_actually_used_not_the_flat_
     # instrument's own ATR% for a fast mover (confirmed live: up to 0.9%
     # on INTC) — the terminal overlay was silently drawing a NARROWER
     # zone than what Python actually used to decide these were "the same
-    # level." SRLevelsResult.tolerance_pct now carries the REAL value.
+    # level." SRLevelsResult.tolerance_pct now carries the REAL value,
+    # used here (2026-09-20) only as the symmetric-zone FALLBACK for a
+    # level with no real low/high band of its own yet.
     structure = ChartStructureSnapshot(
         fibonacci=None,
         sr_levels=SRLevelsResult(
@@ -85,9 +98,13 @@ def test_build_overlay_lines_uses_the_real_tolerance_actually_used_not_the_flat_
     )
     inputs = OverlaySymbolInputs(symbol="XAUUSD", h4_structure=structure)
     lines = build_overlay_lines(inputs)
-    resistance = next(l for l in lines if l.startswith("LEVEL|XAUUSD|2050|resistance"))
-    assert resistance.endswith("|0.9")
-    assert not resistance.endswith("|0.3")
+    resistance = next(l for l in lines if l.startswith("LEVEL|XAUUSD|") and "|resistance|" in l)
+    half_width_09 = 2050.0 * 0.9 / 100.0
+    half_width_03 = 2050.0 * 0.3 / 100.0
+    low, high = float(_level_field(resistance, 2)), float(_level_field(resistance, 3))
+    assert low == pytest.approx(2050.0 - half_width_09)
+    assert high == pytest.approx(2050.0 + half_width_09)
+    assert low != pytest.approx(2050.0 - half_width_03)
 
 
 def test_build_overlay_lines_flags_liquidity_pool_levels_in_the_exported_label():
@@ -102,10 +119,33 @@ def test_build_overlay_lines_flags_liquidity_pool_levels_in_the_exported_label()
     )
     inputs = OverlaySymbolInputs(symbol="XAUUSD", h4_structure=structure)
     lines = build_overlay_lines(inputs)
-    resistance = next(l for l in lines if l.startswith("LEVEL|XAUUSD|2050|resistance"))
-    support = next(l for l in lines if l.startswith("LEVEL|XAUUSD|1980|support"))
+    resistance = next(l for l in lines if l.startswith("LEVEL|XAUUSD|") and "|resistance|" in l)
+    support = next(l for l in lines if l.startswith("LEVEL|XAUUSD|") and "|support|" in l)
     assert "[LIQUIDITY POOL]" in resistance
     assert "[LIQUIDITY POOL]" not in support
+
+
+def test_build_overlay_lines_sr_level_uses_the_real_band_when_available():
+    # Real gap found 2026-09-20, direct user challenge: a level with a
+    # real, usually-asymmetric clustered band (SRLevel.low/.high) must
+    # export THAT exact band, not a tolerance-derived symmetric guess
+    # around the mean price.
+    structure = ChartStructureSnapshot(
+        fibonacci=None,
+        sr_levels=SRLevelsResult(
+            resistance_levels=[
+                SRLevel(price=2050.0, touches=3, distance_pct=2.5, low=2048.0, high=2053.0, weighted_score=2.1)
+            ],
+            support_levels=[],
+        ),
+        trendlines=None,
+        patterns=[],
+    )
+    inputs = OverlaySymbolInputs(symbol="XAUUSD", h4_structure=structure)
+    lines = build_overlay_lines(inputs)
+    resistance = next(l for l in lines if l.startswith("LEVEL|XAUUSD|") and "|resistance|" in l)
+    assert float(_level_field(resistance, 2)) == pytest.approx(2048.0)
+    assert float(_level_field(resistance, 3)) == pytest.approx(2053.0)
 
 
 def test_build_overlay_lines_caps_sr_levels_per_side():

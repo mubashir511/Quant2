@@ -1,10 +1,12 @@
 import csv
 import functools
+import json
 import logging
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
 
@@ -147,6 +149,21 @@ class ContractSpec:
     trade_contract_size: float
     currency_margin: str
     margin_initial: float  # margin required for 1.0 lot, in currency_margin
+    # Account-currency P&L of a one-price-unit move on 1.0 lot, from MT5's own tick value / tick size. None when
+    # unavailable (CSV fallback, older specs) — risk_per_price_unit then falls back to trade_contract_size, which
+    # is exactly right for a USD-quoted instrument on a USD account.
+    money_per_price_unit: float | None = None
+
+    @property
+    def risk_per_price_unit(self) -> float:
+        """What every lot-sizing / risk-% formula must multiply a stop distance by. trade_contract_size is the
+        P&L per price unit in the instrument's own QUOTE currency, so it is only correct when that is the account
+        currency: measured 2026-09-25 on this account, USDJPY (JPY quote) is 0.0063 of it — its risk was overstated
+        ~159x, so a 0.01-lot USDJPY trade looked like 1.63% risk (Mega excluded it as "mechanically untradeable") —
+        and LVMH (EUR quote) 1.137x, understating its risk."""
+        if self.money_per_price_unit and self.money_per_price_unit > 0:
+            return self.money_per_price_unit
+        return self.trade_contract_size
 
 
 class MT5ConnectionError(RuntimeError):
@@ -154,6 +171,45 @@ class MT5ConnectionError(RuntimeError):
 
 
 @_serialize_mt5_access
+def _attach_without_login(mt5, path, login, server) -> bool:
+    """True when the running terminal is ALREADY logged in to the requested account: attach to it WITHOUT sending credentials.
+    Every credentialed mt5.initialize() makes the terminal authorize again with the broker, and this app runs many short-lived
+    processes (the fast lane and the Sentinel every minute, the thinker, the regular poll, the web app): 2026-09-26 the terminal
+    started answering "Authorization failed" for every login. A plain attach costs the broker nothing."""
+    try:
+        if not mt5.initialize(**({"path": path} if path else {})):
+            return False
+        info = mt5.account_info()
+        return bool(
+            info is not None and info.login == int(login) and (not server or str(server).lower() == str(info.server).lower())
+        )
+    except Exception:  # noqa: BLE001 - any doubt: fall back to the full login below
+        return False
+
+
+def _auth_backoff_until() -> datetime | None:
+    try:
+        until = datetime.fromisoformat(json.loads(Path(config.MT5_AUTH_BACKOFF_FILE).read_text())["until_utc"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return until if until > datetime.now(timezone.utc) else None
+
+
+def _set_auth_backoff() -> None:
+    until = datetime.now(timezone.utc) + timedelta(minutes=config.MT5_AUTH_BACKOFF_MINUTES)
+    try:
+        Path(config.MT5_AUTH_BACKOFF_FILE).write_text(json.dumps({"until_utc": until.isoformat()}))
+    except OSError:
+        pass
+
+
+def _clear_auth_backoff() -> None:
+    try:
+        Path(config.MT5_AUTH_BACKOFF_FILE).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def connect(
     login: str | int | None = None,
     password: str | None = None,
@@ -195,12 +251,27 @@ def connect(
     if server:
         kwargs["server"] = server
 
+    if login and _attach_without_login(mt5, path, login, server):
+        _clear_auth_backoff()
+        return
+
+    backoff_until = _auth_backoff_until()
+    if backoff_until is not None:
+        raise MT5ConnectionError(
+            "The MT5 terminal rejected the login (Authorization failed) a moment ago; not retrying until "
+            f"{backoff_until.strftime('%H:%M')} UTC so the broker is not hammered with logins. Open the terminal and check "
+            "that it is logged in - once it is, the app reconnects at once."
+        )
+
     if not mt5.initialize(**kwargs):
         error = mt5.last_error()
+        if error and error[0] == -6:  # Authorization failed
+            _set_auth_backoff()
         raise MT5ConnectionError(
             f"Could not connect to the MT5 terminal ({error}). "
             "Make sure the terminal is running and logged in."
         )
+    _clear_auth_backoff()
 
     if login:
         info = mt5.account_info()
@@ -475,6 +546,23 @@ def get_current_bid_ask(symbol: str) -> tuple[float, float] | None:
 
 
 @_serialize_mt5_access
+def get_last_tick_epochs(symbols: list[str]) -> dict[str, int | None]:
+    """{symbol: broker-clock epoch seconds of its LAST tick, or None when it has no tick}. One serialized MT5 pass - used to
+    tell an instrument that is trading right now from one whose market is closed (its last tick is hours old)."""
+    import MetaTrader5 as mt5
+
+    out: dict[str, int | None] = {}
+    for symbol in symbols:
+        try:
+            _ensure_symbol_selected(mt5, symbol)
+            tick = mt5.symbol_info_tick(symbol)
+            out[symbol] = int(tick.time) if tick is not None and tick.time > 0 else None
+        except Exception:  # noqa: BLE001 - one unreadable symbol never blocks the rest
+            out[symbol] = None
+    return out
+
+
+@_serialize_mt5_access
 def get_server_time_offset(symbol: str = "EURUSD") -> timedelta | None:
     """How far ahead of (or behind) this machine's true UTC clock the
     connected MT5 broker's own server clock currently is — computed
@@ -537,6 +625,47 @@ def get_account_summary() -> AccountSummary:
 
 
 @_serialize_mt5_access
+def read_ftmo_symbol_mix() -> list[str] | None:
+    """The explicit, persistent symbol allowlist get_market_watch() below
+    filters through — None (not an empty list) on a missing/corrupt file,
+    genuinely different from "the user configured an empty mix": None
+    means "no filter configured yet, show everything visible" (this
+    function's pre-existing, unchanged behavior), while an empty list
+    would mean "the user deliberately wants zero symbols considered."
+    See config.FTMO_SYMBOL_MIX_FILE's own comment for why this exists at
+    all — Market Watch's own "visible" flag isn't a stable enough signal
+    on its own."""
+    path = Path(config.FTMO_SYMBOL_MIX_FILE)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    symbols = data.get("symbols")
+    if not isinstance(symbols, list) or not all(isinstance(s, str) for s in symbols):
+        return None
+    return symbols
+
+
+def set_ftmo_symbol_mix(symbols: list[str] | None) -> None:
+    """Persists the explicit symbol allowlist — `None` (or an empty list)
+    clears the file entirely, reverting get_market_watch() to its
+    original "show everything visible" behavior, same as it never having
+    been set."""
+    path = Path(config.FTMO_SYMBOL_MIX_FILE)
+    if not symbols:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning("Could not remove symbol-mix file %s: %s", config.FTMO_SYMBOL_MIX_FILE, e)
+        return
+    try:
+        path.write_text(json.dumps({"symbols": symbols}))
+    except OSError as e:
+        logger.warning("Could not write symbol-mix file %s: %s", config.FTMO_SYMBOL_MIX_FILE, e)
+
+
 def get_market_watch() -> list[MarketAsset]:
     """Tradable instruments the user has added to their MT5 Market Watch.
 
@@ -550,7 +679,35 @@ def get_market_watch() -> list[MarketAsset]:
     dropped (no tick, or a zero bid/ask) is now logged — previously a
     silent `continue`, indistinguishable from "not visible" or "correctly
     excluded," with no way to tell how many symbols this was actually
-    happening to."""
+    happening to.
+
+    Also filters through read_ftmo_symbol_mix()'s own explicit allowlist
+    when one is configured (see config.FTMO_SYMBOL_MIX_FILE's own comment
+    for the real incident this closes: Market Watch's own "visible" flag
+    kept getting silently repopulated with old symbols — by the broker's
+    own terminal on login, and separately by any code path merely reading
+    a symbol's live data by name — so it can't be trusted alone to mean
+    "the symbols this account has actually chosen to trade").
+
+    Real gap found live 2026-09-20, direct user report (Researcher's own
+    run that day only covered 8 of the 20 configured mix symbols):
+    filtering by `s.visible` FIRST, before ever attempting to select an
+    allowlisted symbol, meant a symbol genuinely IN the mix but not
+    currently shown in MT5's own Market Watch window was silently
+    dropped before _ensure_symbol_selected ever got a chance to add it —
+    "visible" reflects the terminal's own history, which config.
+    FTMO_SYMBOL_MIX_FILE's own docstring already establishes can't be
+    trusted. Fixed: when an allowlist is configured, this now iterates
+    the allowlist directly and force-selects EVERY one of its symbols
+    (mt5.symbol_select genuinely adds a symbol to Market Watch even if
+    it wasn't visible before, as long as the broker actually offers it),
+    so the account's own configured mix is authoritative — a symbol only
+    ever gets dropped for a real reason (no live tick right now, or the
+    broker doesn't offer it at all), never merely for not having been
+    visible in the terminal already. Falls back to filtering by
+    `s.visible` only when no allowlist is configured at all (matches the
+    plain "whatever's in Market Watch" contract this function's own name
+    promises for that case)."""
     import MetaTrader5 as mt5
 
     symbols = mt5.symbols_get()
@@ -558,23 +715,27 @@ def get_market_watch() -> list[MarketAsset]:
         error = mt5.last_error()
         raise MT5ConnectionError(f"Failed to fetch symbols ({error}).")
 
+    allowlist = read_ftmo_symbol_mix()
+
+    if allowlist is not None:
+        known = {s.name: s.description for s in symbols}
+        candidates = [(name, known.get(name, "")) for name in allowlist]
+    else:
+        candidates = [(s.name, s.description) for s in symbols if s.visible]
+
     assets = []
     dropped = []
-    for s in symbols:
-        if not s.visible:
-            continue
-        _ensure_symbol_selected(mt5, s.name)
-        tick = mt5.symbol_info_tick(s.name)
+    for name, description in candidates:
+        _ensure_symbol_selected(mt5, name)
+        tick = mt5.symbol_info_tick(name)
         if tick is None or (tick.bid == 0 and tick.ask == 0):
-            dropped.append(s.name)
+            dropped.append(name)
             continue  # no live quote right now
-        assets.append(
-            MarketAsset(symbol=s.name, description=s.description, bid=tick.bid, ask=tick.ask)
-        )
+        assets.append(MarketAsset(symbol=name, description=description, bid=tick.bid, ask=tick.ask))
 
     if dropped:
         logger.warning(
-            "get_market_watch: %d visible symbol(s) dropped for missing/zero tick: %s",
+            "get_market_watch: %d configured symbol(s) dropped for missing/zero tick: %s",
             len(dropped), ", ".join(dropped),
         )
     return assets
@@ -637,6 +798,25 @@ def _compute_margin_via_order_calc(symbol: str) -> float:
         )
         return 0.0
     return margin
+
+
+def _money_per_price_unit(info) -> float | None:
+    """Account-currency P&L of a one-price-unit move on 1.0 lot: MT5's own loss-side tick value over the tick size
+    (both already in the deposit currency). Snapped to trade_contract_size when they agree to 1e-6 so a USD-quoted
+    instrument keeps its exact, float-clean number (1/0.01 must not become 100.00000000000001 and shift a lot
+    rounding). None on any missing/non-positive input — never a guess."""
+    try:
+        tick_size = float(info.trade_tick_size)
+        tick_value = float(getattr(info, "trade_tick_value_loss", 0.0) or getattr(info, "trade_tick_value", 0.0))
+        contract = float(info.trade_contract_size)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if tick_size <= 0 or tick_value <= 0:
+        return None
+    money = tick_value / tick_size
+    if contract > 0 and abs(money / contract - 1.0) < 1e-6:
+        return contract
+    return money
 
 
 @_serialize_mt5_access
@@ -708,6 +888,7 @@ def get_contract_spec(symbol: str) -> ContractSpec | None:
                 trade_contract_size=info.trade_contract_size,
                 currency_margin=info.currency_margin,
                 margin_initial=margin_initial,
+                money_per_price_unit=_money_per_price_unit(info),
             )
         except AttributeError as e:
             logger.warning("mt5.symbol_info(%s) returned an incomplete object: %s", symbol, e)
@@ -932,13 +1113,78 @@ def group_closed_trades(deals: list[HistoricalDeal]) -> list[ClosedTrade]:
     return trades
 
 
-_MT5_TIMEFRAMES = ("H1", "H4", "D1", "MN1")
+# M5/M15 added 2026-09-17 — real, direct-from-broker intraday bars for
+# ai.ftmo_suggest's own intraday-calibrated backtest evidence (see
+# config.M15_BACKTEST_BARS). Originally assumed unavailable in this MT5
+# Python package; live-verified otherwise (both the installed and latest
+# PyPI builds genuinely expose TIMEFRAME_M1 through TIMEFRAME_M30, and
+# copy_rates_from_pos returns real, deep history for them — M15 back
+# 1.5-5.8 years and M5 back 8 months-2.6 years, confirmed live across
+# Forex/Metals/Indices/Crypto/Equities). H1/H4/D1/MN1 were simply this
+# codebase's own earlier subset, not a platform limit.
+_MT5_TIMEFRAMES = ("M5", "M15", "H1", "H4", "D1", "MN1")
+
+
+_BAR_SECONDS = {"M5": 300, "M15": 900, "H1": 3600, "H4": 14400}
+_STALE_BARS_RETRIES = 3
+_STALE_BARS_RETRY_SLEEP_SECONDS = 0.6
+
+
+def _refetch_if_stale(mt5, symbol: str, mt5_timeframe, timeframe: str, count: int, rates):
+    """Real, live-verified gotcha (2026-09-24, broker FTMO demo): the FIRST
+    copy_rates_from_pos call for a symbol/timeframe in a freshly-started
+    process can return a STALE cached history — USDJPY M5 came back ending at
+    the previous day's 16:10 while its live tick was 17 hours newer; the very
+    next call returned current bars. A Mega Session job or Clerk poll running as
+    a cold process would silently analyze yesterday's M5/M15 structure.
+
+    Detected by comparing the newest bar to the symbol's own newest TICK (both
+    on the broker's server clock, so no timezone assumption): bars are only
+    ever created by ticks, so the last bar can never legitimately trail the last
+    tick by more than one bar width — more than two is stale, and the call is
+    retried after a short wait. A genuinely closed market (weekend, equity
+    after hours) has a stale tick too, so its bars are never flagged. Only the
+    intraday timeframes are checked; any failure here just returns the bars as
+    fetched. Persistently stale bars after the retries are logged, not hidden."""
+    bar_seconds = _BAR_SECONDS.get(timeframe)
+    if bar_seconds is None:
+        return rates
+    for attempt in range(_STALE_BARS_RETRIES):
+        try:
+            if rates is None or len(rates) == 0:
+                return rates
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None or not tick.time:
+                return rates
+            lag_seconds = int(tick.time) - int(rates[-1]["time"])
+            if lag_seconds <= 2 * bar_seconds:
+                return rates
+            logger.info(
+                "fetch_mt5_price_history(%s, %s): newest bar trails the live tick by %.1fh (attempt %d) — "
+                "stale cached bars, retrying.", symbol, timeframe, lag_seconds / 3600, attempt + 1,
+            )
+            time.sleep(_STALE_BARS_RETRY_SLEEP_SECONDS)
+            rates = mt5.copy_rates_from_pos(symbol, mt5_timeframe, 0, count)
+        except Exception:
+            return rates
+    try:
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is not None and tick.time and rates is not None and len(rates) and (
+            int(tick.time) - int(rates[-1]["time"]) > 2 * bar_seconds
+        ):
+            logger.warning(
+                "fetch_mt5_price_history(%s, %s): bars still trail the live tick after %d retries.",
+                symbol, timeframe, _STALE_BARS_RETRIES,
+            )
+    except Exception:
+        pass
+    return rates
 
 
 @_serialize_mt5_access
 def fetch_mt5_price_history(symbol: str, timeframe: str, count: int = 300) -> pd.DataFrame:
-    """Real OHLCV bars for `symbol` at `timeframe` ("H1"/"H4"/"D1"/"MN1"),
-    fetched directly from the currently-connected MT5 terminal's own
+    """Real OHLCV bars for `symbol` at `timeframe` ("M5"/"M15"/"H1"/"H4"/
+    "D1"/"MN1"), fetched directly from the currently-connected MT5 terminal's own
     price feed — the broker's real data for the exact symbol, not a
     best-effort external ticker match the way PMEX's Yahoo-based
     enrichment needs (see data/underlying.py). Shaped into the same
@@ -964,6 +1210,8 @@ def fetch_mt5_price_history(symbol: str, timeframe: str, count: int = 300) -> pd
     import MetaTrader5 as mt5
 
     mt5_timeframe = {
+        "M5": mt5.TIMEFRAME_M5,
+        "M15": mt5.TIMEFRAME_M15,
         "H1": mt5.TIMEFRAME_H1,
         "H4": mt5.TIMEFRAME_H4,
         "D1": mt5.TIMEFRAME_D1,
@@ -972,6 +1220,7 @@ def fetch_mt5_price_history(symbol: str, timeframe: str, count: int = 300) -> pd
 
     _ensure_symbol_selected(mt5, symbol)
     rates = mt5.copy_rates_from_pos(symbol, mt5_timeframe, 0, count)
+    rates = _refetch_if_stale(mt5, symbol, mt5_timeframe, timeframe, count, rates)
     if rates is None or len(rates) == 0:
         error = mt5.last_error()
         logger.warning(
@@ -1032,6 +1281,8 @@ def fetch_mt5_price_history_range(
     import MetaTrader5 as mt5
 
     mt5_timeframe = {
+        "M5": mt5.TIMEFRAME_M5,
+        "M15": mt5.TIMEFRAME_M15,
         "H1": mt5.TIMEFRAME_H1,
         "H4": mt5.TIMEFRAME_H4,
         "D1": mt5.TIMEFRAME_D1,
@@ -1127,7 +1378,9 @@ def _compute_swap_pct_per_day(info, price: float) -> tuple[float | None, float |
         if info.trade_tick_size <= 0 or info.trade_contract_size <= 0:
             return None, None
         point_value = info.trade_tick_value * (info.point / info.trade_tick_size)
-        notional = info.trade_contract_size * price
+        # Notional in ACCOUNT currency (point_value above is), not in the quote currency: for a JPY-quoted
+        # USDJPY, contract_size * price is ~159x the real notional and understated the swap % by that factor.
+        notional = (_money_per_price_unit(info) or info.trade_contract_size) * price
         if notional <= 0:
             return None, None
         return (

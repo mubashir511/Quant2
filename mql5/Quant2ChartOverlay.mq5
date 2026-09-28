@@ -1,3 +1,4 @@
+
 //+------------------------------------------------------------------+
 //| Quant2ChartOverlay.mq5                                            |
 //|                                                                    |
@@ -559,11 +560,15 @@ void DrawHardLine(const string objBase, const double price, const color clr, con
 // pass across the WHOLE symbol rather than one zone at a time, is what
 // actually guarantees borders/lines end up visually on top of every
 // fill, not just their own.
-void DrawLevelZoneFill(const string objBase, const double price, const double tolerancePct, const color clr)
+// low/high are now the REAL asymmetric cluster band computed by
+// analysis/chart_structure.py's own SRLevel.low/.high (added 2026-09-20,
+// direct user challenge: this used to derive a symmetric zone from
+// price +/- tolerancePct, which is only ever an approximation of the
+// real, usually-asymmetric band the swing points actually clustered
+// into). Callers pass the real low/high straight through -- no
+// tolerance-based reconstruction here anymore.
+void DrawLevelZoneFill(const string objBase, const double low, const double high, const color clr)
   {
-   double halfWidth = price * tolerancePct / 100.0;
-   double low = price - halfWidth;
-   double high = price + halfWidth;
    datetime t1 = iTime(_Symbol, PERIOD_CURRENT, 60);
    datetime t2 = TimeCurrent() + PeriodSeconds(PERIOD_CURRENT) * 10;
    DrawTransparentRect(objBase + "_fill", low, high, t1, t2, clr, ZONE_FILL_ALPHA);
@@ -580,11 +585,9 @@ void DrawLevelZoneFill(const string objBase, const double price, const double to
 // user feedback: per-region labels made the chart "messy and
 // unprofessional" (see DrawLegendPanel for the one-time color key
 // instead); the full detail still surfaces on hover via OBJPROP_TOOLTIP.
-void DrawLevelZoneBorder(const string objBase, const double price, const double tolerancePct, const color clr, const string label)
+// Same real-band change as DrawLevelZoneFill above.
+void DrawLevelZoneBorder(const string objBase, const double low, const double high, const color clr, const string label)
   {
-   double halfWidth = price * tolerancePct / 100.0;
-   double low = price - halfWidth;
-   double high = price + halfWidth;
    datetime t1 = iTime(_Symbol, PERIOD_CURRENT, 60);
    datetime t2 = TimeCurrent() + PeriodSeconds(PERIOD_CURRENT) * 10;
    string rectName = objBase + "_zone";
@@ -1034,9 +1037,9 @@ void RefreshOverlay()
 
       if(recType == "LEVEL" && n >= 6)
         {
-         double price = StringToDouble(parts[2]);
-         double tolerancePct = StringToDouble(parts[5]);
-         DrawLevelZoneFill(objName, price, tolerancePct, LevelColor(parts[3]));
+         double low  = StringToDouble(parts[2]);
+         double high = StringToDouble(parts[3]);
+         DrawLevelZoneFill(objName, low, high, LevelColor(parts[4]));
         }
       else if(recType == "FIBO" && n >= 7)
         {
@@ -1100,9 +1103,10 @@ void RefreshOverlay()
 
       if(recType == "LEVEL" && n >= 6)
         {
-         double price = StringToDouble(parts[2]);
-         double tolerancePct = StringToDouble(parts[5]);
-         DrawLevelZoneBorder(objName, price, tolerancePct, LevelColor(parts[3]), parts[4]);
+         double low   = StringToDouble(parts[2]);
+         double high  = StringToDouble(parts[3]);
+         string label = parts[5];
+         DrawLevelZoneBorder(objName, low, high, LevelColor(parts[4]), label);
         }
       else if(recType == "FIBO" && n >= 7)
         {

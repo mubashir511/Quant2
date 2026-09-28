@@ -6,6 +6,7 @@ import pytest
 from analysis.backtest import (
     ChartPatternBacktest,
     FavorableExcursionStats,
+    LevelReliabilityBacktest,
     RSIReactionBacktest,
     SupportResistanceBacktest,
     _compute_favorable_excursion,
@@ -13,6 +14,7 @@ from analysis.backtest import (
     _summarize_trade_results,
     backtest_beta_stability,
     backtest_chart_pattern_reaction,
+    backtest_level_reliability,
     backtest_momentum_persistence,
     backtest_rsi_reaction,
     backtest_support_resistance_reaction,
@@ -666,6 +668,117 @@ def test_backtest_support_resistance_reaction_attaches_per_side_excursion_stats(
     assert result.support_excursion.sample_size >= 5
     assert result.resistance_excursion is not None
     assert result.resistance_excursion.sample_size >= 5
+
+
+# --- backtest_level_reliability ---
+# Reuses the same 40-cycle/12-day-period sine wave as the S/R-reaction
+# tests above (oscillates cleanly between ~95 and ~105) — a real band
+# tight around the trough (94.5-95.5) or the peak (104.5-105.5) gets 40
+# genuine historical touches, each one confirmed empirically (see the
+# session's verification script) to hold every single time within a
+# 5-bar window, well before the fixed ATR stop/target is threatened.
+
+
+def _level_reliability_ohlc() -> pd.DataFrame:
+    n_cycles, period = 40, 12
+    prices = [100.0 + 5.0 * math.sin(2 * math.pi * k / period) for k in range(n_cycles * period)]
+    return _make_ohlc(_make_series(prices), pad_pct=0.0005)
+
+
+def test_backtest_level_reliability_counts_holds_and_breaks_for_a_specific_band():
+    ohlc = _level_reliability_ohlc()
+    result = backtest_level_reliability(
+        ohlc, level_price=95.0, level_low=94.5, level_high=95.5, side="support",
+        max_holding_bars=5, min_tests=5,
+    )
+    assert result is not None
+    assert result.tests == 40
+    assert result.holds == 40
+    assert result.breaks == 0
+    assert result.hold_rate_pct == pytest.approx(100.0)
+    assert result.excursion is not None
+    assert result.excursion.sample_size > 0
+
+
+def test_backtest_level_reliability_excludes_a_touch_with_zero_forward_data():
+    # Real bug found on self-review: a touch sitting on the LITERAL LAST
+    # bar of the series has zero forward bars to confirm hold or break —
+    # it used to fall through to "holds" by construction (the inner loop
+    # never runs, so `broke` stays False), silently fabricating support
+    # for the hold rate from the one touch with no real evidence behind
+    # it. 5 clean, fully-resolved holds plus one final untested touch (a
+    # 6th test) must report holds=5 (matching `trades`, which _simulate_
+    # trades already correctly excludes this same position from), not 6.
+    prices = [100.0] * 20
+    for _ in range(5):
+        prices += [95.0, 100.0] + [100.0] * 15
+    prices += [95.0]  # one more touch, zero bars after it
+    ohlc = _make_ohlc(_make_series(prices), pad_pct=0.0005)
+    result = backtest_level_reliability(
+        ohlc, level_price=95.0, level_low=94.5, level_high=95.5, side="support",
+        max_holding_bars=10, min_tests=2,
+    )
+    assert result is not None
+    assert result.tests == 6  # the raw touch count still includes it
+    assert result.holds == 5  # but it must not count as a resolved hold
+    assert result.breaks == 0
+    assert result.trades == 5
+
+
+def test_backtest_level_reliability_none_below_min_tests():
+    ohlc = _level_reliability_ohlc()
+    # A near-zero-width band around the same trough still gets touched,
+    # but far fewer times than an unreasonably high min_tests floor.
+    result = backtest_level_reliability(
+        ohlc, level_price=95.0, level_low=94.99, level_high=95.01, side="support",
+        max_holding_bars=5, min_tests=50,
+    )
+    assert result is None
+
+
+def test_backtest_level_reliability_support_bets_long_resistance_bets_short():
+    ohlc = _level_reliability_ohlc()
+    support = backtest_level_reliability(
+        ohlc, level_price=95.0, level_low=94.5, level_high=95.5, side="support",
+        max_holding_bars=5, min_tests=5,
+    )
+    resistance = backtest_level_reliability(
+        ohlc, level_price=105.0, level_low=104.5, level_high=105.5, side="resistance",
+        max_holding_bars=5, min_tests=5,
+    )
+    assert support is not None and resistance is not None
+    # Both sides of a clean, symmetric oscillation should react equally
+    # well when each is bet in its own natural direction.
+    assert support.win_rate_pct == pytest.approx(100.0)
+    assert resistance.win_rate_pct == pytest.approx(100.0)
+    with pytest.raises(ValueError):
+        backtest_level_reliability(ohlc, 95.0, 94.5, 95.5, side="sideways")
+
+
+def test_backtest_level_reliability_respects_broker_min_stop_and_cost():
+    ohlc = _level_reliability_ohlc()
+    baseline = backtest_level_reliability(
+        ohlc, level_price=95.0, level_low=94.5, level_high=95.5, side="support",
+        max_holding_bars=5, min_tests=5,
+    )
+    with_cost = backtest_level_reliability(
+        ohlc, level_price=95.0, level_low=94.5, level_high=95.5, side="support",
+        max_holding_bars=5, min_tests=5, round_trip_cost_pct=0.2,
+    )
+    assert baseline is not None and with_cost is not None
+    # Real round-trip cost eats directly into every trade's R-multiple.
+    assert with_cost.avg_r_multiple < baseline.avg_r_multiple
+    # A stop widened far beyond the natural swing size never gets to a
+    # clean win within the holding window — it starves out to timeouts
+    # instead, proving the broker floor genuinely reshapes the outcome
+    # rather than being silently ignored.
+    wide_stop = backtest_level_reliability(
+        ohlc, level_price=95.0, level_low=94.5, level_high=95.5, side="support",
+        max_holding_bars=5, min_tests=5, min_stop_distance_pct=5.0,
+    )
+    assert wide_stop is not None
+    assert wide_stop.wins == 0
+    assert wide_stop.timeouts > baseline.timeouts
 
 
 # --- classify_backtest_favorability ---

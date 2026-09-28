@@ -57,6 +57,80 @@ NEWS_HEADLINES_PER_ASSET = int(os.getenv("NEWS_HEADLINES_PER_ASSET", "2"))
 # polls instead of hitting Yahoo fresh every time.
 CLERK_NEWS_CACHE_MINUTES = int(os.getenv("CLERK_NEWS_CACHE_MINUTES", "20"))
 
+# --- data/symbol_news.py — the ONE shared per-symbol news fetch/cache,
+# added 2026-09-20 direct user request ("save double calling of news"):
+# Clerk, Researcher, Mega Session, and the webapp's own News section all
+# now read through this single cache instead of each doing its own
+# independent fetch. Real bug this closes, found live while building it:
+# Clerk's OWN prior news fetch used data.underlying.resolve_yahoo_ticker
+# (a PMEX-symbol keyword map) instead of ai.researcher's own already-
+# correct, FTMO-native resolve_ftmo_yahoo_ticker — confirmed live against
+# this account's real current mix: 17 of 22 symbols (77%) silently
+# resolved to NO Yahoo ticker at all under the old resolver (every
+# equity/forex/crypto symbol; only metals and a couple of commodities
+# happened to work by coincidence, since their MT5 descriptions literally
+# contain a PMEX keyword like "Gold"). Consolidating onto the shared,
+# already-correct resolver fixes this for Clerk as a side effect, not
+# just deduplicates the network calls.
+#
+# Same 20-minute default as CLERK_NEWS_CACHE_MINUTES above (that
+# constant is now unused — kept only so its own historical tests/comment
+# aren't disturbed — direct user confirmation this value is fine to
+# reuse for the shared cache too: "I think we have already set it 20min
+# last time for clerk... no issue with that").
+SYMBOL_NEWS_CACHE_MINUTES = int(os.getenv("SYMBOL_NEWS_CACHE_MINUTES", "20"))
+
+# Where the real, per-symbol news history lives — one JSON file per
+# symbol (records/ftmo_symbol_news/{symbol}.json), the single source of
+# truth; the Obsidian vault note for the same symbol (obsidian_vault/
+# News/{symbol}.md) is a deterministic RENDER of it, regenerated on every
+# new item — same local/gitignored/account-independent convention as
+# TRADE_JOURNAL_DIR.
+SYMBOL_NEWS_DIR = os.getenv("SYMBOL_NEWS_DIR", "records/ftmo_symbol_news")
+
+# Same convention as SYMBOL_NEWS_DIR, for the category-specialty layer
+# (FXStreet/CoinDesk/Investing.com) — added 2026-09-20, direct user
+# report that category news had no vault presence at all before this
+# (records/ftmo_category_news/{category}.json -> obsidian_vault/News/
+# Category/{category}.md), unlike the per-symbol layer.
+CATEGORY_NEWS_DIR = os.getenv("CATEGORY_NEWS_DIR", "records/ftmo_category_news")
+
+# Rolling retention window, direct user request ("save... for one
+# month... after one month the vault will be reset") — every time a
+# symbol's news store is touched, entries older than this many days are
+# pruned, so the note always shows a trailing month rather than growing
+# forever or being wiped all at once on a fixed calendar date.
+SYMBOL_NEWS_RETENTION_DAYS = int(os.getenv("SYMBOL_NEWS_RETENTION_DAYS", "30"))
+
+# Real bug found 2026-09-20, direct user challenge ("i don't want to
+# explode the usage quota... neither do i want any analysis to go
+# without the news context"): Clerk/Researcher/Mega/Trade Audit each run
+# as their OWN standalone spawned process per tray-timer tick (see
+# quant_app_tray.ps1's fire-and-forget Process.Start() per job), so the
+# in-memory _symbol_news_cache/_category_news_cache/_macro_news_cache
+# dicts in data/symbol_news.py reset to empty on every single invocation
+# -- they only ever deduped calls made within ONE process's lifetime
+# (e.g. the long-running webapp), never across the 4 real consumers.
+# This file is a small disk-backed mirror of those same caches so a real
+# fetch made by any one process is visible to every other process for
+# the rest of SYMBOL_NEWS_CACHE_MINUTES, without changing that TTL or
+# ever serving stale-past-TTL data.
+NEWS_FETCH_CACHE_FILE = os.getenv("NEWS_FETCH_CACHE_FILE", "records/news_fetch_cache.json")
+
+# Economic calendar (data/economic_calendar.py, 2026-09-24 intraday
+# decision-tier upgrade): the free weekly JSON feed is cached on disk and
+# shared by every process. The blackout window keeps Clerk from placing or
+# leaving RESTING entry orders from `BEFORE` minutes ahead of a High-impact
+# event for the symbol's own currencies until `AFTER` minutes past it.
+ECONOMIC_CALENDAR_CACHE_FILE = os.getenv("ECONOMIC_CALENDAR_CACHE_FILE", "records/economic_calendar_cache.json")
+ECONOMIC_CALENDAR_CACHE_MINUTES = int(os.getenv("ECONOMIC_CALENDAR_CACHE_MINUTES", "60"))
+EVENT_BLACKOUT_ENABLED = os.getenv("EVENT_BLACKOUT_ENABLED", "1") not in ("0", "false", "False")
+EVENT_BLACKOUT_BEFORE_MINUTES = int(os.getenv("EVENT_BLACKOUT_BEFORE_MINUTES", "30"))
+EVENT_BLACKOUT_AFTER_MINUTES = int(os.getenv("EVENT_BLACKOUT_AFTER_MINUTES", "10"))
+EVENT_BLACKOUT_IMPACTS = tuple(
+    s.strip().title() for s in os.getenv("EVENT_BLACKOUT_IMPACTS", "High").split(",") if s.strip()
+)
+
 # Portfolio Suggestion now lets Claude do real multi-step web research
 # (WebSearch/WebFetch), so it needs much more time than a plain narration
 # call. Raised from 900s 2026-09-01: a real live run (the first full FTMO
@@ -185,6 +259,153 @@ MIN_STOP_DISTANCE_PCT = float(os.getenv("MIN_STOP_DISTANCE_PCT", "0.1"))
 # own precedent immediately above: a trade whose direction/entry is
 # otherwise sound shouldn't be discarded over a fixable stop distance.
 ENTRY_ATR_STOP_FLOOR_MULTIPLE = float(os.getenv("ENTRY_ATR_STOP_FLOOR_MULTIPLE", "1.5"))
+
+# Real gap, 2026-09-17 (direct user request): the mega session's own
+# win-rate/avg-R/favorable-excursion backtest evidence — the numbers
+# actually used to judge whether a take-profit is realistic — runs on
+# DAILY bars with a 10-bar (~2 calendar week) holding cap and a 90-bar
+# (~4.5 month) excursion horizon (see analysis/backtest.py's own
+# TRADE_SIM_MAX_HOLDING_BARS/TRADE_SIM_EXCURSION_HORIZON_BARS). This
+# account holds intraday only, at most one trading day (see
+# ai/ftmo_suggest.py's own HOLDING HORIZON instruction) — the backtest
+# evidence itself was never recalibrated to match, so every TP/SL
+# realism check was effectively grounded in weeks-to-months of real price
+# travel, not the few hours this account actually holds for.
+#
+# M15 (not H1) is the real intraday-evidence timeframe: originally
+# assumed unavailable in this MT5 Python package (data/mt5_source.py's
+# own `_MT5_TIMEFRAMES` only listed H1/H4/D1/MN1) — live-verified
+# otherwise, on direct user push-back, that this was this codebase's own
+# subset choice, not an MT5 limitation (both the installed and latest
+# PyPI package builds genuinely expose TIMEFRAME_M1 through M30, and
+# real M15 history goes back 1.5-5.8 years across every asset class this
+# account trades — confirmed live via copy_rates_from_pos, not assumed).
+#
+# TRADE_SIM_INTRADAY_MAX_HOLDING_BARS default (16 M15 bars = ~4 hours) is
+# empirically derived, not guessed: pulled this account's own real closed
+# -trade history (data.mt5_source.group_closed_trades over the last 180
+# days, 27 real trades) — median hold 2.31h (~9 M15 bars), P75 3.71h
+# (~15 bars), only 2/27 (7.4%) ran past 24h, confirming "closed same
+# session" really is the norm here. 16 sits just above the real P75,
+# without drifting into the small, real overnight-exception tail (P90
+# jumped to 23.4h) — that tail is exactly what the existing D1 evidence
+# and the account's own explicit "overnight exception, only when
+# justified" rule already cover separately.
+# Re-based 2026-09-24 when the M15 tier was dropped (M5 + H1 split its duties): 48 M5 bars = the same
+# ~4 hours the original 16 M15 bars covered.
+TRADE_SIM_INTRADAY_MAX_HOLDING_BARS = int(os.getenv("TRADE_SIM_INTRADAY_MAX_HOLDING_BARS", "48"))
+# Same 9x-the-holding-cap convention analysis/backtest.py's own existing
+# 90/10 D1 pair already uses (TRADE_SIM_EXCURSION_HORIZON_BARS is 9x
+# TRADE_SIM_MAX_HOLDING_BARS) — applied to the new intraday figure
+# instead of an unrelated, separately-guessed number.
+TRADE_SIM_INTRADAY_EXCURSION_HORIZON_BARS = int(
+    os.getenv("TRADE_SIM_INTRADAY_EXCURSION_HORIZON_BARS", str(TRADE_SIM_INTRADAY_MAX_HOLDING_BARS * 9))
+)
+# 5,000 M15 bars — confirmed live to FETCH in well under 20ms per symbol
+# and to comfortably span multiple real months of history, far more than
+# the RSI/S-R sample-size gates in analysis/backtest.py actually need
+# (real EURUSD check: 155/168 RSI-reaction episodes at this size). NOT
+# increased further to chase chart-pattern coverage (see ai.ftmo_suggest.
+# _compute_intraday_backtests' own docstring for why that backtest is
+# skipped for the intraday variant entirely) — pattern detection's own
+# compute cost, not the fetch, is what makes a larger window impractical
+# (confirmed live: 16.65s at 15,000 bars, 29.33s at 25,000, PER SYMBOL,
+# for backtest_chart_pattern_reaction alone — multiplied across ~20
+# Market Watch symbols this would add many real minutes to a mega-session
+# run for a figure that still needed 40,000 bars to reliably populate).
+# Re-based to M5 on 2026-09-24 (the M15 tier was dropped): measured on real bars, 15,000 M5 bars gave
+# 450-490 RSI episodes per side but cost ~0.7s per symbol (10x the old M15 figure); 6,000 bars still gives
+# ~190 episodes per side (well above the 20-resolved-trade gate) at ~0.3s. Name kept as the historical
+# "intraday backtest" count.
+M5_BACKTEST_BARS = int(os.getenv("M5_BACKTEST_BARS", "6000"))
+# Real gap found live shipping this feature: analysis/backtest.py's own
+# _SR_PROXIMITY_PCT (2.0%) is implicitly calibrated for DAILY bars — a
+# 60-bar rolling S/R window spans ~15 real hours on M15 vs. ~3 real
+# months on D1, so a 2%-of-price proximity band that's a genuine "near
+# the level" test on D1 is wide enough on M15 that price sits inside it
+# almost continuously, collapsing what should be many distinct episodes
+# into one — the backtest returned None (insufficient independent
+# episodes) at 2.0% AND 1.0% on real EURUSD M15 data. Re-derived
+# empirically rather than guessed: swept 2.0% down to 0.05% against real
+# EURUSD M15 bars; 0.5% was the first value giving a healthy, clearly-
+# distinct episode count on both sides (9 support/18 resistance tests at
+# M15_BACKTEST_BARS=5000) without over-counting noise the way sub-0.1%
+# values started to (150+ "tests" each side — no longer a meaningfully
+# distinct "near the level" event). backtest_support_resistance_reaction's
+# own `proximity_pct` parameter already supports this override — no code
+# change needed there, only this value passed in for the intraday call.
+# On M5 a FLAT proximity is instrument-dependent (measured on 15,000 real M5 bars: 0.5% left EURUSD with
+# 23/5 tests but MSFT with 525/531, 0.1% gave EURUSD 317/328), so the intraday S/R backtest now uses an
+# ATR-relative proximity: this many multiples of the instrument's own median M5 ATR%, clamped to a range.
+M5_SR_PROXIMITY_ATR_MULTIPLE = float(os.getenv("M5_SR_PROXIMITY_ATR_MULTIPLE", "4.0"))
+M5_SR_PROXIMITY_MIN_PCT = float(os.getenv("M5_SR_PROXIMITY_MIN_PCT", "0.1"))
+M5_SR_PROXIMITY_MAX_PCT = float(os.getenv("M5_SR_PROXIMITY_MAX_PCT", "0.5"))
+# Real, explicit off-switch for the whole intraday-evidence feature,
+# mirroring this account's existing enable/disable toggle pattern (mega
+# session/Clerk execution/Researcher each have one) — cheap insurance on
+# a change to the core TP/SL evidence pipeline.
+INTRADAY_BACKTEST_ENABLED = os.getenv("INTRADAY_BACKTEST_ENABLED", "true").lower() == "true"
+
+# Real incident, 2026-09-17: a real INTC pending order came out at exactly
+# 1:1 net reward:risk (risk 4.44, reward 4.44) — traced to two genuinely
+# CORRECT mechanisms colliding, not a bug: INTC's own H1 ATR forced a
+# stop ~2x that ATR (correct — tighter gets noise-stopped on a fast
+# mover), and the account's own same-session realism ceiling caps the
+# target at ~1.5-2x that SAME ATR (correct — farther isn't reachable in
+# one session). When both land on the same ATR multiple, ~1:1 is the
+# best MATHEMATICALLY achievable ratio — no cleverer entry/stop/target
+# choice fixes it. The account's own cited backtest for this exact setup
+# (support-bounce, 38% win rate) was measured at a 2:1 target; the SAME
+# 38% win rate at 1:1 is NEGATIVE expected value (0.38*1 - 0.62*1 =
+# -0.24R). The existing instruction text (ai/ftmo_suggest.py:587-623)
+# already names this situation and offers "size it smaller, treat it as
+# lower-conviction, or leave it out" as equally-valid options, with no
+# threshold saying when "leave it out" stops being optional — advisory
+# text a compelling fundamental story (US government stake, Apple
+# foundry talks) can and did override. See ai.clerk_execution._apply_
+# reward_risk_floor_guard for the deterministic backstop this enables:
+# REJECT (pct=0), never downsize, a not-yet-held candidate below this
+# floor.
+#
+# 1.8 is derived, not guessed: this account's own real backtests cluster
+# in a 25-40% win-rate range across setups; at a representative 35% win
+# rate, breakeven requires (1-0.35)/0.35 ~= 1.86:1 before any real cost
+# is netted. 1.8 sits just under that — the account's own already-cited
+# "2:1 Bulkowski/Rockefeller" literature floor, made a hard line instead
+# of advisory, with a small tolerance band rather than a razor's-edge
+# cutoff at the textbook number itself.
+MIN_NET_REWARD_RISK_RATIO = float(os.getenv("MIN_NET_REWARD_RISK_RATIO", "1.8"))
+
+# Real gap, 2026-09-18 (direct user request): the flat floor above is one
+# number for every candidate, derived from a GENERIC, assumed win rate.
+# But this account's own real M5 intraday backtest evidence (see
+# ai.ftmo_suggest.IntradayBacktests) now computes a REAL, per-symbol,
+# per-side win rate for many candidates — breakeven R:R is mathematically
+# a function of win rate, (1-w)/w, so one flat number wastes real,
+# already-computed evidence that could make the floor smarter in BOTH
+# directions: looser for a setup whose own real win rate is genuinely
+# good (the "small dagger" case — a high-win-rate, modest-target setup
+# is legitimately profitable even below 1.8:1), tighter for one whose
+# own real win rate reads worse than the generic assumption (this
+# account's own REAL historical win rate has actually been 25.9% over
+# the last 180 days — worse than the 35% this flat floor assumes).
+# See ai.clerk_execution._side_relevant_win_rate's own docstring for how
+# a per-symbol win rate is selected, and _apply_reward_risk_floor_guard
+# for how it's applied.
+#
+# A real sample-size floor, separate from the backtest functions' own
+# internal min_occurrences/min_tests gates (5) — trusting a win rate
+# enough to LOWER a risk floor deserves a stricter bar than merely
+# "enough to report a number at all."
+MIN_RESOLVED_TRADES_FOR_WIN_RATE_FLOOR = int(os.getenv("MIN_RESOLVED_TRADES_FOR_WIN_RATE_FLOOR", "20"))
+# A hard backstop under the win-rate-derived path: no computed win rate,
+# however good it looks, should ever let a candidate through below a
+# bare 1:1 — a backtested win rate is itself an estimate with real
+# sampling error, not a guarantee.
+MIN_ABSOLUTE_NET_REWARD_RISK_RATIO = float(os.getenv("MIN_ABSOLUTE_NET_REWARD_RISK_RATIO", "1.0"))
+# Requires the setup to clear its own real breakeven by a real margin,
+# not scrape by exactly at the theoretical breakeven line.
+WIN_RATE_FLOOR_SAFETY_MARGIN = float(os.getenv("WIN_RATE_FLOOR_SAFETY_MARGIN", "1.3"))
 
 # Real incident, 2026-09-11: the mega session revised an already-held
 # NVDA position's own stop (a genuine improvement, widening an unsafe
@@ -326,6 +547,81 @@ FTMO_RECORDS_DIR = os.getenv("FTMO_RECORDS_DIR", "records/ftmo")
 # report cards must never collide with that dir's own
 # portfolio_suggestion_*.md glob.
 CURIOSITY_RECORDS_DIR = os.getenv("CURIOSITY_RECORDS_DIR", "records/ftmo_curiosity")
+# Where ai.trade_journal's own per-trade lifecycle records live — one
+# JSON file per trade "story" (a symbol's own trade idea from Mega
+# Session's original proposal through every Clerk touch to however it
+# ultimately resolves), added 2026-09-19 direct user request. Same
+# local/gitignored/account-independent convention as CURIOSITY_RECORDS_
+# DIR above — this is the single source of truth; the Obsidian vault
+# note for the same story is a deterministic RENDER of this JSON,
+# regenerated on every append, never hand-parsed back for logic.
+TRADE_JOURNAL_DIR = os.getenv("TRADE_JOURNAL_DIR", "records/ftmo_trade_journal")
+
+# --- Trade Audit (ai/trade_audit.py) — the 4th agent-like automation
+# role, added 2026-09-20 direct user request: a once-daily retrospective
+# 3-model coaching review of every CLOSED trade in the journal above,
+# reusing ai.portfolio_suggest.build_audit_block's existing concurrent
+# audit pool unmodified, saved into that trade's own Obsidian vault node.
+# Opt-out, not opt-in — same posture as CLERK_EXECUTION_ENABLED_FILE/
+# RESEARCHER_ENABLED_FILE/MEGA_ANALYSIS_ENABLED_FILE.
+TRADE_AUDIT_ENABLED_FILE = os.getenv("TRADE_AUDIT_ENABLED_FILE", "trade_audit_enabled.json")
+
+# DELIBERATE DEPARTURE from this codebase's own established "fixed UTC
+# hour/minute, not DST-adjusted" convention (see RESEARCHER_TRIGGER_HOUR_
+# UTC's own comment) — every other job's trigger anchors loosely to
+# "roughly before/after the US day," where a DST-driven hour of drift
+# twice a year is an accepted, documented non-issue. This job is
+# different: it exists SPECIFICALLY to track one real, precise external
+# event — 5:00 PM America/New_York local time, the real daily close of
+# the US/FTMO forex trading session — and an hour of undetected drift
+# half the year would mean running while that session may still
+# genuinely be open (during EST). So this job computes its own trigger
+# instant FRESH EACH DAY via Python's stdlib zoneinfo (3.9+, no new
+# language-level dependency — see ai.trade_audit._ny_close_trigger_utc)
+# rather than reading a fixed HOUR_UTC/MINUTE_UTC pair the way every
+# other job here does: 21:00 UTC during EDT (~mid-March to early
+# November) vs 22:00 UTC during EST (~November to mid-March), correctly
+# and automatically, every day — verified live via web search 2026-09-20
+# and confirmed against both an EDT and an EST date on this machine.
+# NOTE: zoneinfo needs the IANA tz database at runtime; Windows CPython
+# does NOT ship it, so this depends on the third-party `tzdata` PyPI
+# package (added explicitly to requirements.txt alongside this feature —
+# previously present on this machine only as an incidental transitive
+# dependency of an unrelated package, which a clean install elsewhere
+# could not have relied on).
+TRADE_AUDIT_TRIGGER_HOUR_LOCAL = int(os.getenv("TRADE_AUDIT_TRIGGER_HOUR_LOCAL", "17"))
+TRADE_AUDIT_TRIGGER_MINUTE_LOCAL = int(os.getenv("TRADE_AUDIT_TRIGGER_MINUTE_LOCAL", "0"))
+TRADE_AUDIT_TRIGGER_TZ = os.getenv("TRADE_AUDIT_TRIGGER_TZ", "America/New_York")
+
+# Real MT5 deal-settlement/trade-closing data needs a little wall-clock
+# time to finalize right at the moment of the exact session close — this
+# buffer is ADDED to the real NY-close instant above before the job is
+# ever considered due, so the "closed" events this job reads are for
+# trades that genuinely finished settling, not a race against MT5's own
+# end-of-day bookkeeping.
+TRADE_AUDIT_SETTLEMENT_BUFFER_MINUTES = int(os.getenv("TRADE_AUDIT_SETTLEMENT_BUFFER_MINUTES", "45"))
+
+# Same "missing this window loses the whole day" reasoning as
+# RESEARCHER_GRACE_MINUTES — wider than that job's 60 minutes since this
+# one may need to sequentially audit several stories (up to TRADE_AUDIT_
+# MAX_STORIES_PER_RUN below) before the window closes.
+TRADE_AUDIT_GRACE_MINUTES = int(os.getenv("TRADE_AUDIT_GRACE_MINUTES", "120"))
+
+TRADE_AUDIT_STATE_FILE = os.getenv("TRADE_AUDIT_STATE_FILE", "trade_audit_state.json")
+
+# A hard ceiling on one Trade Audit pass — sized against TRADE_AUDIT_MAX_
+# STORIES_PER_RUN below, each of which runs a full 3-model concurrent
+# audit (comparable per-story cost to one AUDIT_RETRY_TIMEOUT_SECONDS
+# window), with real margin.
+TRADE_AUDIT_RUN_TIMEOUT_SECONDS = int(os.getenv("TRADE_AUDIT_RUN_TIMEOUT_SECONDS", "1800"))
+
+# Defensive cap on how many unaudited closed stories get a real 3-model
+# review in a single daily run, same "excess is picked up on a LATER
+# poll rather than let one poll run unbounded" reasoning as CLERK_
+# EXECUTION_MAX_PENDING_SETUPS — a large opening backlog (e.g. right
+# after this feature ships) drains gradually over several days by
+# design, not all at once, so it never monopolizes the free model pool.
+TRADE_AUDIT_MAX_STORIES_PER_RUN = int(os.getenv("TRADE_AUDIT_MAX_STORIES_PER_RUN", "3"))
 
 # How far back to pull closed trades each run — one FTMO trading week,
 # wide enough to always have something real to critique on a quiet day
@@ -688,17 +984,6 @@ MEGA_ANALYSIS_LATEST_SUGGESTION_FILE = os.getenv(
 CLERK_EXECUTION_CHECK_INTERVAL_MINUTES = int(
     os.getenv("CLERK_EXECUTION_CHECK_INTERVAL_MINUTES", "15")
 )
-# Analogous to MEGA_ANALYSIS_GRACE_MINUTES above but keyed to each
-# CLERK_EXECUTION_CHECK_INTERVAL_MINUTES-sized window instead of a
-# fixed daily clock time; this window must exceed however often the
-# Task Scheduler poll actually runs so at least one poll always lands
-# inside it every interval. A window this generous relative to the
-# interval is safe, not wasteful — the per-interval dedup marker (see
-# is_execution_due) means a real check still only happens once per
-# interval regardless of how many polls land inside this window; a wide
-# window just gives more polls a chance to catch up if an earlier one
-# in the same interval was skipped or blocked.
-CLERK_EXECUTION_GRACE_MINUTES = int(os.getenv("CLERK_EXECUTION_GRACE_MINUTES", "10"))
 # Idempotency/status marker for this job, mirroring
 # MEGA_ANALYSIS_STATE_FILE's own role exactly, just for this second job.
 CLERK_EXECUTION_STATE_FILE = os.getenv(
@@ -811,6 +1096,31 @@ CLERK_TACTICAL_DEFENSE_ENABLED_FILE = os.getenv(
 # least CLERK_TACTICAL_DEFEND_MIN_RETRIGGER_PCT since that last action
 # (both required together) — see ai.clerk_execution._validate_and_
 # apply_tactical_verdict's own docstring.
+# Explicit, persistent allowlist of FTMO symbols the architecture should
+# actually consider — added 2026-09-19, direct user request after a real
+# incident: MT5's own Market Watch "visible" flag turned out NOT to be a
+# stable signal for "the symbols we've chosen to trade." The broker
+# terminal silently re-populates old symbols on login/reconnect
+# (confirmed live: the user manually removed old symbols and added new
+# ones directly in the terminal, and the old ones came back after simply
+# logging back in — independent of any runtime symbol_select() call,
+# ours or theirs). Separately, data/mt5_source.py's own _ensure_symbol_
+# selected runs defensively wherever a symbol's live data is read by
+# name, which re-marks it visible too — confirmed live: a stray, already-
+# open browser tab still rendering the OLD symbol list kept resurrecting
+# them on every page refresh, with no code change involved at all.
+# Market Watch visibility can therefore never be trusted to durably
+# represent this account's real choice of symbols — this file is the
+# actual source of truth instead, read once inside get_market_watch()
+# itself so every consumer (Clerk/Mega Session/Researcher/app.py) is
+# filtered uniformly, with zero per-caller changes needed.
+#
+# Missing/empty/corrupt file means NO filter at all — get_market_watch()
+# returns everything currently visible, exactly its original behavior —
+# so this is purely additive until the user actually sets a real list via
+# app.py's own symbol-mix control.
+FTMO_SYMBOL_MIX_FILE = os.getenv("FTMO_SYMBOL_MIX_FILE", "ftmo_symbol_mix.json")
+
 CLERK_TACTICAL_DEFEND_COOLDOWN_MINUTES = int(
     os.getenv("CLERK_TACTICAL_DEFEND_COOLDOWN_MINUTES", "60")
 )
@@ -882,6 +1192,30 @@ CLERK_TACTICAL_PARTIAL_PROFIT_TARGET_PCT = float(
 CLERK_TACTICAL_PARTIAL_PROFIT_MAX_DAYS = float(
     os.getenv("CLERK_TACTICAL_PARTIAL_PROFIT_MAX_DAYS", "7")
 )
+
+# Real gap, 2026-09-18 (direct user request): the 50%-of-target trigger
+# above is a large, late milestone — real, observed consequence, this
+# account's positions have mostly closed at breakeven or small loss, not
+# small-green, this engagement. CLERK_TACTICAL_PARTIAL_PROFIT_TARGET_PCT
+# is also only ever advisory prompt context (ai.clerk_execution's own
+# TacticalSignals.partial_profit_due field is never checked in
+# _run_clerk_tactical_check's own deterministic circuit breakers) — the
+# same "advisory text loses to model discretion" failure class already
+# fixed twice this session. This is a SECOND, much earlier, genuinely
+# deterministic profit-lock: a small, real slice gets banked as soon as
+# a position has moved favorably enough to safely cover its OWN real
+# round-trip cost with margin — far earlier than 50% of target — for a
+# new, aspirant trader's own stated need for occasional small, real,
+# realized-profit events, without loosening any entry-side risk
+# discipline. 3x real cost is a real, derived margin (not a guessed flat
+# %): enough that the banked gain is genuinely real after cost, not a
+# coin-flip-thin margin a single tick of noise could erase.
+CLERK_QUICK_PROFIT_LOCK_COST_MULTIPLE = float(os.getenv("CLERK_QUICK_PROFIT_LOCK_COST_MULTIPLE", "3.0"))
+# A genuinely small slice — vs. the trend-flip circuit breaker's own
+# defensive 50% — leaving most of the position open to still reach its
+# full target; this is meant to feel like a quick, low-stakes bonus, not
+# a real de-risking action.
+CLERK_QUICK_PROFIT_LOCK_REDUCE_PCT = float(os.getenv("CLERK_QUICK_PROFIT_LOCK_REDUCE_PCT", "20.0"))
 
 # Local Ollama models powering the Clerk's own LLM calls (verdict,
 # invalidation, and tactical-defense checks) — direct user request
@@ -955,4 +1289,293 @@ CLERK_BACKUP_MODEL = os.getenv("CLERK_BACKUP_MODEL", "phi4-mini")
 # see CLERK_EXECUTION_RUN_TIMEOUT_SECONDS above, raised alongside this so
 # the outer per-run ceiling doesn't kill a check that's still making
 # real progress within this larger per-call budget.
-CLERK_LLM_TIMEOUT_SECONDS = int(os.getenv("CLERK_LLM_TIMEOUT_SECONDS", "300"))
+CLERK_LLM_TIMEOUT_SECONDS = int(os.getenv("CLERK_LLM_TIMEOUT_SECONDS", "180"))  # was 300; calls now run one at a time, warm
+
+
+# Decision-tier M5 bar count fetched per symbol for Mega Session and Clerk's technical context.
+# 600 M5 bars ~= 2 trading days: the structure window is capped by analysis/timeframe_profiles.py's
+# M5 lookback (144), the rest feeds the median-ATR% baseline the volatility size scalar compares
+# against. (M15 was dropped 2026-09-24: M5 supplies entry timing / stop ATR / short-range structure,
+# H1 supplies the structure anchors and the reachability ATR.)
+INTRADAY_M5_BARS = int(os.getenv("INTRADAY_M5_BARS", "600"))
+# The M5-ATR multiple used for stop floors and tactical stops wherever the H1-era 1.5x ATR used to
+# apply. Derived from REAL data (20 symbols, 2026-09-24): median M15 ATR / M5 ATR = 1.42, so the
+# old 1.5x M15 ATR stop is 2.1x M5 ATR; 2.0 keeps the same stop distance in M5 terms.
+M5_ATR_STOP_MULTIPLE = float(os.getenv("M5_ATR_STOP_MULTIPLE", "2.0"))
+
+
+# --- Intraday decision-tier guards (2026-09-24) -------------------------------
+# Resting M5-scale limit orders must not sit for a day: the older 24h age
+# ceiling (MAX_PENDING_ORDER_AGE_HOURS) stays as the outer bound, Clerk now
+# uses this much shorter one for every resting entry, including Pending-Setup
+# orders that the plan-level age rule never saw.
+INTRADAY_PENDING_ORDER_MAX_AGE_HOURS = float(os.getenv("INTRADAY_PENDING_ORDER_MAX_AGE_HOURS", "3"))
+# Stop floor extras: at least this many spreads wide, and never below the
+# broker's own minimum stop distance (previously unenforced on the live path).
+MIN_STOP_SPREAD_MULTIPLE = float(os.getenv("MIN_STOP_SPREAD_MULTIPLE", "4"))
+# A planned entry is STALE when live price sits further than this many M5 ATRs
+# from it (a limit that far from market will not fill soon). Chosen from the fill
+# math, not guessed. MEASURED on 20 real symbols x 6000 M5 bars (audit 2026-09-24; per-bar
+# close-to-close sigma = 0.72 ATR, matching the 0.7 assumed here): the chance price TOUCHES a
+# level d M5 ATRs away, in one direction, inside the 3h (36-bar) resting-order ceiling is 79% at
+# 1.0, 60% at 2.0, 45% at 3.0, 39% at 3.5, 26% at 5.0 (interpolated: 30% at ~4.4). 3.5 is kept
+# (a level that is unlikely — under 2-in-5 — to be touched inside the order's own life); the
+# earlier M15-derived "30% at 3.5 M5 ATRs" figure was a units slip, the real 30% point is ~4.4.
+STALE_ENTRY_M5_ATR_MULTIPLE = float(os.getenv("STALE_ENTRY_M5_ATR_MULTIPLE", "3.5"))
+# Once a guard (stale-entry rejection, reward:risk floor) has rejected an UNFILLED entry and the resting order
+# was cancelled, the Clerk does not place that symbol again for this many minutes (or until the next Mega
+# session, which resets the tracking). Found on the first real M5-only session (2026-09-24 18:28 UTC): the
+# stale-entry re-anchor moves the entry to a fresh zone every poll while the target stays put, so the net
+# reward:risk hovered around the 1.8 floor and SOLUSD was placed and cancelled 9 times (NVDA 3 and 2) in ~7 hours.
+GUARD_REJECTION_COOLDOWN_MINUTES = float(os.getenv("GUARD_REJECTION_COOLDOWN_MINUTES", "60"))
+# Found 2026-09-25: an NVDA limit was placed ~4 minutes before the US close, then could not be cancelled for the
+# whole night ("Market closed", 56 failed attempts). No NEW resting order is placed for a non-24h instrument
+# inside this many minutes of the session end the instrument's own recent bars show (fail-open: no estimate,
+# no block), and after a "Market closed" rejection the same order action is not retried for the backoff below.
+NO_NEW_ORDER_MINUTES_BEFORE_CLOSE = float(os.getenv("NO_NEW_ORDER_MINUTES_BEFORE_CLOSE", "20"))
+MARKET_CLOSED_BACKOFF_MINUTES = float(os.getenv("MARKET_CLOSED_BACKOFF_MINUTES", "30"))
+# A stale entry the Clerk had to re-anchor rests on a re-derived zone plus Claude's ORIGINAL target, so its net
+# reward:risk is less trustworthy and hovers near the floor (SOLUSD was placed/cancelled 9 times on that edge);
+# it must clear the floor by this margin before an order is placed.
+REANCHORED_ENTRY_RR_MARGIN = float(os.getenv("REANCHORED_ENTRY_RR_MARGIN", "0.3"))
+# A discretionary (LLM) DEFEND may take a partial close only while the position is in profit; see
+# ai/clerk_execution._validate_and_apply_tactical_verdict for the real MSFT incident.
+CLERK_PARTIAL_CLOSE_REQUIRES_PROFIT = os.getenv("CLERK_PARTIAL_CLOSE_REQUIRES_PROFIT", "1") not in ("0", "false", "False", "")
+# Order-churn hysteresis: a resting order keeps its exact price/stop/target
+# while the freshly computed values stay within this many M5 ATRs (0.5 M15 ATR = 0.7 M5 ATR)
+# (and its risk % within this fraction) of what is already resting.
+RESTING_ORDER_STABILITY_M5_ATR_MULTIPLE = float(os.getenv("RESTING_ORDER_STABILITY_M5_ATR_MULTIPLE", "0.7"))
+RESTING_ORDER_PCT_STABILITY_FRACTION = float(os.getenv("RESTING_ORDER_PCT_STABILITY_FRACTION", "0.2"))
+# Volatility scalar: risk % is scaled by median-M5-ATR% / current-M5-ATR%,
+# clamped to [this, 1.0] — only ever downsizes in an elevated-volatility tape.
+INTRADAY_VOLATILITY_SCALAR_MIN = float(os.getenv("INTRADAY_VOLATILITY_SCALAR_MIN", "0.5"))
+# Entries inside this many hours BEFORE a High-impact event (but outside the
+# hard blackout window) are downsized by this factor.
+EVENT_RUNUP_HOURS = float(os.getenv("EVENT_RUNUP_HOURS", "2"))
+EVENT_RUNUP_SIZE_SCALAR = float(os.getenv("EVENT_RUNUP_SIZE_SCALAR", "0.5"))
+# One position's initial margin may not exceed this % of equity (0 disables).
+MAX_POSITION_MARGIN_PCT_OF_EQUITY = float(os.getenv("MAX_POSITION_MARGIN_PCT_OF_EQUITY", "25"))
+
+# Reachability limit for a same-session target, in M5 ATRs. MEASURED 2026-09-24 (20 symbols x 6000 M5
+# bars): the median furthest excursion from an entry within the 48-bar (4h) holding cap is 5.7 M5 ATRs, and
+# price touches a level in ONE chosen direction within 3h only 60% / 45% / 26% of the time at 2x / 3x / 5x.
+# The M5 trade-zone line flags any target past this limit as a long shot.
+M5_TARGET_REACH_ATR_LIMIT = float(os.getenv("M5_TARGET_REACH_ATR_LIMIT", "6.0"))
+# Final live re-check of the Mega Session's entries (ai/live_recheck.py, 2026-09-25): after the free-model audit
+# Python compares every drafted entry with the LIVE price; an entry more than RECHECK_DRIFT_ATR M5 ATRs from it
+# (the measured fill odds are 46% at 3x and 30% at 4.5x) goes back to Claude with fresh real levels. A re-issue
+# is then verified: within RECHECK_REISSUE_MAX_ATR of the price (67% fill odds at 1.6x, 60% at 2x), entry/target
+# each within RECHECK_ANCHOR_TOLERANCE_ATR of a real level, stop within RECHECK_MAX_STOP_ATR.
+LIVE_RECHECK_ENABLED = os.getenv("LIVE_RECHECK_ENABLED", "1") not in ("0", "false", "False", "")
+RECHECK_DRIFT_ATR = float(os.getenv("RECHECK_DRIFT_ATR", "3.0"))
+RECHECK_REISSUE_MAX_ATR = float(os.getenv("RECHECK_REISSUE_MAX_ATR", "2.0"))
+RECHECK_ANCHOR_TOLERANCE_ATR = float(os.getenv("RECHECK_ANCHOR_TOLERANCE_ATR", "0.35"))
+RECHECK_MAX_STOP_ATR = float(os.getenv("RECHECK_MAX_STOP_ATR", "8.0"))
+# Zone-confidence hold-rate cutoffs for the M5 trade zone (analysis.trade_zone.construct_trade_zone
+# nudges confidence one notch by the anchor level's backtested hold rate). The H1-era cutoffs (70 / 40)
+# are degenerate on M5: MEASURED 2026-09-24 on 97 real M5 S/R bands (48-bar hold window), the hold-rate
+# distribution is p10 0 / p25 6 / p50 15 / p75 25 / p90 44, so 89% of bands sat at or below 40 and 3%
+# at or above 70 — nearly every zone was downgraded and none upgraded. Shifted control bands (same width,
+# +/-1.5 and +/-3 M5 ATRs away) held 15.5% on average vs 20.2% for the real bands (win rate 35% vs 43%),
+# i.e. real levels do carry signal, so the cutoffs are set at the real-band quartiles: p75 (25) and p25 (6).
+M5_ZONE_STRONG_HOLD_RATE_PCT = float(os.getenv("M5_ZONE_STRONG_HOLD_RATE_PCT", "25"))
+M5_ZONE_WEAK_HOLD_RATE_PCT = float(os.getenv("M5_ZONE_WEAK_HOLD_RATE_PCT", "6"))
+# M5-based tactical stop candidates (the H1-era 1.5x / 2.5x-fast ATR multiples are kept for the H1
+# fallback): 2.0x M5 ATR is the same distance the old 1.5x M15 ATR gave; fast-tier movers get 3.0x.
+CLERK_TACTICAL_M5_ATR_STOP_MULTIPLE = float(os.getenv("CLERK_TACTICAL_M5_ATR_STOP_MULTIPLE", "2.0"))
+CLERK_TACTICAL_M5_ATR_STOP_MULTIPLE_FAST = float(os.getenv("CLERK_TACTICAL_M5_ATR_STOP_MULTIPLE_FAST", "3.0"))
+
+# ---- Significance-aware backtest evidence (analysis/edge_stats.py, 2026-09-25 position-hunting review) ----
+# A pooled M5 backtest that reads "~27% win rate, slightly negative R" is the NULL result: MEASURED on real
+# M5 bars, random 2x/4x-ATR entries with a 2:1 target win ~27% at about -0.05R gross. Setups are therefore
+# judged against a random-entry baseline on the same bars/stop/target/cost instead of against zero.
+EDGE_SUPPORTED_Z = float(os.getenv("EDGE_SUPPORTED_Z", "1.5"))
+EDGE_CONTRADICTED_Z = float(os.getenv("EDGE_CONTRADICTED_Z", "-2.0"))
+EDGE_MIN_TRADES_SUPPORTED = int(os.getenv("EDGE_MIN_TRADES_SUPPORTED", "20"))
+EDGE_MIN_TRADES_CONTRADICTED = int(os.getenv("EDGE_MIN_TRADES_CONTRADICTED", "30"))
+EDGE_BASELINE_ENTRY_STEP_BARS = int(os.getenv("EDGE_BASELINE_ENTRY_STEP_BARS", "6"))
+EDGE_BASELINE_MAX_ENTRIES = int(os.getenv("EDGE_BASELINE_MAX_ENTRIES", "800"))
+EDGE_BASELINE_MIN_TRADES = int(os.getenv("EDGE_BASELINE_MIN_TRADES", "100"))
+EDGE_BASELINE_WARMUP_BARS = int(os.getenv("EDGE_BASELINE_WARMUP_BARS", "60"))
+
+# ---- Cost drag as an explicit gate (ai.ftmo_suggest.cost_drag_r, 2026-09-25) ----
+# Round-trip spread+commission as a share of the risked amount. MEASURED on real spreads: mean 0.19R at a 2x
+# M5-ATR stop, 0.09R at 4x, 0.06R at 6x; ~0.01R (BTC) up to >1R (WHEAT, COCOA). COST_DRAG_TARGET_R is only the
+# figure shown next to "the stop that would cap drag" (information, not a floor — Claude picks the stop);
+# COST_DRAG_VETO_R is the objective hard veto (V1) at the tightest valid stop.
+COST_DRAG_TARGET_R = float(os.getenv("COST_DRAG_TARGET_R", "0.10"))
+# 2026-09-25 (deep M5, 30,790 with-the-trend breakout fills, structure stop): net R by round-trip cost in R at the stop -
+# cost <= 0.10R: +0.03..+0.06R per fill at 2-4R targets; cost > 0.10R: -0.10..-0.23R at EVERY target multiple. V1 therefore
+# vetoes above 0.10R measured at the playbook's structure stop (it was 0.35R at the tightest stop).
+COST_DRAG_VETO_R = float(os.getenv("COST_DRAG_VETO_R", "0.10"))
+# The sizing sheet's "COST VETO" wording is measured at the TIGHTEST valid stop, where the drag is ~2x the playbook-stop figure;
+# it keeps its own, looser limit.
+COST_DRAG_SHEET_VETO_R = float(os.getenv("COST_DRAG_SHEET_VETO_R", "0.35"))
+
+# ---- Position Hunter shortlist (analysis/position_hunter.py, 2026-09-25) ----
+POSITION_HUNT_MAX_CANDIDATES = int(os.getenv("POSITION_HUNT_MAX_CANDIDATES", "8"))
+POSITION_HUNT_ENABLED = os.getenv("POSITION_HUNT_ENABLED", "1") not in ("0", "false", "False", "")
+
+# ---- New entry order types (analysis/entry_mode.py, 2026-09-25; enabled immediately by user decision) ----
+# Kill switch: 0 makes every entry a plain limit again. Caps are re-verified from a live quote by the Clerk
+# guard and by the final live re-check; a failed check downgrades to a limit (or rejects a dead setup).
+NEW_ENTRY_KINDS_ENABLED = os.getenv("NEW_ENTRY_KINDS_ENABLED", "1") not in ("0", "false", "False", "")
+MARKET_ENTRY_MAX_SLIPPAGE_ATR = float(os.getenv("MARKET_ENTRY_MAX_SLIPPAGE_ATR", "0.5"))  # live worse than the plan, M5 ATRs
+MARKET_ENTRY_MAX_SPREAD_STOP_FRACTION = float(os.getenv("MARKET_ENTRY_MAX_SPREAD_STOP_FRACTION", "0.25"))
+MARKET_ENTRY_SEND_DEVIATION_ATR = float(os.getenv("MARKET_ENTRY_SEND_DEVIATION_ATR", "0.15"))  # tick movement allowed poll->send
+STOP_ENTRY_MAX_DISTANCE_ATR = float(os.getenv("STOP_ENTRY_MAX_DISTANCE_ATR", "2.0"))  # breakout trigger from the market
+STOP_ENTRY_MAX_EXTENSION_ATR = float(os.getenv("STOP_ENTRY_MAX_EXTENSION_ATR", "0.6"))  # O'Neil: do not chase past the pivot
+
+# ---- Deterministic profit trail (ai/clerk_execution.py TacticalSignals.profit_trail_*, 2026-09-25) ----
+# MEASURED (20 real symbols x 6000 M5 bars, 38,960 paired random trades, spread charged): trailing the stop 1.5 M5
+# ATR behind the price once the trade is +1R lifts net expectancy from -0.174R to -0.148R (better on 17/20
+# symbols) — better than breakeven-at-1R (-0.163R), partial-50%+breakeven (-0.155R) or breakeven-at-1.5R
+# (-0.172R). Applied as a deterministic, shadow-mode-exempt DEFEND (stop only, never a partial close).
+CLERK_PROFIT_TRAIL_ENABLED = os.getenv("CLERK_PROFIT_TRAIL_ENABLED", "1") not in ("0", "false", "False", "")
+CLERK_PROFIT_TRAIL_START_R = float(os.getenv("CLERK_PROFIT_TRAIL_START_R", "1.0"))
+CLERK_PROFIT_TRAIL_ATR = float(os.getenv("CLERK_PROFIT_TRAIL_ATR", "1.5"))
+CLERK_PROFIT_TRAIL_MIN_STEP_ATR = float(os.getenv("CLERK_PROFIT_TRAIL_MIN_STEP_ATR", "0.25"))  # no micro-amends
+
+# ---- Re-hunt ledger (ai/rehunt.py, 2026-09-25) ----
+REHUNT_LEDGER_FILE = os.getenv("REHUNT_LEDGER_FILE", "rehunt_ledger.json")
+REHUNT_LEDGER_KEEP_DAYS = int(os.getenv("REHUNT_LEDGER_KEEP_DAYS", "7"))
+REHUNT_MAX_AGE_HOURS = float(os.getenv("REHUNT_MAX_AGE_HOURS", "36"))
+
+# ---- Deep price-history cache (data/price_cache.py, 2026-09-25 plan W2) ----
+# The broker serves far more than the 6,000 M5 bars the live pipeline fetches (measured: up to 200,000 M5 bars for
+# FX/crypto, ~100,000 for stocks). Studies, Symbol Behaviour Cards and out-of-sample gates read this cache.
+PRICE_CACHE_DIR = os.getenv("PRICE_CACHE_DIR", "records/price_cache")
+DEEP_HISTORY_BARS_M5 = int(os.getenv("DEEP_HISTORY_BARS_M5", "120000"))
+DEEP_HISTORY_BARS_H1 = int(os.getenv("DEEP_HISTORY_BARS_H1", "60000"))
+DEEP_HISTORY_BARS_D1 = int(os.getenv("DEEP_HISTORY_BARS_D1", "6000"))
+
+# ---- Playbook selector (analysis/playbook.py, 2026-09-25 plan W3) ----
+# Measured on 205,758 aligned M5 opportunities (see analysis/playbook.py): breakout stop at the 24-bar range extreme with
+# the stop at the opposite side of the range (clipped 1.5-4 ATR): +0.086R gross, +0.077R net on the cheaper half of symbols.
+PLAYBOOK_ENABLED = os.getenv("PLAYBOOK_ENABLED", "1") not in ("0", "false", "False", "")
+PLAYBOOK_RANGE_BARS = int(os.getenv("PLAYBOOK_RANGE_BARS", "24"))
+# ADX is a quality dial, not a gate: deep history showed the structure-stop breakout net positive on the cheaper half of symbols in EVERY regime
+# (ADX<20 +0.034R, 20-30 +0.053R, >=30 +0.093R per opportunity); raise this to make it a gate.
+PLAYBOOK_MIN_ADX = float(os.getenv("PLAYBOOK_MIN_ADX", "0"))
+PLAYBOOK_MAX_TRIGGER_AHEAD_ATR = float(os.getenv("PLAYBOOK_MAX_TRIGGER_AHEAD_ATR", "1.5"))
+PLAYBOOK_STOP_MIN_ATR = float(os.getenv("PLAYBOOK_STOP_MIN_ATR", "1.5"))
+PLAYBOOK_STOP_MAX_ATR = float(os.getenv("PLAYBOOK_STOP_MAX_ATR", "4.0"))
+PLAYBOOK_MIN_VOLUME_RATIO = float(os.getenv("PLAYBOOK_MIN_VOLUME_RATIO", "0.7"))
+PLAYBOOK_TARGET_RR = float(os.getenv("PLAYBOOK_TARGET_RR", "2.0"))
+PLAYBOOK_MEASURED_GROSS = float(os.getenv("PLAYBOOK_MEASURED_GROSS", "0.086"))
+PLAYBOOK_MEASURED_NET_CHEAP = float(os.getenv("PLAYBOOK_MEASURED_NET_CHEAP", "0.077"))
+
+# ---- Broker-side expiry of resting orders (data/mt5_execution.py open_position(expiration_hours=), 2026-09-25) ----
+# A NEW limit/stop order for a session-limited instrument expires this many minutes before the instrument's learned session
+# close, so it can never sit overnight where nobody can manage it (the NVDA case). A negative value disables the expiry.
+RESTING_ORDER_EXPIRY_BEFORE_CLOSE_MINUTES = float(os.getenv("RESTING_ORDER_EXPIRY_BEFORE_CLOSE_MINUTES", "5"))
+
+# ---- Structured Pending-Setup triggers (analysis/triggers.py, 2026-09-25) ----
+# How many completed M5 bars the Clerk keeps in FtmoAssetAnalysis.m5_recent for evaluating a structured trigger.
+TRIGGER_RECENT_BARS = int(os.getenv("TRIGGER_RECENT_BARS", "30"))
+
+# ---- The Sentinel (ai/sentinel.py, clerk_sentinel_job.py; 2026-09-25) ----
+# A one-minute, LLM-free profit-trail ratchet. SENTINEL_LOG_ONLY=1 (default) only logs what it WOULD do; set 0 to let it
+# move stops. SENTINEL_ENABLED=0 switches the job off entirely.
+SENTINEL_ENABLED = os.getenv("SENTINEL_ENABLED", "1") not in ("0", "false", "False", "")
+SENTINEL_LOG_ONLY = os.getenv("SENTINEL_LOG_ONLY", "1") not in ("0", "false", "False", "")
+SENTINEL_STATE_FILE = os.getenv("SENTINEL_STATE_FILE", "sentinel_state.json")
+
+# ---- Level Map (analysis/level_map.py, 2026-09-25) ----
+LEVEL_MAP_ENABLED = os.getenv("LEVEL_MAP_ENABLED", "1") not in ("0", "false", "False", "")
+LEVEL_MAP_MAX_DISTANCE_ATR = float(os.getenv("LEVEL_MAP_MAX_DISTANCE_ATR", "6.0"))  # beyond this a resting order is unlikely to fill in hours
+LEVEL_MAP_MIN_DISTANCE_ATR = float(os.getenv("LEVEL_MAP_MIN_DISTANCE_ATR", "0.5"))  # closer than this is inside the noise/spread band
+LEVEL_MAP_MAX_CANDIDATES = int(os.getenv("LEVEL_MAP_MAX_CANDIDATES", "6"))
+LEVEL_MAP_MIN_BOUNCE_ATR = float(os.getenv("LEVEL_MAP_MIN_BOUNCE_ATR", "1.0"))  # a reaction point: price turned at least this far within 12 bars
+# Measured 2026-09-25 (deep M5, 20 symbols): how far price pokes THROUGH a level that then held, in M5 ATRs.
+LEVEL_PENETRATION_MEDIAN_ATR = 0.5
+LEVEL_PENETRATION_P75_ATR = 1.3
+LEVEL_PENETRATION_P90_ATR = 2.7
+
+# ---- Symbol Behaviour Card (analysis/symbol_card.py, tools/studies/symbol_cards.py; 2026-09-25) ----
+SYMBOL_CARD_ENABLED = os.getenv("SYMBOL_CARD_ENABLED", "1") not in ("0", "false", "False", "")
+SYMBOL_CARD_FILE = os.getenv("SYMBOL_CARD_FILE", "records/symbol_cards.json")
+SYMBOL_CARD_MIN_BARS = int(os.getenv("SYMBOL_CARD_MIN_BARS", "5000"))  # fewer completed M5 bars than this: no card
+SYMBOL_CARD_STALE_DAYS = int(os.getenv("SYMBOL_CARD_STALE_DAYS", "45"))
+
+# The Position Hunter reads D1/H4 direction from CLOSED higher-timeframe buckets (analysis/htf_flags.py) - the flags the
+# alignment study measured - instead of the TechnicalStats trend that includes the still-forming bar. 0 = the old read.
+HUNTER_CLOSED_HTF_FLAGS = os.getenv("HUNTER_CLOSED_HTF_FLAGS", "1") not in ("0", "false", "False", "")
+
+# The Clerk's intraday size scalar never shrinks a NEW entry below the broker's minimum lot when that minimum lot still fits
+# inside the risk % Claude chose (a scaled risk that buys no position silently kills an approved trade). 0 = old behaviour.
+SIZE_SCALAR_MIN_LOT_FLOOR = os.getenv("SIZE_SCALAR_MIN_LOT_FLOOR", "1") not in ("0", "false", "False", "")
+
+
+# Clerk correlation guard (ai/clerk_execution.py::_apply_correlation_guard). Correlation is LOW-weight information: the aggregate-heat
+# ceiling already sums every stop as if all were hit together, so correlated positions cannot breach it. The guard remains only for
+# near-duplicates (|r| >= 0.90; it was 0.70) and trims the newcomer by a quarter (it halved it). Set the threshold above 1 to switch off.
+CLERK_CORRELATION_GUARD_THRESHOLD = float(os.getenv("CLERK_CORRELATION_GUARD_THRESHOLD", "0.90"))
+CLERK_CORRELATION_SIZE_FACTOR = float(os.getenv("CLERK_CORRELATION_SIZE_FACTOR", "0.75"))
+
+# ---- Mega session: analyse only instruments that can trade right now (ai/mega_analysis.py::select_tradable_assets) ----
+# An instrument is skipped when its market calendar is closed, it has no tick, or its last tick is older than this many minutes
+# behind the freshest tick in the Market Watch pool (a session that ended for the day). Held / resting-order symbols are always kept.
+MEGA_TRADABLE_FILTER_ENABLED = os.getenv("MEGA_TRADABLE_FILTER_ENABLED", "1") not in ("0", "false", "False", "")
+MEGA_TRADABLE_MAX_TICK_AGE_MINUTES = float(os.getenv("MEGA_TRADABLE_MAX_TICK_AGE_MINUTES", "30"))
+
+# The Clerk FAST LANE (clerk_fast_job.py): the deterministic pipeline every minute, no model call. 0 = only the full poll runs.
+CLERK_FAST_LANE_ENABLED = os.getenv("CLERK_FAST_LANE_ENABLED", "1") not in ("0", "false", "False", "")
+
+# ---- Thinking vs acting (ai/clerk_thinking.py, clerk_think_job.py; 2026-09-26) ----
+# ON: no Clerk pass that acts (fast lane, regular poll, post-Mega hand-off) ever waits for the local model; a separate thinking job
+# keeps a cache of model verdicts that the acting passes use in seconds. OFF: the old single poll that thinks and then acts.
+CLERK_THINK_SPLIT_ENABLED = os.getenv("CLERK_THINK_SPLIT_ENABLED", "1") not in ("0", "false", "False", "")
+CLERK_THINK_CACHE_FILE = os.getenv("CLERK_THINK_CACHE_FILE", "clerk_thinking_cache.json")
+# A stored model verdict older than this is ignored (the thinking job renews them every review interval).
+CLERK_THINK_CACHE_TTL_MINUTES = float(os.getenv("CLERK_THINK_CACHE_TTL_MINUTES", "12"))
+
+# When the MT5 terminal answers "Authorization failed" to a login, every process backs off this long before trying credentials again
+# (data/mt5_source.py::connect). A terminal that is (or becomes) logged in is still attached to immediately, with no credentials.
+MT5_AUTH_BACKOFF_FILE = os.getenv("MT5_AUTH_BACKOFF_FILE", "mt5_auth_backoff.json")
+MT5_AUTH_BACKOFF_MINUTES = float(os.getenv("MT5_AUTH_BACKOFF_MINUTES", "5"))
+
+# ---- Clerk thinking diet (2026-09-26): what makes the local-model rounds short ----
+# Measured on this machine (qwen3:8b, 4GB VRAM, ~8 tokens/s): the cost of a call is almost entirely the tokens the model WRITES
+# (prompt evaluation of a compact prompt is ~0.3 s), a reload after Ollama's default 5-minute idle unload costs 9-250 s, and requests
+# submitted in parallel to one Ollama server just queue behind each other against the per-call timeout.
+CLERK_LLM_KEEP_ALIVE = os.getenv("CLERK_LLM_KEEP_ALIVE", "30m")  # keep the Clerk's model resident between thinking passes
+CLERK_COMPACT_CONTEXT = os.getenv("CLERK_COMPACT_CONTEXT", "1") not in ("0", "false", "False", "")  # ~1/4 of the old context
+CLERK_DETERMINISTIC_INVALIDATION = os.getenv("CLERK_DETERMINISTIC_INVALIDATION", "1") not in ("0", "false", "False", "")
+CLERK_LLM_SEQUENTIAL = os.getenv("CLERK_LLM_SEQUENTIAL", "1") not in ("0", "false", "False", "")
+
+# The Clerk analyses a symbol it only has to DEFEND (an open position, no new entry on it) with the LEAN analysis: M5 reads only.
+CLERK_LEAN_ANALYSIS = os.getenv("CLERK_LEAN_ANALYSIS", "1") not in ("0", "false", "False", "")
+
+# Continuation Watch, phase 2 (2026-09-28): the job/orchestration around the phase-1 filter — see
+# ai/continuation_hunter.py's own module docstring for the full seven-point design. LOG_ONLY=1 (the
+# default) means every decision is computed and written to the trade journal/log but NO ORDER IS EVER SENT —
+# wiring a "propose" into the real entry pipeline is phase 3, not built yet. ENABLED=1 lets the job run at
+# all (in log-only mode by default, so it starts producing real observations right away, same rollout shape
+# as the Sentinel).
+CONTINUATION_WATCH_ENABLED = os.getenv("CONTINUATION_WATCH_ENABLED", "1") not in ("0", "false", "False", "")
+CONTINUATION_WATCH_LOG_ONLY = os.getenv("CONTINUATION_WATCH_LOG_ONLY", "1") not in ("0", "false", "False", "")
+CONTINUATION_WATCH_STATE_FILE = os.getenv("CONTINUATION_WATCH_STATE_FILE", "continuation_watch_state.json")
+# Escalation to OpenRouter when the local model is down/unclear (same shape as ai.curiosity's own
+# _run_curiosity_model_with_retry): a short per-call timeout, tried across a few fallbacks within one budget.
+CONTINUATION_WATCH_MODEL_TIMEOUT_SECONDS = int(os.getenv("CONTINUATION_WATCH_MODEL_TIMEOUT_SECONDS", "30"))
+CONTINUATION_WATCH_RETRY_TIMEOUT_SECONDS = int(os.getenv("CONTINUATION_WATCH_RETRY_TIMEOUT_SECONDS", "150"))
+
+# Continuation Watch (phase 1, 2026-09-28): how long a just-closed WINNING trade gets to prove it's still
+# running before this filter gives up on it, how many real M5 bars that needs, and how big the move (in ATR)
+# must be. See analysis/continuation_watch.py's own docstring for the calibration these numbers came from —
+# 15 minutes / 3 bars is exactly the "2-3 candles is a fair time to decide" the user asked for; 2.0x ATR is a
+# conservative first cut (the two real trades that motivated this cleared 4.5x and 21x, with room to spare).
+CONTINUATION_MIN_BARS = int(os.getenv("CONTINUATION_MIN_BARS", "3"))
+CONTINUATION_MAX_WAIT_MINUTES = float(os.getenv("CONTINUATION_MAX_WAIT_MINUTES", "15"))
+CONTINUATION_MIN_ATR_MOVE = float(os.getenv("CONTINUATION_MIN_ATR_MOVE", "2.0"))
+
+# Thinking pass: a held position whose last tactical verdict was HOLD and whose relevant facts have not moved (see
+# ai.clerk_execution._tactical_fingerprint) is not put to the model again, for at most this many minutes (0 = always ask).
+CLERK_THINK_REUSE_MAX_MINUTES = float(os.getenv("CLERK_THINK_REUSE_MAX_MINUTES", "20"))
+# Cap on the tokens the Clerk's local model may write per answer (the answers are 2-3 sentences plus a verdict block).
+CLERK_LLM_MAX_TOKENS = int(os.getenv("CLERK_LLM_MAX_TOKENS", "450"))
+
+# Time-critical Clerk jobs (fast lane, Sentinel, regular poll, post-Mega hand-off) wait up to this long for the execution lock instead
+# of skipping when another short pass holds it (the minute timers all fire in the same second).
+CLERK_LOCK_WAIT_SECONDS = float(os.getenv("CLERK_LOCK_WAIT_SECONDS", "30"))

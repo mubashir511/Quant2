@@ -21,6 +21,7 @@ from ai.openrouter_client import FAILED_MESSAGE as OPENROUTER_FAILED_MESSAGE
 from ai.openrouter_client import MISSING_KEY_MESSAGE as OPENROUTER_MISSING_KEY_MESSAGE
 from ai.openrouter_client import run_openrouter
 from ai.session_record import SessionRecord, save_portfolio_session
+from analysis.entry_mode import normalise_entry_mode
 from analysis.backtest import (
     ChartPatternBacktest,
     FavorableExcursionStats,
@@ -35,6 +36,7 @@ from analysis.backtest import (
     backtest_volatility_regime,
 )
 from analysis.technical import TechnicalStats, compute_technical_stats
+from analysis.triggers import normalise_trigger
 from data.book_wisdom import format_book_wisdom
 from data.commodity_geography import INDEX_LINKED_COUNTRIES, METAL_LINKED_COUNTRIES
 from data.crop_context import CROP_TRADE_PROFILES, fetch_crop_supply_demand_context
@@ -1162,6 +1164,7 @@ def format_enriched_asset_context(
     account_equity: float | None = None,
     include_favorable_excursion: bool = True,
     include_market_status: bool = True,
+    daily_atr_is_context: bool = False,
 ) -> str:
     """Pure formatting over already-computed AssetAnalysis objects — same
     text shape as before this was split out of a single fetch+format loop,
@@ -1230,7 +1233,15 @@ def format_enriched_asset_context(
                     "volatility not available (insufficient price history) — verify "
                     "via WebSearch before sizing"
                 )
-            if stats.atr_pct is not None:
+            if stats.atr_pct is not None and daily_atr_is_context:
+                # FTMO intraday decision tier (2026-09-24): the daily ATR is regime
+                # context only — stops are sized from the M5 ATR, so this line must
+                # never tell the model to use it as the stop basis.
+                stat_bits.append(
+                    f"ATR {stats.atr_pct:.2f}% of price (14-day, CONTEXT only — NOT a stop "
+                    "distance; size stops from the M5 ATR in the decision tier below)"
+                )
+            elif stats.atr_pct is not None:
                 stat_bits.append(
                     f"ATR {stats.atr_pct:.2f}% of price (14-day) — use this, not a "
                     "flat percentage, as the basis for this instrument's stop distance"
@@ -1661,6 +1672,10 @@ class AllocationEntry:
     side: str = "buy"  # "buy" or "sell" — see risk/apply_suggestion.py::compute_rebalance_plan
     reason: str = ""  # current thesis for this specific target, mirrors PendingSetup.reason
     invalidation_condition: str | None = None  # mechanically-checkable exit trigger, mirrors PendingSetup.trigger_condition
+    # How the ENTRY is sent (analysis/entry_mode.py): "limit" (default, the pullback order every entry used
+    # to be), "stop" (breakout trigger beyond the market) or "market". Optional in the JSON schema; anything
+    # else parses as "limit". Re-verified from a live quote before an order is sent.
+    entry_mode: str = "limit"
 
 
 def parse_final_allocation(
@@ -1758,6 +1773,7 @@ def parse_final_allocation(
             side=side_norm,
             reason=reason,
             invalidation_condition=invalidation_condition,
+            entry_mode=normalise_entry_mode(value.get("entry_mode")),
         )
     return result
 
@@ -1799,6 +1815,10 @@ class PendingSetup:
     stop_loss: float | None = None
     take_profit: float | None = None
     reason: str = ""
+    # Optional STRUCTURED trigger (analysis/triggers.py): {"kind": "range_break"|"reclaim"|"close_beyond", "level": float,
+    # "within_bars": int}. When valid, Python evaluates it on the completed M5 bars and the LLM check is skipped; a fired
+    # trigger becomes a market entry. Absent/invalid -> the legacy free-text `trigger_condition` path, unchanged.
+    trigger: dict | None = None
 
 
 def parse_pending_setups(
@@ -1886,6 +1906,7 @@ def parse_pending_setups(
                 stop_loss=float(stop_loss) if stop_loss is not None else None,
                 take_profit=float(take_profit) if take_profit is not None else None,
                 reason=reason,
+                trigger=normalise_trigger(item.get("trigger")),
             )
         )
     return result

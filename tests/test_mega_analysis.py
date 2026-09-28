@@ -561,3 +561,97 @@ def test_run_mega_analysis_broadcasts_audit_progress_too(
     run_mega_analysis()
 
     assert read_progress()["current_activity"] == "gpt-4: analyzing..."
+
+
+# --- the tradable-now filter: the first thing a session does (2026-09-25) ---------------------------------------------
+
+def _asset(symbol):
+    from data.mt5_source import MarketAsset
+
+    return MarketAsset(symbol=symbol, description=symbol, bid=1.0, ask=1.0)
+
+
+NOW_T = datetime(2026, 9, 25, 14, 0, tzinfo=timezone.utc)
+EPOCH = int(NOW_T.timestamp())
+
+
+def test_select_tradable_assets_drops_closed_calendar_no_tick_and_stale_tick_but_keeps_held_symbols():
+    from ai.mega_analysis import select_tradable_assets
+
+    assets = [_asset(s) for s in ("EURUSD", "AAPL", "COCOA.c", "NODATA", "HELD", "BTCUSD")]
+    ticks = {
+        "EURUSD": EPOCH - 5, "BTCUSD": EPOCH, "AAPL": EPOCH - 5 * 3600,  # US stock: session ended hours ago
+        "COCOA.c": EPOCH - 10 * 60, "NODATA": None, "HELD": EPOCH - 9 * 3600,
+    }
+    closed_calendar = lambda symbol, now: symbol != "COCOA.c"  # noqa: E731
+    tradable, skipped = select_tradable_assets(assets, {"HELD"}, NOW_T, ticks, calendar_fn=closed_calendar, max_tick_age_minutes=30)
+    assert [a.symbol for a in tradable] == ["EURUSD", "HELD", "BTCUSD"]  # a held symbol stays even with a 9-hour-old tick
+    reasons = dict(skipped)
+    assert "no fresh tick" in reasons["AAPL"] and "calendar" in reasons["COCOA.c"] and reasons["NODATA"] == "no live tick"
+
+
+def test_select_tradable_assets_never_raises_and_falls_back_to_the_calendar_without_tick_data():
+    from ai.mega_analysis import select_tradable_assets
+
+    assets = [_asset("EURUSD"), _asset("AAPL")]
+    tradable, skipped = select_tradable_assets(assets, set(), NOW_T, {}, calendar_fn=lambda s, n: s == "EURUSD")
+    assert [a.symbol for a in tradable] == ["EURUSD"] and skipped == [("AAPL", "market closed (weekly calendar)")]
+
+    def boom(symbol, now):
+        raise RuntimeError("calendar broke")
+
+    assert len(select_tradable_assets(assets, set(), NOW_T, {}, calendar_fn=boom)[0]) == 2  # unknown -> not skipped
+
+
+@patch("ai.mega_analysis.suggest_ftmo_portfolio", return_value="a real suggestion")
+@patch("ai.mega_analysis.build_ftmo_summary", return_value="summary text")
+@patch("ai.mega_analysis.analyze_ftmo_assets", return_value=[])
+@patch("ai.mega_analysis.fetch_ftmo_status")
+@patch("ai.mega_analysis.get_pending_orders", return_value=[])
+@patch("ai.mega_analysis.get_open_positions", return_value=[])
+@patch("ai.mega_analysis.get_last_tick_epochs")
+@patch("ai.mega_analysis.get_market_watch")
+@patch("ai.mega_analysis.get_account_summary")
+@patch("ai.mega_analysis.connect")
+def test_run_mega_analysis_analyses_and_summarises_only_the_tradable_symbols(
+    mock_connect, mock_account, mock_watch, mock_ticks, mock_positions, mock_pending, mock_status,
+    mock_analyze, mock_summary, mock_suggest, _fixed_schedule, monkeypatch,
+):
+    from ai.mega_analysis import run_mega_analysis
+
+    monkeypatch.setattr(config, "MEGA_TRADABLE_FILTER_ENABLED", True)
+    now = int(datetime.now(timezone.utc).timestamp())
+    mock_watch.return_value = [_asset("EURUSD"), _asset("AAPL")]
+    mock_ticks.return_value = {"EURUSD": now, "AAPL": now - 6 * 3600}
+    with patch("ai.mega_analysis.is_symbol_tradable_now", return_value=True):
+        run_mega_analysis()
+    analysed = mock_analyze.call_args.args[0]
+    assert [a.symbol for a in analysed] == ["EURUSD"]
+    assert [a.symbol for a in mock_summary.call_args.args[1]] == ["EURUSD"]
+    prompt_summary = mock_suggest.call_args.args[0]
+    assert prompt_summary.startswith("MARKETS CLOSED RIGHT NOW - NOT ANALYSED THIS RUN") and "AAPL (no fresh tick" in prompt_summary
+    progress = read_progress()
+    assert any("1 of 2 instruments are tradable now; skipping 1 closed: AAPL" in step for step in progress["steps"])
+
+
+@patch("ai.mega_analysis.suggest_ftmo_portfolio")
+@patch("ai.mega_analysis.analyze_ftmo_assets")
+@patch("ai.mega_analysis.fetch_ftmo_status")
+@patch("ai.mega_analysis.get_pending_orders", return_value=[])
+@patch("ai.mega_analysis.get_open_positions", return_value=[])
+@patch("ai.mega_analysis.get_last_tick_epochs", return_value={"EURUSD": None})
+@patch("ai.mega_analysis.get_market_watch", return_value=[_asset("EURUSD")])
+@patch("ai.mega_analysis.get_account_summary")
+@patch("ai.mega_analysis.connect")
+def test_run_mega_analysis_spends_nothing_when_no_market_is_open(
+    mock_connect, mock_account, mock_watch, mock_ticks, mock_positions, mock_pending, mock_status,
+    mock_analyze, mock_suggest, _fixed_schedule, monkeypatch,
+):
+    from ai.mega_analysis import run_mega_analysis
+
+    monkeypatch.setattr(config, "MEGA_TRADABLE_FILTER_ENABLED", True)
+    with patch("ai.mega_analysis.is_symbol_tradable_now", return_value=False):
+        with pytest.raises(RuntimeError, match="No instrument is tradable right now"):
+            run_mega_analysis()
+    mock_analyze.assert_not_called()
+    mock_suggest.assert_not_called()

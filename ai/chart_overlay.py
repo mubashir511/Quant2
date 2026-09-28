@@ -104,7 +104,7 @@ _MAX_NOTE_CHARS = 180
 # anchoring by chart bar-offset silently assumed the chart's own period
 # matched the analysis timeframe, which produced nonsense trendlines on
 # an M5 chart built from H4/H1-scale price math).
-_TIMEFRAME_SECONDS = {"H1": 3600, "H4": 14400}
+_TIMEFRAME_SECONDS = {"M5": 300, "M15": 900, "H1": 3600, "H4": 14400}
 _TREND_LOOKBACK_BARS = 20
 
 # Human labels per raw compute_regime_segments regime value, and the
@@ -173,32 +173,39 @@ class OverlaySymbolInputs:
 def _sr_level_lines(symbol: str, structure: ChartStructureSnapshot | None, timeframe: str) -> list[str]:
     if structure is None or structure.sr_levels is None:
         return []
-    # Real gap found on independent audit, fixed 2026-09-10: this used to
-    # hardcode the flat SR_CLUSTER_TOLERANCE_PCT module constant as every
-    # level's own exported zone-width, regardless of instrument. Since
-    # analysis.chart_structure.compute_chart_structure now scales this
-    # tolerance by the instrument's own ATR% for a fast mover (confirmed
-    # live: 0.443% on NVDA, 0.9% on INTC, both several times the flat
-    # 0.3% default), the terminal overlay was silently drawing a
-    # NARROWER zone than what Python actually used to decide these were
-    # "the same level" — a real mismatch between the computation and
-    # what actually renders on the user's own MT5 chart (see mql5/
-    # Quant2ChartOverlay.mq5's own DrawLevelZoneFill, which uses this
-    # exact value numerically, not just cosmetically). sr_levels.
-    # tolerance_pct is the REAL value compute_sr_levels actually used.
+    # Real band, not a tolerance-derived symmetric guess — added
+    # 2026-09-20, direct user challenge: this used to export a single
+    # price plus the clustering tolerance_pct, and mql5/
+    # Quant2ChartOverlay.mq5's own DrawLevelZoneFill/Border would then
+    # reconstruct a SYMMETRIC zone (price +/- tolerance) around it — only
+    # ever an approximation of the real, usually-asymmetric band the
+    # swing points actually clustered into (analysis.chart_structure.
+    # SRLevel.low/.high, computed directly from the real clustered swing
+    # prices). Falls back to the old tolerance-derived symmetric zone
+    # only for a level with no real band yet (low/high None — a pre-
+    # upgrade direct construction), never a fabricated one.
     tolerance_pct = structure.sr_levels.tolerance_pct
+
+    def _band(level) -> tuple[float, float]:
+        if level.low is not None and level.high is not None:
+            return level.low, level.high
+        half_width = level.price * tolerance_pct / 100.0
+        return level.price - half_width, level.price + half_width
+
     lines = []
     for level in structure.sr_levels.resistance_levels[:_MAX_SR_LEVELS_PER_SIDE]:
         pool = " [LIQUIDITY POOL]" if level.is_liquidity_pool else ""
+        low, high = _band(level)
         lines.append(
-            f"LEVEL|{symbol}|{level.price:g}|resistance|{timeframe} Resistance ({level.touches}x){pool} "
-            f"- sellers defended here before, watch for rejection|{tolerance_pct:g}"
+            f"LEVEL|{symbol}|{low:g}|{high:g}|resistance|{timeframe} Resistance ({level.touches}x){pool} "
+            f"- sellers defended here before, watch for rejection"
         )
     for level in structure.sr_levels.support_levels[:_MAX_SR_LEVELS_PER_SIDE]:
         pool = " [LIQUIDITY POOL]" if level.is_liquidity_pool else ""
+        low, high = _band(level)
         lines.append(
-            f"LEVEL|{symbol}|{level.price:g}|support|{timeframe} Support ({level.touches}x){pool} "
-            f"- buyers defended here before, watch for bounce|{tolerance_pct:g}"
+            f"LEVEL|{symbol}|{low:g}|{high:g}|support|{timeframe} Support ({level.touches}x){pool} "
+            f"- buyers defended here before, watch for bounce"
         )
     return lines
 

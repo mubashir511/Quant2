@@ -1459,3 +1459,208 @@ def test_pct_for_target_lots_round_trip_partial_close():
     assert len(plan) == 1
     assert plan[0].action == "reduce"
     assert plan[0].volume == pytest.approx(0.4)
+
+
+# --- Lot ceilings (intraday decision-tier upgrade, 2026-09-24) ---------------
+
+
+def _tight_stop_allocation():
+    # 10% of 100k = $10,000 risk; a stop only 5 points away, contract 100 -> raw 20 lots.
+    return {"GO10OZ": AllocationEntry(pct=10.0, price=2000.0, stop_loss=1995.0, take_profit=2100.0)}
+
+
+def test_lots_are_capped_at_the_brokers_volume_max():
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=_tight_stop_allocation(),
+        get_spec=_get_spec_for({"GO10OZ": ContractSpec(
+            volume_min=1.0, volume_step=1.0, volume_max=8.0, trade_contract_size=100.0,
+            currency_margin="USD", margin_initial=100.0,
+        )}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+    )
+    assert plan[0].action == "open"
+    assert plan[0].volume == 8.0
+    assert "volume limit" in plan[0].reason
+
+
+def test_lots_are_capped_by_the_per_position_margin_share_of_equity():
+    # margin_initial 1000/lot; 25% of 100k = 25k -> at most 25 lots; a 10% cap -> 10 lots.
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=_tight_stop_allocation(),
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=1000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+        max_position_margin_pct_of_equity=10.0,
+    )
+    assert plan[0].action == "open" and plan[0].volume == 10.0
+    assert "10%-of-equity per-position margin cap" in plan[0].reason
+
+
+def test_margin_cap_below_the_minimum_lot_is_infeasible_never_a_silent_oversize():
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=_tight_stop_allocation(),
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=50000.0)}),  # cap allows only 0.05 lot
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+        max_position_margin_pct_of_equity=5.0,
+    )
+    assert plan[0].action == "infeasible"
+
+
+def test_no_margin_cap_by_default_keeps_the_original_sizing():
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation=_tight_stop_allocation(),
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=1000.0)}),
+        market_prices={"GO10OZ": _asset(ask=2000.0)},
+    )
+    assert plan[0].volume == 20.0
+
+
+def test_margin_cap_never_force_reduces_an_already_held_position():
+    # Audit finding 2026-09-24: held 20 lots, target now asks for more (pct 0.6% -> raw 30 lots), cap
+    # allows 16 -> the plan used to "reduce 4 lots" of a live position because of the CAP alone.
+    acct = AccountSummary(balance=10000.0, equity=10000.0, free_margin=9000.0, currency="USD")
+    spec = ContractSpec(volume_min=1.0, volume_step=1.0, volume_max=1000.0, trade_contract_size=1.0,
+                        currency_margin="USD", margin_initial=150.0)
+    held = _position(symbol="MSFT", side="buy", volume=20.0, sl=498.0, tp=506.0, price_open=500.0)
+    alloc = {"MSFT": AllocationEntry(pct=0.6, price=500.0, stop_loss=498.0, take_profit=506.0, side="buy", reason="r")}
+    plan = compute_rebalance_plan(
+        [held], acct, alloc, lambda s_: spec, {"MSFT": _asset(symbol="MSFT", bid=499.9, ask=500.0)},
+        max_position_margin_pct_of_equity=25.0,
+    )
+    assert [o.action for o in plan] == ["hold"]
+    # ...and a genuinely fresh entry on the same numbers IS still capped (16 lots = 25% of equity / 150).
+    fresh = compute_rebalance_plan(
+        [], acct, alloc, lambda s_: spec, {"MSFT": _asset(symbol="MSFT", bid=499.9, ask=500.0)},
+        max_position_margin_pct_of_equity=25.0,
+    )
+    assert fresh[0].action == "open" and fresh[0].volume == 16.0
+
+
+# --- Entry modes: stop orders and market entries (2026-09-25) -------------------------------------------
+
+def _plan_one(entry, asset, pending=None, positions=None):
+    return compute_rebalance_plan(
+        positions=positions or [], account=ACCOUNT, allocation={"GO10OZ": entry},
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+        market_prices={"GO10OZ": asset}, pending_orders=pending,
+    )
+
+
+def test_default_entry_mode_is_a_limit_and_unknown_modes_are_limits():
+    assert AllocationEntry(pct=1.0).entry_mode == "limit"
+    entry = AllocationEntry(pct=10.0, price=1990.0, stop_loss=1940.0, take_profit=2100.0, entry_mode="breakout")
+    assert _plan_one(entry, _asset(bid=1999.0, ask=2000.0))[0].order_type == "limit"
+
+
+def test_market_entry_is_sized_from_the_live_ask_and_keeps_claudes_structural_stop():
+    entry = AllocationEntry(pct=10.0, price=1999.5, stop_loss=1950.0, take_profit=2100.0, entry_mode="market")
+    order = _plan_one(entry, _asset(bid=1999.0, ask=2000.0))[0]
+    assert (order.action, order.order_type, order.side) == ("open", "market", "buy")
+    assert order.price == 2000.0  # the live ask
+    assert order.stop_loss == 1950.0  # NOT re-derived to preserve a distance from the planned price
+    assert order.volume == 2.0  # 10% of 100k = $10k / (50 x 100)
+
+
+def test_market_sell_executes_at_the_live_bid():
+    entry = AllocationEntry(pct=10.0, price=2000.5, stop_loss=2050.0, take_profit=1900.0, side="sell", entry_mode="market")
+    order = _plan_one(entry, _asset(bid=2000.0, ask=2001.0))[0]
+    assert (order.order_type, order.price, order.stop_loss) == ("market", 2000.0, 2050.0)
+
+
+def test_buy_stop_sits_above_the_ask_and_a_trigger_below_it_is_pushed_out_to_the_minimum_distance():
+    ok = _plan_one(
+        AllocationEntry(pct=10.0, price=2010.0, stop_loss=1960.0, take_profit=2150.0, entry_mode="stop"),
+        _asset(bid=1999.0, ask=2000.0),
+    )[0]
+    assert (ok.order_type, ok.price) == ("stop", 2010.0)
+    too_close = _plan_one(
+        AllocationEntry(pct=10.0, price=1995.0, stop_loss=1940.0, take_profit=2150.0, entry_mode="stop"),
+        _asset(bid=1999.0, ask=2000.0),
+    )[0]
+    assert too_close.order_type == "stop" and too_close.price == pytest.approx(2000.0 * 1.001)  # min_stop_distance_pct 0.1
+
+
+def test_sell_stop_sits_below_the_bid():
+    order = _plan_one(
+        AllocationEntry(pct=10.0, price=1990.0, stop_loss=2040.0, take_profit=1850.0, side="sell", entry_mode="stop"),
+        _asset(bid=2000.0, ask=2001.0),
+    )[0]
+    assert (order.order_type, order.price, order.side) == ("stop", 1990.0, "sell")
+
+
+def test_stop_trigger_beyond_the_sanity_band_is_clamped_to_the_band():
+    order = _plan_one(
+        AllocationEntry(pct=10.0, price=3000.0, stop_loss=2060.0, take_profit=3500.0, entry_mode="stop"),
+        _asset(bid=1999.0, ask=2000.0),
+    )[0]
+    assert order.price == pytest.approx(2000.0 * 1.05)  # the default 5% band
+
+
+def test_a_non_limit_mode_without_a_live_quote_falls_back_to_a_plain_limit():
+    entry = AllocationEntry(pct=10.0, price=2000.0, stop_loss=1950.0, take_profit=2100.0, entry_mode="market")
+    plan = compute_rebalance_plan(
+        positions=[], account=ACCOUNT, allocation={"GO10OZ": entry},
+        get_spec=_get_spec_for({"GO10OZ": _spec()}), market_prices={},
+    )
+    assert plan[0].action == "infeasible"  # no quote at all: nothing is ever sent as a market deal
+
+
+def test_a_resting_limit_is_replaced_when_the_target_becomes_a_stop_and_left_alone_when_it_matches():
+    entry = AllocationEntry(pct=10.0, price=2010.0, stop_loss=1960.0, take_profit=2150.0, entry_mode="stop")
+    limit_resting = _pending_order(order_type="buy limit", price_open=2010.0, sl=1960.0, tp=2150.0, volume=2.0)
+    replaced = _plan_one(entry, _asset(bid=1999.0, ask=2000.0), pending=[limit_resting])[0]
+    assert replaced.action == "amend_pending" and replaced.order_type == "stop"
+    stop_resting = _pending_order(order_type="buy stop", price_open=2010.0, sl=1960.0, tp=2150.0, volume=2.0)
+    held = _plan_one(entry, _asset(bid=1999.0, ask=2000.0), pending=[stop_resting])[0]
+    assert held.action == "hold"
+
+
+def test_a_market_target_over_a_resting_order_cancels_it_and_deals_at_the_market():
+    entry = AllocationEntry(pct=10.0, price=2000.0, stop_loss=1950.0, take_profit=2100.0, entry_mode="market")
+    resting = _pending_order(order_type="buy limit", price_open=1990.0, sl=1950.0, tp=2100.0, volume=2.0)
+    plan = _plan_one(entry, _asset(bid=1999.0, ask=2000.0), pending=[resting])[0]
+    assert plan.action == "amend_pending" and plan.order_type == "market" and plan.pending_tickets_to_cancel == [501]
+
+
+def test_an_already_held_position_ignores_the_entry_mode():
+    entry = AllocationEntry(pct=10.0, price=2000.0, stop_loss=1950.0, take_profit=2100.0, entry_mode="market")
+    held = _position(volume=2.0, sl=1950.0, tp=2100.0)
+    plan = _plan_one(entry, _asset(bid=1999.0, ask=2000.0), positions=[held])
+    assert all(p.order_type != "market" or p.action in ("close", "reduce") for p in plan)
+    assert not any(p.action == "open" for p in plan)
+
+
+def test_a_deliberate_partial_close_is_not_swallowed_by_the_size_tolerance():
+    # The SOLUSD case (2026-09-25): a 20% quick profit lock inside the 25% rounding tolerance was planned as "on target" and no
+    # order was ever sent. 5 lots held, target 4 (a 20% reduction).
+    positions = [_position(volume=5.0, ticket=1, sl=1900.0)]
+    allocation = {"GO10OZ": AllocationEntry(pct=40.0, price=2000.0, stop_loss=1900.0)}
+    kwargs = dict(
+        positions=positions, account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}), market_prices={"GO10OZ": _asset(ask=2000.0)},
+    )
+    assert compute_rebalance_plan(**kwargs)[0].action != "reduce"  # the rounding tolerance still absorbs an ordinary 20% drift
+    order = compute_rebalance_plan(**kwargs, deliberate_resize_symbols={"GO10OZ"})[0]
+    assert order.action == "reduce" and order.volume == 1.0
+
+
+def test_a_trailing_stop_past_the_entry_is_amended_when_it_is_still_on_the_safe_side_of_the_live_price():
+    # The SOLUSD trail (2026-09-25): a profit-locking stop above a buy's entry was dropped as "wrong side of entry", so the
+    # amend never went out. Held 1 lot bought at 2000, price now 2010, stop trailed to 2004 (still 6 below the bid).
+    positions = [_position(volume=1.0, ticket=7, sl=1990.0, price_open=2000.0)]
+    allocation = {"GO10OZ": AllocationEntry(pct=0.4, price=2000.0, stop_loss=2004.0, take_profit=2030.0)}
+    kwargs = dict(
+        positions=positions, account=ACCOUNT, allocation=allocation,
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}),
+    )
+    order = compute_rebalance_plan(**kwargs, market_prices={"GO10OZ": _asset(bid=2010.0, ask=2010.5)})[0]
+    assert order.action == "amend_position" and order.stop_loss == 2004.0 and order.position_tickets_to_amend == [7]
+    # a stop the market has already run through is still refused (dropped -> the held stop stands)
+    dead = compute_rebalance_plan(**kwargs, market_prices={"GO10OZ": _asset(bid=2003.0, ask=2003.5)})[0]
+    assert dead.action != "amend_position" or dead.stop_loss == 1990.0
+    # and a sell mirrors it: entry 2000, price 1990, stop trailed to 1996 (above the ask)
+    sell = compute_rebalance_plan(
+        positions=[_position(side="sell", volume=1.0, ticket=8, sl=2010.0, price_open=2000.0)], account=ACCOUNT,
+        allocation={"GO10OZ": AllocationEntry(pct=0.4, price=2000.0, stop_loss=1996.0, take_profit=1970.0, side="sell")},
+        get_spec=_get_spec_for({"GO10OZ": _spec(margin_initial=10000.0)}), market_prices={"GO10OZ": _asset(bid=1989.5, ask=1990.0)},
+    )[0]
+    assert sell.action == "amend_position" and sell.stop_loss == 1996.0
